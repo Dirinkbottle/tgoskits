@@ -80,8 +80,7 @@ rk3588-pwm = [
 ]
 k230-kpu = ["ax-hal/xuantie-c9xx", "dep:k230-kpu"]
 vsock = ["ax-runtime/vsock"]
-dynamic_debug = ["ipi"]
-sg2002 = [
+dynamic_debug = ["ipi"]sg2002 = [
     "ax-runtime/irq",
     "ax-driver/usb",
     "dep:rdif-pwm",
