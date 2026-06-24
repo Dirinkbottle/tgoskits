@@ -1,6 +1,8 @@
 //! Special devices
 
 mod card0;
+#[cfg(feature = "k3_com260kit")]
+mod k3_airunner;
 #[cfg(feature = "rknpu")]
 mod card1;
 // The real contiguous coherent dma-heap is shared by every accelerator that
@@ -590,6 +592,16 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
             NodeType::CharacterDevice,
             rtc::RTC0_DEVICE_ID,
             Arc::new(rtc::Rtc),
+        ),
+    );
+    #[cfg(feature = "k3_com260kit")]
+    root.add(
+        "k3_airunner",
+        Device::new(
+            fs.clone(),
+            NodeType::CharacterDevice,
+            k3_airunner::K3_AIRUNNER_DEVICE_ID,
+            Arc::new(k3_airunner::K3AiRunner),
         ),
     );
 
