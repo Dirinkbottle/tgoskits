@@ -24,6 +24,7 @@ memtrack = ["ax-feat/backtrace", "ax-alloc/tracking"]
 rknpu = ["ax-driver/rknpu"]
 std-compat = []
 k230-kpu = ["ax-feat/xuantie-c9xx", "dep:axklib", "dep:k230-kpu"]
+k3_com260kit = []
 plat-dyn = [
     "dep:axplat-dyn",
     "ax-feat/plat-dyn",
@@ -65,6 +66,11 @@ ax-feat = { workspace = true, features = [
     "ext4fs",
     "net",
 ] }
+
+
+ov-channels = { version = "0.2" }
+k3_aiUabi = {path = "/home/inkbottle/othersrc/k3x-HERA-RT/k3_aiUabi"}
+k3_aiScheduler = {path = "/home/inkbottle/othersrc/k3x-HERA-RT/k3_aiScheduler"}
 
 ax-alloc = { workspace = true }
 ax-config.workspace = true

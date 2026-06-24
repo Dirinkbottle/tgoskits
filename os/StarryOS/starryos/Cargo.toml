@@ -14,7 +14,7 @@ repository.workspace = true
 version = "0.5.19"
 
 [features]
-default = []
+default = ["k3_com260kit"]
 myplat = ["ax-feat/myplat"]
 qemu = [
   "ax-feat/defplat",
@@ -46,6 +46,7 @@ k230 = [
   "ax-driver/k230-sdhci",
   "ax-driver/serial",
 ]
+k3_com260kit = ["starry-kernel/k3_com260kit"]
 plat-dyn = ["dep:axplat-dyn", "starry-kernel/plat-dyn"]
 
 rknpu = ["ax-driver/rknpu", "starry-kernel/rknpu"]
