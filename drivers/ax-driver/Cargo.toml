@@ -86,6 +86,11 @@ k230-sdhci = [
     "dep:sdmmc-protocol",
     "sdmmc-protocol/rdif",
 ]
+k3-sdhci = [
+    "block",
+    "dep:k3-sdhci",
+]
+k3-ufs = ["block"]
 phytium-mci = [
     "block",
     "dep:phytium-mci-host",
@@ -165,6 +170,7 @@ fdt-edit = { workspace = true }
 fxmac_rs = { workspace = true, optional = true }
 heapless.workspace = true
 irq-framework.workspace = true
+k3-sdhci = { path = "../blk/k3-sdhci", features = ["platform"], optional = true }
 log.workspace = true
 mmio-api.workspace = true
 nvme-driver = { workspace = true, optional = true }
