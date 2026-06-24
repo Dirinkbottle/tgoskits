@@ -38,7 +38,9 @@ fn main() {
     if has_virtio_core || has_virtio_dev {
         enable_cfg_flag("virtio_dev");
     }
-    if has_any_feature(&["ahci", "bcm2835-sdhci"]) || (has_feature("cvsd") && target_has_cvsd) {
+    if has_any_feature(&["ahci", "bcm2835-sdhci", "k3-ufs"])
+        || (has_feature("cvsd") && target_has_cvsd)
+    {
         enable_cfg_flag("sync_block_dev");
     }
 
