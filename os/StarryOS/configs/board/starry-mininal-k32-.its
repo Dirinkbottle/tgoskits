@@ -1,0 +1,46 @@
+/dts-v1/;
+
+/ {
+	description = "StarryOS FIT image for SpacemiT K3 COM260 IFX";
+	#address-cells = <2>;
+
+	images {
+		kernel {
+			description = "StarryOS raw kernel image";
+			data = /incbin/("/home/inkbottle/othersrc/tgoskits/target/riscv64gc-unknown-none-elf/release/starryos.bin");
+			type = "kernel";
+			arch = "riscv";
+			os = "linux";
+			compression = "none";
+			load = <0x00000001 0x02202000>;
+			entry = <0x00000001 0x02202000>;
+
+			hash {
+				algo = "sha256";
+			};
+		};
+
+		fdt {
+			description = "SpacemiT K3 COM260 IFX device tree";
+			data = /incbin/("/home/inkbottle/othersrc/tgoskits/os/StarryOS/configs/board/spacemit-k3-com260-ifx.dtb");
+			type = "flat_dt";
+			arch = "riscv";
+			compression = "none";
+			load = <0x00000001 0x38000000>;
+
+			hash {
+				algo = "sha256";
+			};
+		};
+	};
+
+	configurations {
+		default = "conf";
+
+		conf {
+			description = "StarryOS on SpacemiT K3 COM260 IFX";
+			kernel = "kernel";
+			fdt = "fdt";
+		};
+	};
+};
