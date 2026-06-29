@@ -1,8 +1,6 @@
 //! Special devices
 
 mod card0;
-#[cfg(feature = "k3_com260kit")]
-mod k3_airunner;
 #[cfg(feature = "rknpu")]
 mod card1;
 // The real contiguous coherent dma-heap is shared by every accelerator that

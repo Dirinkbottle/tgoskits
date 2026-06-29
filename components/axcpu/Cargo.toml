@@ -27,6 +27,7 @@ fp-simd = []
 vector = []
 # Use unprivileged host-safe register fallbacks in scheduler tests.
 host-test = []
+vector = []
 tls = ["cpu-local/tls"]
 uspace = ["exception-table"]
 arm-el2 = []

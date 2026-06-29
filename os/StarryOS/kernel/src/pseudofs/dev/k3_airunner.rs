@@ -347,7 +347,7 @@ impl DeviceOps for K3AiRunner {
 
                 // complete环
                 let complete_sender = shm.sender(ChannelId::new(1)).expect("sender initial fail");
-                let complete_reciver = shm
+                let _complete_reciver = shm
                     .receiver(ChannelId::new(1))
                     .expect("reciver initiall fail");
 
@@ -459,9 +459,11 @@ impl DeviceOps for K3AiRunner {
 
                         // 映射输入 tensors 到内核地址
                         for i in 0..node.desc.input_count as usize {
-                            let mut tensor: &mut AiTensorDesc;
+                            let tensor: &mut AiTensorDesc;
                             unsafe {
-                                /// SAFETY: node.desc.tensors[i]是从blob副本解析出来的,通过*mut 转为mut引用不会造成ub
+                                // SAFETY: node.desc.tensors[i] is parsed from the copied blob,
+                                // so reborrowing it as a mutable tensor descriptor does not
+                                // alias user memory.
                                 let addr = (&node.desc.tensors[i]) as *const _ as usize + 1;
                                 let trans_tensor = &mut *((addr - 1) as *mut AiTensorDesc);
                                 tensor = trans_tensor;
@@ -502,9 +504,11 @@ impl DeviceOps for K3AiRunner {
 
                         // 映射输出 tensors 到内核地址
                         for i in 0..node.desc.output_count as usize {
-                            let mut tensor: &mut AiTensorDesc;
+                            let tensor: &mut AiTensorDesc;
                             unsafe {
-                                /// SAFETY: node.desc.tensors[i]是从blob副本解析出来的,通过*mut 转为mut引用不会造成ub
+                                // SAFETY: node.desc.tensors[i] is parsed from the copied blob,
+                                // so reborrowing it as a mutable tensor descriptor does not
+                                // alias user memory.
                                 let addr = (&node.desc.tensors[node.desc.input_count as usize + i])
                                     as *const _ as usize
                                     + 1;
@@ -545,7 +549,7 @@ impl DeviceOps for K3AiRunner {
 
                     fence(core::sync::atomic::Ordering::Release);
 
-                    /// TODO: 后面必须实现内存同步写回,我们会实现ai_dma
+                    // TODO: implement write-back synchronization here once the AI DMA path lands.
                     // 通过 IPI 唤醒 core3，在目标核心上进入 scheduler::run_graph。
                     run_on_cpu(3, move || {
                         // acquire屏障

@@ -5,7 +5,7 @@ args = [
   "512M",
   "-nographic",
   "-cpu",
-  "rv64",
+  "rv64,v=true",
   "-device",
   "nvme,drive=disk0,serial=tgoskits,max_ioqpairs=64,msix_qsize=65",
   "-drive",
