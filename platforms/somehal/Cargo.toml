@@ -10,6 +10,7 @@ repository.workspace = true
 version = "0.7.3"
 
 [features]
+debug-runtime-console-output = ["someboot/debug-runtime-console-output"]
 efi = ["someboot/efi"]
 hv = ["mmu", "someboot/hv"]
 mmu = ["someboot/mmu"]

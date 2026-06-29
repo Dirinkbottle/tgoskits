@@ -237,6 +237,7 @@ struct CoreInner<T: RawUart> {
     raw: T,
     irq_mask: InterruptMask,
     state: PortState,
+    hardware_irq_enabled: bool,
     tx_irq_enabled: bool,
 }
 
@@ -246,6 +247,7 @@ impl<T: RawUart> CoreInner<T> {
             raw,
             irq_mask: InterruptMask::empty(),
             state: PortState::Down,
+            hardware_irq_enabled: true,
             tx_irq_enabled: false,
         }
     }
@@ -338,9 +340,30 @@ impl<const TX: usize, const RX: usize> SerialPort<TX, RX> {
         }
 
         core.raw.startup(config)?;
+        core.hardware_irq_enabled = true;
         core.irq_mask = InterruptMask::RX;
         let irq_mask = core.irq_mask;
         core.raw.set_irq_mask(irq_mask);
+        core.tx_irq_enabled = false;
+        core.state = PortState::Running;
+        Ok(SerialIrqOutcome::default())
+    }
+
+    pub fn startup_polling(
+        &self,
+        mut lease: OwnerLease<'_>,
+        config: &Config,
+    ) -> Result<SerialIrqOutcome, ConfigError> {
+        self.assert_owner(&lease);
+        let mut core = unsafe { self.core.access(&mut lease) };
+        if core.state == PortState::Running {
+            return Ok(SerialIrqOutcome::default());
+        }
+
+        core.raw.startup(config)?;
+        core.hardware_irq_enabled = false;
+        core.irq_mask = InterruptMask::empty();
+        core.raw.set_irq_mask(InterruptMask::empty());
         core.tx_irq_enabled = false;
         core.state = PortState::Running;
         Ok(SerialIrqOutcome::default())
@@ -356,6 +379,7 @@ impl<const TX: usize, const RX: usize> SerialPort<TX, RX> {
         core.raw.set_irq_mask(InterruptMask::empty());
         core.raw.shutdown();
         core.irq_mask = InterruptMask::empty();
+        core.hardware_irq_enabled = true;
         core.tx_irq_enabled = false;
         core.state = PortState::Down;
         self.tx.clear_from_owner();
@@ -542,16 +566,22 @@ impl<const TX: usize, const RX: usize> SerialIrqHandler<TX, RX> {
             sent += 1;
         }
 
-        if self.tx.ring.is_empty() {
-            if core.tx_irq_enabled {
-                core.irq_mask.remove(InterruptMask::TX_SPACE);
+        if core.hardware_irq_enabled {
+            if self.tx.ring.is_empty() {
+                if core.tx_irq_enabled {
+                    core.irq_mask.remove(InterruptMask::TX_SPACE);
+                    core.raw.set_irq_mask(core.irq_mask);
+                    core.tx_irq_enabled = false;
+                }
+            } else if !core.tx_irq_enabled {
+                core.irq_mask.insert(InterruptMask::TX_SPACE);
                 core.raw.set_irq_mask(core.irq_mask);
-                core.tx_irq_enabled = false;
+                core.tx_irq_enabled = true;
             }
-        } else if !core.tx_irq_enabled {
-            core.irq_mask.insert(InterruptMask::TX_SPACE);
+        } else if core.tx_irq_enabled {
+            core.irq_mask.remove(InterruptMask::TX_SPACE);
             core.raw.set_irq_mask(core.irq_mask);
-            core.tx_irq_enabled = true;
+            core.tx_irq_enabled = false;
         }
 
         if sent > 0 {

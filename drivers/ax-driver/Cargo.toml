@@ -95,6 +95,8 @@ k3-sdhci = [
     "dep:k3-sdhci",
 ]
 k3-ufs = ["block", "plat-dyn"]
+k3-gmac = ["net", "plat-dyn"]
+k3-pxa-uart = ["serial", "plat-dyn", "some-serial/pxa-uart"]
 rockchip-dwmmc = [
     "block",
     "plat-dyn",

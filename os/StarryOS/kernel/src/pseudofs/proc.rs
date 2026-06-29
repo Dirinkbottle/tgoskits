@@ -1,3 +1,5 @@
+#[cfg(feature = "k3_com260kit")]
+use alloc::collections::BTreeSet;
 use alloc::{
     borrow::Cow,
     boxed::Box,
@@ -23,10 +25,14 @@ use ax_runtime::hal::{
     paging::MappingFlags,
     time::{monotonic_time, wall_time},
 };
+#[cfg(feature = "k3_com260kit")]
+use ax_sync::Mutex;
 use ax_task::{AxCpuMask, AxTaskRef, TaskState, WeakAxTaskRef, current};
 use axfs_ng_vfs::{DeviceId, Filesystem, NodePermission, NodeType, VfsError, VfsResult};
 use kernel_elf_parser::{AuxEntry, AuxType};
 use ksym::KallsymsMapped;
+#[cfg(feature = "k3_com260kit")]
+use spin::LazyLock;
 use starry_process::{Pid, Process};
 use zerocopy::IntoBytes;
 
@@ -49,6 +55,141 @@ static IRQ_CNT: AtomicUsize = AtomicUsize::new(0);
 const PROCFS_INIT_PID: Pid = 1;
 
 pub static KALLSYMS: LazyInit<KallsymsMapped<'static>> = LazyInit::new();
+
+#[cfg(feature = "k3_com260kit")]
+static AI_THREAD_SET: LazyLock<Mutex<BTreeSet<u32>>> =
+    LazyLock::new(|| Mutex::new(BTreeSet::new()));
+
+#[cfg(feature = "k3_com260kit")]
+enum SetAiThreadCommand {
+    Mark(u32),
+    Unmark(u32),
+}
+
+#[cfg(feature = "k3_com260kit")]
+fn parse_set_ai_thread_command(input: &str, current_tid: u32) -> VfsResult<SetAiThreadCommand> {
+    let token = input.trim();
+    if token.is_empty() {
+        return Err(VfsError::InvalidInput);
+    }
+    match token {
+        "1" | "self" => return Ok(SetAiThreadCommand::Mark(current_tid)),
+        "0" | "-self" => return Ok(SetAiThreadCommand::Unmark(current_tid)),
+        _ => {}
+    }
+
+    if let Some(rest) = token.strip_prefix('-') {
+        let tid = rest.parse::<u32>().map_err(|_| VfsError::InvalidInput)?;
+        return Ok(SetAiThreadCommand::Unmark(tid));
+    }
+
+    let tid = token.parse::<u32>().map_err(|_| VfsError::InvalidInput)?;
+    Ok(SetAiThreadCommand::Mark(tid))
+}
+
+#[cfg(feature = "k3_com260kit")]
+fn prune_ai_thread_set(set: &mut BTreeSet<u32>) {
+    let stale = set
+        .iter()
+        .copied()
+        .filter(|tid| get_task(*tid).is_err())
+        .collect::<Vec<_>>();
+    for tid in stale {
+        set.remove(&tid);
+    }
+}
+
+#[cfg(feature = "k3_com260kit")]
+fn render_set_ai_thread_file() -> String {
+    let mut buf = String::new();
+    writeln!(
+        buf,
+        "Write '1' or 'self' to mark current thread as AI thread.\nWrite '0' or '-self' to unmark \
+         current thread.\nWrite '<tid>' to mark a specific thread, '-<tid>' to unmark.\n"
+    )
+    .unwrap();
+
+    let mut set = AI_THREAD_SET.lock();
+    prune_ai_thread_set(&mut set);
+
+    if set.is_empty() {
+        buf.push_str("\nNo AI threads currently marked.\n");
+    } else {
+        writeln!(buf, "\nCurrent AI threads ({}):", set.len()).unwrap();
+        for &tid in set.iter() {
+            let (pid, name) = get_task(tid)
+                .ok()
+                .and_then(|t| {
+                    let thread = t.as_thread();
+                    let pid = thread.proc_data.proc.pid();
+                    let exe = thread.proc_data.exe_path.read();
+                    let name = exe
+                        .rsplit_once('/')
+                        .map(|(_, base)| base)
+                        .unwrap_or(&exe)
+                        .to_string();
+                    Some((pid, name))
+                })
+                .unwrap_or((0, "<unknown>".to_string()));
+            writeln!(buf, "  tid={:<6} pid={:<6} {}", tid, pid, name).unwrap();
+        }
+    }
+
+    buf
+}
+
+#[cfg(feature = "k3_com260kit")]
+fn write_set_ai_thread_file(data: &[u8]) -> VfsResult<()> {
+    // truncate 忽略
+    if data.is_empty() {
+        return Ok(());
+    }
+
+    let input = core::str::from_utf8(data).map_err(|_| VfsError::InvalidInput)?;
+    let current_tid = current().as_thread().tid();
+    let command = parse_set_ai_thread_command(input, current_tid)?;
+
+    let tid = match command {
+        SetAiThreadCommand::Mark(tid) | SetAiThreadCommand::Unmark(tid) => tid,
+    };
+    get_task(tid).map_err(|_| VfsError::NotFound)?;
+
+    let mut set = AI_THREAD_SET.lock();
+    prune_ai_thread_set(&mut set);
+    match command {
+        SetAiThreadCommand::Mark(tid) => {
+            set.insert(tid);
+        }
+        SetAiThreadCommand::Unmark(tid) => {
+            set.remove(&tid);
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(feature = "k3_com260kit")]
+struct SetAiThreadFile;
+
+#[cfg(feature = "k3_com260kit")]
+impl DirectRwFsFileOps for SetAiThreadFile {
+    fn read_at(&self, buf: &mut [u8], offset: u64) -> VfsResult<usize> {
+        let data = render_set_ai_thread_file();
+        if offset >= data.len() as u64 {
+            return Ok(0);
+        }
+
+        let data = &data.as_bytes()[offset as usize..];
+        let read = data.len().min(buf.len());
+        buf[..read].copy_from_slice(&data[..read]);
+        Ok(read)
+    }
+
+    fn write_at(&self, buf: &[u8], _offset: u64) -> VfsResult<usize> {
+        write_set_ai_thread_file(buf)?;
+        Ok(buf.len())
+    }
+}
 
 fn read_kallsyms() -> KallsymsMapped<'static> {
     unsafe extern "C" {
@@ -1394,6 +1535,16 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
         SimpleFile::new_regular(fs.clone(), || {
             Ok(format!("0: {}", IRQ_CNT.load(Ordering::Relaxed)))
         }),
+    );
+
+    #[cfg(feature = "k3_com260kit")]
+    root.add(
+        "set_ai_thread",
+        SpecialFsFile::new_regular_with_perm(
+            fs.clone(),
+            SetAiThreadFile,
+            NodePermission::from_bits_truncate(0o644),
+        ),
     );
 
     root.add("sys", {

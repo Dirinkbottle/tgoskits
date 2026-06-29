@@ -12,6 +12,8 @@ pub use rdif_serial::{
 };
 use rdrive::{Device, DeviceId, DriverGeneric, probe::acpi::AcpiInfo, register::FdtInfo};
 
+#[cfg(feature = "k3-pxa-uart")]
+mod k3;
 mod ns16550;
 mod pl011;
 mod rockchip_fiq;

@@ -1,5 +1,8 @@
 use alloc::{boxed::Box, format, string::String, sync::Arc, vec, vec::Vec};
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use core::{
+    sync::atomic::{AtomicBool, AtomicU32, Ordering},
+    time::Duration,
+};
 
 use ax_driver::serial::{
     self as ax_serial, Config, ConfigError, OwnerId, RxFlag, RxItem, RxQueue, SerialDevice,
@@ -34,6 +37,7 @@ pub type SerialTtyDriver = Tty<SerialReader, SerialWriter>;
 const SERIAL_RX_DRAIN_CHUNK: usize = 256;
 const SERIAL_SYNC_ECHO_LIMIT: usize = 256;
 const SERIAL_DEFAULT_BAUDRATE: u32 = 115_200;
+const SERIAL_POLL_INTERVAL_MS: u64 = 1;
 
 bitflags! {
     #[derive(Clone, Copy, Debug, Default)]
@@ -70,11 +74,11 @@ struct SerialBackend {
     tty_name: String,
     rdrive_device_id: RDriveDeviceId,
     number: usize,
+    mode: SerialBackendMode,
     owner: OwnerId,
     port: Arc<SerialPort>,
     tx: SpinNoIrq<TxQueue>,
     rx: SpinNoIrq<RxQueue>,
-    irq: IrqId,
     irq_handle: SpinNoIrq<Option<IrqHandle>>,
     started: AtomicBool,
     start_lock: Mutex<()>,
@@ -83,6 +87,12 @@ struct SerialBackend {
     output_source: Arc<PollSet>,
     tx_notify: IrqNotify,
     output_lock: Mutex<()>,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum SerialBackendMode {
+    Interrupt { irq: IrqId },
+    Polling,
 }
 
 struct SerialEvents {
@@ -147,13 +157,14 @@ impl DeviceOps for NoConsole {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 struct ConsoleCandidate {
     number: usize,
     device_id: RDriveDeviceId,
 }
 
-#[cfg_attr(test, derive(Debug, PartialEq, Eq))]
+#[derive(Debug)]
+#[cfg_attr(test, derive(PartialEq, Eq))]
 enum ConsoleSelection {
     SelectedDevice(usize),
     TtyS0Fallback(usize),
@@ -202,9 +213,10 @@ pub fn bind_console_to(proc: &Process) -> AxResult<()> {
         && let Some(entry) = SERIAL_REGISTRY.entries.get(index)
     {
         entry.backend.ensure_started()?;
-        ax_runtime::hal::console::claim_runtime_output();
+        // ax_runtime::hal::console::claim_runtime_output();
         return entry.tty.bind_to(proc);
     }
+
     Err(AxError::NoSuchDevice)
 }
 
@@ -219,6 +231,16 @@ pub fn arm_console_irq() {
 impl SerialRegistry {
     fn discover() -> Self {
         let serials = ax_serial::take_serial_devices();
+        warn!(
+            "SerialRegistry::discover: take_serial_devices returned {} device(s)",
+            serials.len()
+        );
+        for (i, s) in serials.iter().enumerate() {
+            warn!(
+                "  serial[{i}]: name={}, path={}, alias={:?}, irq={:?}",
+                s.name, s.info.fdt_path, s.info.alias_index, s.info.irq
+            );
+        }
         let numbers = assign_tty_numbers(
             serials
                 .iter()
@@ -226,6 +248,7 @@ impl SerialRegistry {
                 .collect::<Vec<_>>()
                 .as_slice(),
         );
+        warn!("SerialRegistry::discover: assigned ttyS numbers = {numbers:?}");
 
         let mut entries = Vec::new();
         for (serial, number) in serials.into_iter().zip(numbers) {
@@ -237,7 +260,13 @@ impl SerialRegistry {
                 continue;
             };
             match new_serial_tty(number, serial) {
-                Ok(entry) => entries.push(entry),
+                Ok(entry) => {
+                    warn!(
+                        "SerialRegistry::discover: ttyS{number} created, device_id={:?}",
+                        entry.backend.rdrive_device_id
+                    );
+                    entries.push(entry);
+                }
                 Err(err) => warn!("Skipping ttyS{number}: {err:?}"),
             }
         }
@@ -250,8 +279,17 @@ impl SerialRegistry {
                 device_id: entry.backend.rdrive_device_id,
             })
             .collect::<Vec<_>>();
-        let console_selection =
-            select_console_candidate(&candidates, ax_runtime::hal::console::device_id());
+        warn!(
+            "SerialRegistry::discover: candidates = {:?}",
+            candidates
+                .iter()
+                .map(|c| (c.number, c.device_id))
+                .collect::<Vec<_>>()
+        );
+        let device_id_result = ax_runtime::hal::console::device_id();
+        warn!("SerialRegistry::discover: hal::console::device_id() = {device_id_result:?}");
+        let console_selection = select_console_candidate(&candidates, device_id_result);
+        warn!("SerialRegistry::discover: select_console_candidate = {console_selection:?}");
         let console_index = console_selection.as_ref().map(ConsoleSelection::index);
         if let Some(index) = console_index {
             let number = entries[index].number;
@@ -283,16 +321,7 @@ fn new_serial_tty(number: usize, serial: SerialDevice) -> AxResult<SerialTtyEntr
         info,
         runtime,
     } = serial;
-    let Some(irq_binding) = info.irq.clone() else {
-        return Err(AxError::Unsupported);
-    };
-    let irq_id = ax_runtime::irq::resolve_binding_irq(irq_binding).map_err(|err| {
-        warn!(
-            "Failed to resolve {} IRQ binding for {}: {err:?}",
-            tty_name, info.fdt_path
-        );
-        AxError::Unsupported
-    })?;
+    let mode = serial_backend_mode(&tty_name, &info);
     let port = runtime.port;
     let tx = runtime.tx;
     let rx = runtime.rx;
@@ -303,11 +332,11 @@ fn new_serial_tty(number: usize, serial: SerialDevice) -> AxResult<SerialTtyEntr
         tty_name: tty_name.clone(),
         rdrive_device_id,
         number,
+        mode,
         owner,
         port,
         tx: SpinNoIrq::new(tx),
         rx: SpinNoIrq::new(rx),
-        irq: irq_id,
         irq_handle: SpinNoIrq::new(None),
         started: AtomicBool::new(false),
         start_lock: Mutex::new(()),
@@ -318,7 +347,11 @@ fn new_serial_tty(number: usize, serial: SerialDevice) -> AxResult<SerialTtyEntr
         output_lock: Mutex::new(()),
     });
 
-    backend.register_irq(irq)?;
+    if let SerialBackendMode::Interrupt { irq: irq_id } = mode {
+        backend.register_irq(irq_id, irq)?;
+    } else {
+        spawn_serial_poll_worker(backend.clone());
+    }
     spawn_serial_event_worker(backend.clone());
 
     let terminal = Arc::new(Terminal::default());
@@ -337,8 +370,13 @@ fn new_serial_tty(number: usize, serial: SerialDevice) -> AxResult<SerialTtyEntr
         },
     );
     info!(
-        "{} registered: path={}, alias={:?}, paddr={:#x}, mapped={:#x}, irq={:?}, mode=interrupt",
-        tty_name, info.fdt_path, info.alias_index, info.paddr, info.mapped_base, irq_id
+        "{} registered: path={}, alias={:?}, paddr={:#x}, mapped={:#x}, mode={}",
+        tty_name,
+        info.fdt_path,
+        info.alias_index,
+        info.paddr,
+        info.mapped_base,
+        mode.label()
     );
     Ok(SerialTtyEntry {
         number,
@@ -347,8 +385,38 @@ fn new_serial_tty(number: usize, serial: SerialDevice) -> AxResult<SerialTtyEntr
     })
 }
 
+fn serial_backend_mode(tty_name: &str, info: &ax_serial::SerialDeviceInfo) -> SerialBackendMode {
+    let Some(irq_binding) = info.irq.clone() else {
+        warn!(
+            "{} at {} has no IRQ binding; using polling mode",
+            tty_name, info.fdt_path
+        );
+        return SerialBackendMode::Polling;
+    };
+
+    match ax_runtime::irq::resolve_binding_irq(irq_binding) {
+        Ok(irq) => SerialBackendMode::Interrupt { irq },
+        Err(err) => {
+            warn!(
+                "Failed to resolve {} IRQ binding for {}: {err:?}; using polling mode",
+                tty_name, info.fdt_path
+            );
+            SerialBackendMode::Polling
+        }
+    }
+}
+
+impl SerialBackendMode {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Interrupt { .. } => "interrupt",
+            Self::Polling => "polling",
+        }
+    }
+}
+
 impl SerialBackend {
-    fn register_irq(self: &Arc<Self>, mut irq: SerialIrqHandler) -> AxResult<()> {
+    fn register_irq(self: &Arc<Self>, irq_id: IrqId, mut irq: SerialIrqHandler) -> AxResult<()> {
         let backend = self.clone();
         let request = IrqRequest::new_boxed(Box::new(move |ctx| {
             let outcome = backend.handle_irq_on_owner(ctx.cpu, &mut irq);
@@ -365,7 +433,7 @@ impl SerialBackend {
         .share_mode(ShareMode::Shared)
         .affinity(IrqAffinity::Fixed(CpuId(self.owner.0)))
         .auto_enable(AutoEnable::No);
-        match ax_runtime::hal::irq::request_irq(self.irq, request) {
+        match ax_runtime::hal::irq::request_irq(irq_id, request) {
             Ok(handle) => {
                 *self.irq_handle.lock() = Some(handle);
                 Ok(())
@@ -373,7 +441,7 @@ impl SerialBackend {
             Err(err) => {
                 warn!(
                     "Failed to register {} IRQ handler for irq {:?}: {err:?}",
-                    self.tty_name, self.irq
+                    self.tty_name, irq_id
                 );
                 Err(AxError::Unsupported)
             }
@@ -389,13 +457,12 @@ impl SerialBackend {
             return true;
         }
 
-        let Some(handle) = *self.irq_handle.lock() else {
-            return false;
+        let config = Config::new().baudrate(startup_baudrate(self.baudrate()));
+        let startup_result = match self.mode {
+            SerialBackendMode::Interrupt { .. } => self.startup_port(&config),
+            SerialBackendMode::Polling => self.startup_polling_port(&config),
         };
-
-        if let Err(err) =
-            self.startup_port(&Config::new().baudrate(startup_baudrate(self.baudrate())))
-        {
+        if let Err(err) = startup_result {
             warn!(
                 "{} failed to start serial port {}: {:?}",
                 self.tty_name, self.name, err
@@ -403,13 +470,19 @@ impl SerialBackend {
             return false;
         }
 
-        if let Err(err) = ax_runtime::hal::irq::enable_irq(handle) {
-            self.shutdown_port();
-            warn!(
-                "Failed to enable {} IRQ handler for irq {:?}: {err:?}",
-                self.tty_name, self.irq
-            );
-            return false;
+        if let SerialBackendMode::Interrupt { irq } = self.mode {
+            let Some(handle) = *self.irq_handle.lock() else {
+                self.shutdown_port();
+                return false;
+            };
+            if let Err(err) = ax_runtime::hal::irq::enable_irq(handle) {
+                self.shutdown_port();
+                warn!(
+                    "Failed to enable {} IRQ handler for irq {:?}: {err:?}",
+                    self.tty_name, irq
+                );
+                return false;
+            }
         }
 
         self.started.store(true, Ordering::Release);
@@ -432,6 +505,11 @@ impl SerialBackend {
 
     fn startup_port(&self, config: &Config) -> Result<SerialIrqOutcome, ConfigError> {
         ax_serial::run_on_owner(self.owner, |lease| self.port.startup(lease, config))
+            .map_err(|_| ConfigError::RegisterError)?
+    }
+
+    fn startup_polling_port(&self, config: &Config) -> Result<SerialIrqOutcome, ConfigError> {
+        ax_serial::run_on_owner(self.owner, |lease| self.port.startup_polling(lease, config))
             .map_err(|_| ConfigError::RegisterError)?
     }
 
@@ -502,6 +580,23 @@ fn spawn_serial_event_worker(backend: Arc<SerialBackend>) {
                     let outcome = backend.service_on_owner(SerialSoftWork::TX_KICK);
                     publish_serial_outcome(&backend, outcome, false);
                 }
+            }
+        },
+        task_name,
+    );
+}
+
+fn spawn_serial_poll_worker(backend: Arc<SerialBackend>) {
+    let task_name = format!("{}-poll", backend.tty_name);
+    ax_task::spawn_with_name(
+        move || {
+            let interval = Duration::from_millis(SERIAL_POLL_INTERVAL_MS);
+            loop {
+                if backend.started.load(Ordering::Acquire) {
+                    let outcome = backend.service_on_owner(SerialSoftWork::RESERVICE);
+                    publish_serial_outcome(&backend, outcome, false);
+                }
+                ax_task::sleep(interval);
             }
         },
         task_name,
@@ -679,23 +774,37 @@ fn select_console_candidate(
 ) -> Option<ConsoleSelection> {
     match selected_device_id {
         Ok(device_id) => {
+            warn!(
+                "select_console_candidate: searching for device_id={device_id:?} among {} \
+                 candidate(s)",
+                candidates.len()
+            );
             if let Some(index) = candidates
                 .iter()
                 .position(|candidate| candidate.device_id == device_id)
             {
+                warn!("select_console_candidate: matched candidate[{index}] -> SelectedDevice");
                 return Some(ConsoleSelection::SelectedDevice(index));
             }
             warn!("selected console device {device_id:?} did not match a discovered serial TTY");
             None
         }
-        Err(ConsoleDeviceIdError::NotSpecified) => candidates
-            .iter()
-            .position(|candidate| candidate.number == 0)
-            .map(ConsoleSelection::TtyS0Fallback),
+        Err(ConsoleDeviceIdError::NotSpecified) => {
+            warn!(
+                "select_console_candidate: NotSpecified, falling back to ttyS0 (candidates={})",
+                candidates.len()
+            );
+            let result = candidates
+                .iter()
+                .position(|candidate| candidate.number == 0)
+                .map(ConsoleSelection::TtyS0Fallback);
+            warn!("select_console_candidate: ttyS0 fallback = {result:?}");
+            result
+        }
         Err(
             err @ (ConsoleDeviceIdError::NoHardwareDevice | ConsoleDeviceIdError::DeviceNotFound),
         ) => {
-            debug!("No hardware console TTY selected: {err:?}");
+            warn!("select_console_candidate: no hardware console ({err:?})");
             None
         }
     }

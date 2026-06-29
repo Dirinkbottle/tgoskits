@@ -1,8 +1,6 @@
 //! Special devices
 
 mod card0;
-#[cfg(feature = "k3_com260kit")]
-mod k3_airunner;
 #[cfg(feature = "rknpu")]
 mod card1;
 #[cfg(feature = "rknpu")]
@@ -13,6 +11,8 @@ pub mod event;
 mod fb;
 #[cfg(all(feature = "sg2002", not(feature = "plat-dyn")))]
 mod irq_byte_ring;
+#[cfg(feature = "k3_com260kit")]
+mod k3_airunner;
 mod kmsg;
 #[cfg(feature = "k230-kpu")]
 mod kpu;

@@ -64,6 +64,19 @@ const ARCH_SPECS: &[ArchSpec] = &[
         },
     },
     ArchSpec {
+        arch: "riscv64v",
+        target: "riscv64gcv-unknown-none-elf",
+        default_rootfs_image: "rootfs-riscv64-alpine.img",
+        starry_default_platform: None,
+        cross_compile: CrossCompileSpec {
+            llvm_target: "riscv64-linux-musl",
+            cmake_system_processor: "riscv64",
+            guest_tool_dir: "usr/riscv64-alpine-linux-musl/bin",
+            gnu_tool_prefix: "riscv64-linux-musl",
+            qemu_user_binaries: &["qemu-riscv64-static", "qemu-riscv64"],
+        },
+    },
+    ArchSpec {
         arch: "loongarch64",
         target: "loongarch64-unknown-none-softfloat",
         default_rootfs_image: "rootfs-loongarch64-alpine.img",

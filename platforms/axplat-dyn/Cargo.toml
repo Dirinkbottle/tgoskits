@@ -11,6 +11,7 @@ repository.workspace = true
 
 [features]
 default = ["smp", "irq" ]
+debug-runtime-console-output = ["somehal/debug-runtime-console-output"]
 smp = ["ax-plat/smp"]
 irq = ["ax-plat/irq"]
 rtc = []

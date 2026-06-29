@@ -24,6 +24,7 @@ license = "Apache-2.0"
 default = []
 exception-table = []
 fp-simd = []
+vector = []
 tls = []
 uspace = ["exception-table"]
 arm-el2 = ["ax-page-table-entry/arm-el2"]

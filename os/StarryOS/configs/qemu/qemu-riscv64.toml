@@ -5,7 +5,7 @@ args = [
   "512M",
   "-nographic",
   "-cpu",
-  "rv64",
+  "rv64,v=true",
   "-device",
   "virtio-blk-pci,drive=disk0",
   "-drive",

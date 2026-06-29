@@ -1,5 +1,7 @@
-#[cfg(feature = "fp-simd")]
+#[cfg(any(feature = "fp-simd", feature = "vector"))]
 use riscv::register::sstatus;
+#[cfg(feature = "vector")]
+use riscv::register::sstatus::VS;
 use riscv::{
     interrupt::{
         Trap,
@@ -57,6 +59,40 @@ fn riscv_trap_handler(tf: &mut TrapFrame) {
                 handle_page_fault(tf, PageFaultFlags::EXECUTE)
             }
             Trap::Exception(E::Breakpoint) => handle_breakpoint(tf),
+            Trap::Exception(E::IllegalInstruction) => {
+                #[cfg(feature = "vector")]
+                {
+                    let current_vs = sstatus::read().vs();
+                    if current_vs == VS::Off {
+                        warn!(
+                            "vector extension not enabled, enabling VS = Initial @ {:#x}",
+                            tf.sepc
+                        );
+                        unsafe { sstatus::set_vs(VS::Initial) };
+                        // fall through to update tf.sstatus below
+                    } else {
+                        let bt = tf.backtrace();
+                        panic!(
+                            "IllegalInstruction @ {:#x}, stval={:#x}:\n{:#x?}\n{}",
+                            tf.sepc,
+                            stval::read(),
+                            tf,
+                            bt.kind("trap")
+                        );
+                    }
+                }
+                #[cfg(not(feature = "vector"))]
+                {
+                    let bt = tf.backtrace();
+                    panic!(
+                        "IllegalInstruction @ {:#x}, stval={:#x}:\n{:#x?}\n{}",
+                        tf.sepc,
+                        stval::read(),
+                        tf,
+                        bt.kind("trap")
+                    );
+                }
+            }
             Trap::Interrupt(_) => {
                 crate::trap::dispatch_irq(scause.bits());
             }
@@ -83,8 +119,9 @@ fn riscv_trap_handler(tf: &mut TrapFrame) {
         );
     }
 
-    // Update tf.sstatus to preserve current hardware FS state
-    // This replaces the assembly-level FS handling workaround
+    // Update tf.sstatus to preserve current hardware FS/VS state
     #[cfg(feature = "fp-simd")]
     tf.sstatus.set_fs(sstatus::read().fs());
+    #[cfg(feature = "vector")]
+    tf.sstatus.set_vs(sstatus::read().vs());
 }

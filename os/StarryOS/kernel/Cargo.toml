@@ -49,6 +49,7 @@ sg2002-wifi = [
 ]
 stack-guard-page = ["ax-feat/stack-guard-page"]
 stack-protector = ["ax-feat/stack-protector"]
+vector = ["ax-cpu/vector"]
 
 [dependencies]
 ax-feat = { workspace = true, features = [
