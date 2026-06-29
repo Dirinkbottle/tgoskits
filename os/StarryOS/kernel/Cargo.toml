@@ -79,8 +79,10 @@ rk3588-pwm = [
     "dep:rdif-pwm",
 ]
 k230-kpu = ["ax-hal/xuantie-c9xx", "dep:k230-kpu"]
+k3_com260kit = []
 vsock = ["ax-runtime/vsock"]
-dynamic_debug = ["ipi"]sg2002 = [
+dynamic_debug = ["ipi"]
+sg2002 = [
     "ax-runtime/irq",
     "ax-driver/usb",
     "dep:rdif-pwm",
@@ -105,6 +107,8 @@ smp = ["ax-std/smp"]
 stack-guard-page = ["ax-runtime/stack-guard-page"]
 stack-protector = ["ax-runtime/stack-protector"]
 axtest = []
+vector = ["ax-cpu/vector"]
+
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(axtest)', 'cfg(feature, values("ax-std"))'] }

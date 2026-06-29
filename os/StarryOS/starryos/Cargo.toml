@@ -34,7 +34,6 @@ k230 = [
   "ax-driver/k230-sdhci",
 ]
 k3_com260kit = ["starry-kernel/k3_com260kit"]
-plat-dyn = ["dep:axplat-dyn", "starry-kernel/plat-dyn"]
 
 
 rknpu = ["ax-driver/rknpu", "starry-kernel/rknpu"]

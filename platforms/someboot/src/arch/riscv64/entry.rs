@@ -15,11 +15,12 @@ pub unsafe extern "C" fn _head() -> ! {
     naked_asm!(
         ".option push",
         ".option norvc",
-        // code0/code1: use lla+jr instead of j to avoid R_RISCV_JAL
-        // range limit (±1MB); lla expands to auipc+addi with ±2GB reach
-        "lla t0, {kernel_entry}",
-        "jr t0",
-        "nop",
+        // Linux RISC-V boot image header starts with 4-byte code0 and
+        // 4-byte reserved code1; keep the following fields at Linux/U-Boot
+        // offsets. Reference: Linux 5.4
+        // arch/riscv/kernel/head.S:24-45 and arch/riscv/include/asm/image.h:51-62.
+        "j .Lsomeboot_riscv64_head_trampoline",
+        ".word 0",
         ".option pop",
         // text_offset
         ".quad {text_offset}",
@@ -36,6 +37,14 @@ pub unsafe extern "C" fn _head() -> ! {
         ".quad {magic}",
         ".word {magic2}",
         ".word 0",
+        ".option push",
+        ".option norvc",
+        ".Lsomeboot_riscv64_head_trampoline:",
+        // Use lla+jr instead of a direct j to avoid R_RISCV_JAL range limits;
+        // lla expands to auipc+addi with ±2GB reach.
+        "lla t0, {kernel_entry}",
+        "jr t0",
+        ".option pop",
         kernel_entry = sym kernel_entry,
         text_offset = const RISCV_LINUX_IMAGE_TEXT_OFFSET,
         flags = const RISCV_LINUX_IMAGE_FLAGS,

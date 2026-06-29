@@ -6,6 +6,8 @@ use core::{
 
 use ax_memory_addr::VirtAddr;
 use cpu_local::{CurrentThreadHeader, PreparedThreadSwitch};
+#[cfg(feature = "vector")]
+use riscv::register::sstatus::VS;
 use riscv::register::sstatus::{self, FS};
 
 use crate::{KernelTlsBase, TaskLocalState};
@@ -124,6 +126,62 @@ impl FpState {
         // SAFETY: the same IRQ-disabled, CPU-pinned handoff still owns this
         // hart, and every FS variant is a valid architectural encoding.
         unsafe { sstatus::set_fs(next_fp_state.fs) };
+    }
+}
+
+/// Per-register vector length in bytes, determined at runtime from the `vlenb` CSR.
+///
+/// Set to 0 as placeholder. The actual value must match the target hardware's VLEN
+/// (e.g., VLEN=256 bits → 32 bytes on SpacemiT K3 X60). Read the `vlenb` CSR to
+/// determine the correct value.
+#[cfg(feature = "vector")]
+const VLEN_BYTES: usize = 0;
+
+/// Vector register state of RISC-V V extension.
+///
+/// Contains 32 vector registers (v0-v31) and the seven unprivileged control and status
+/// registers (CSRs): `vstart`, `vxsat`, `vxrm`, `vcsr`, `vtype`, `vl`, `vlenb`.
+/// `vlenb` is read-only in hardware and is saved for reference only (not restored).
+#[cfg(feature = "vector")]
+#[repr(C, align(16))]
+#[derive(Debug, Clone)]
+pub struct VState {
+    /// vector registers v0-v31, each [`VLEN_BYTES`] wide
+    pub v_regs: [[u8; VLEN_BYTES]; 32],
+    /// Vector start index CSR (vstart)
+    pub vstart: usize,
+    /// Fixed-point saturation flag CSR (vxsat)
+    pub vxsat: usize,
+    /// Fixed-point rounding mode CSR (vxrm)
+    pub vxrm: usize,
+    /// Vector control and status register CSR (vcsr)
+    pub vcsr: usize,
+    /// Vector type register CSR (vtype)
+    pub vtype: usize,
+    /// Vector length CSR (vl)
+    pub vl: usize,
+    /// Vector register length in bytes CSR (vlenb)
+    ///
+    /// Read-only hardware constant. Saved for reference, not restored on context switch.
+    pub vlenb: usize,
+    /// Vector context status (off, initial, clean, dirty)
+    pub vs: VS,
+}
+
+#[cfg(feature = "vector")]
+impl Default for VState {
+    fn default() -> Self {
+        Self {
+            v_regs: [[0u8; VLEN_BYTES]; 32],
+            vstart: 0,
+            vxsat: 0,
+            vxrm: 0,
+            vcsr: 0,
+            vtype: 0,
+            vl: 0,
+            vlenb: 0,
+            vs: VS::Initial,
+        }
     }
 }
 
@@ -317,6 +375,8 @@ pub struct TaskContext {
     page_table_root: ax_memory_addr::PhysAddr,
     #[cfg(feature = "fp-simd")]
     pub fp_state: FpState,
+    #[cfg(feature = "vector")]
+    pub v_state: VState,
 }
 
 // RISC-V load/store macros accept a machine-word index. Derive every index

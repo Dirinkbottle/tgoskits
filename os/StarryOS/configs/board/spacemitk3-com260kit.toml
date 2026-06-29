@@ -1,6 +1,7 @@
 env = {}
 features = [
   "ax-driver/serial",
+  "ax-driver/k3-pxa-uart",
   "ax-driver/k3-ufs",
 ]
 log = "Info"

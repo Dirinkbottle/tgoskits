@@ -15,14 +15,31 @@ pub enum ConsoleDeviceIdError {
 }
 
 pub fn device_id() -> Result<DeviceId, ConsoleDeviceIdError> {
-    match device_id_from_bootargs(someboot::cmdline()) {
-        Ok(device_id) => Ok(device_id),
-        Err(ConsoleDeviceIdError::NotSpecified) => device_id_from_acpi_spcr()
-            .or_else(device_id_from_fdt_stdout)
-            .ok_or(ConsoleDeviceIdError::NotSpecified),
+    let cmdline = someboot::cmdline();
+    warn!("console device_id: bootargs cmdline = {cmdline:?}");
+    match device_id_from_bootargs(cmdline) {
+        Ok(device_id) => {
+            warn!("console device_id: resolved from bootargs: {device_id:?}");
+            Ok(device_id)
+        }
+        Err(ConsoleDeviceIdError::NotSpecified) => {
+            warn!("console device_id: no console= in bootargs, trying ACPI SPCR...");
+            let acpi = device_id_from_acpi_spcr();
+            warn!("console device_id: ACPI SPCR result = {acpi:?}");
+            if let Some(device_id) = acpi {
+                return Ok(device_id);
+            }
+            warn!("console device_id: trying FDT /chosen/stdout-path...");
+            let fdt = device_id_from_fdt_stdout();
+            warn!("console device_id: FDT stdout-path result = {fdt:?}");
+            fdt.ok_or(ConsoleDeviceIdError::NotSpecified)
+        }
         Err(
             err @ (ConsoleDeviceIdError::NoHardwareDevice | ConsoleDeviceIdError::DeviceNotFound),
-        ) => Err(err),
+        ) => {
+            warn!("console device_id: bootargs error = {err:?}");
+            Err(err)
+        }
     }
 }
 

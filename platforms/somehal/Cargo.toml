@@ -11,6 +11,7 @@ version = "0.8.2"
 
 [features]
 axtest = []
+debug-runtime-console-output = ["someboot/debug-runtime-console-output"]
 efi = ["someboot/efi"]
 hv = ["mmu", "someboot/hv", "dep:ax-cpu"]
 mmu = ["someboot/mmu"]

@@ -91,6 +91,8 @@ k3-sdhci = [
     "dep:k3-sdhci",
 ]
 k3-ufs = ["block"]
+k3-gmac = ["net"]
+k3-pxa-uart = ["serial", "some-serial/pxa-uart"]
 phytium-mci = [
     "block",
     "dep:phytium-mci-host",
