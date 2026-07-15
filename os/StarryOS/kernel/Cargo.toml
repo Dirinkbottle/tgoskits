@@ -24,7 +24,7 @@ memtrack = ["ax-feat/backtrace", "ax-alloc/tracking"]
 rknpu = ["ax-driver/rknpu"]
 std-compat = []
 k230-kpu = ["ax-feat/xuantie-c9xx", "dep:axklib", "dep:k230-kpu"]
-k3_com260kit = []
+k3_com260kit = ["dep:k3_aiUabi", "dep:k3_aiScheduler"]
 plat-dyn = [
     "dep:axplat-dyn",
     "ax-feat/plat-dyn",
@@ -70,8 +70,15 @@ ax-feat = { workspace = true, features = [
 
 
 ov-channels = { version = "0.2" }
-k3_aiUabi = {path = "/home/inkbottle/othersrc/k3x-HERA-RT/k3_aiUabi"}
-k3_aiScheduler = {path = "/home/inkbottle/othersrc/k3x-HERA-RT/k3_aiScheduler"}
+# K3 AI 运行时依赖（k3_aiUabi / k3_aiScheduler）：仅 k3_com260kit feature 下需要，
+# 故 optional + feature gate（dep: 语法）。非 K3 构建完全不解析这两个 crate。
+#
+# crate 来自作者公开 github 仓库 Dirinkbottle/k3x-HERA-RT（根目录无 Cargo.toml，
+# 是松散 crate 集合，cargo 自动搜索整个仓库找 package.name 匹配的 Cargo.toml）。
+# 此前用本机绝对路径（/home/inkbottle/...），换机器后 cargo 无法解析 manifest，
+# 导致整个 workspace 的 cargo metadata 失败。
+k3_aiUabi = { git = "https://github.com/Dirinkbottle/k3x-HERA-RT.git", optional = true }
+k3_aiScheduler = { git = "https://github.com/Dirinkbottle/k3x-HERA-RT.git", optional = true }
 
 ax-alloc = { workspace = true }
 ax-config.workspace = true

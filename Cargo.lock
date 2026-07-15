@@ -4580,6 +4580,7 @@ dependencies = [
 [[package]]
 name = "k3_aiScheduler"
 version = "0.1.0"
+source = "git+https://github.com/Dirinkbottle/k3x-HERA-RT.git#171c70e56b917677620eb3b2ea88aa0650b8dd84"
 dependencies = [
  "dma-api 0.8.2",
  "k3_aiUabi",
@@ -4592,6 +4593,7 @@ dependencies = [
 [[package]]
 name = "k3_aiUabi"
 version = "0.1.0"
+source = "git+https://github.com/Dirinkbottle/k3x-HERA-RT.git#171c70e56b917677620eb3b2ea88aa0650b8dd84"
 dependencies = [
  "bitflags 2.13.0",
 ]
@@ -4599,6 +4601,7 @@ dependencies = [
 [[package]]
 name = "k3_kernel_backend"
 version = "0.1.0"
+source = "git+https://github.com/Dirinkbottle/k3x-HERA-RT.git#171c70e56b917677620eb3b2ea88aa0650b8dd84"
 dependencies = [
  "k3_aiUabi",
  "log",
