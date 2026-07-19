@@ -1,5 +1,6 @@
 //! Special devices
 
+mod accelerator;
 mod card0;
 #[cfg(feature = "rknpu")]
 mod card1;
@@ -598,8 +599,8 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
         Device::new(
             fs.clone(),
             NodeType::CharacterDevice,
-            k3_airunner::K3_AIRUNNER_DEVICE_ID,
-            Arc::new(k3_airunner::K3AiRunner),
+            accelerator::k3AiCore::K3_AIRUNNER_DEVICE_ID,
+            Arc::new(accelerator::k3AiCore::K3AiRunner),
         ),
     );
 
