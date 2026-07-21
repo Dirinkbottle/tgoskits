@@ -584,6 +584,10 @@ impl TaskContext {
             unsafe { crate::asm::write_user_page_table(_next_ctx.page_table_root) };
             crate::asm::flush_tlb(None);
         }
+        #[cfg(feature = "vector")]
+        {
+            self.v_state.switch_to(&_next_ctx.v_state);
+        }
     }
 
     /// Performs only the final GPR/current/TLS transfer.
