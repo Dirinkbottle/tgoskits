@@ -8,7 +8,8 @@ features = [
   "ax-driver/virtio-input",
   "ax-driver/virtio-socket",
   "starry-kernel/input",
+  "starry-kernel/vector",
   "starry-kernel/vsock",
 ]
-log = "Warn"
+log = "Info"
 target = "riscv64gc-unknown-none-elf"
