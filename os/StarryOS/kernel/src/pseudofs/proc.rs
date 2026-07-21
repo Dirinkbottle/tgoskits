@@ -1,5 +1,5 @@
 #[cfg(feature = "k3_com260kit")]
-use alloc::collections::BTreeSet;
+use alloc::collections::BTreeMap;
 use alloc::{
     borrow::Cow,
     boxed::Box,
@@ -59,46 +59,57 @@ const PROCFS_INIT_PID: Pid = 1;
 pub static KALLSYMS: LazyInit<KallsymsMapped<'static>> = LazyInit::new();
 
 #[cfg(feature = "k3_com260kit")]
-static AI_THREAD_SET: LazyLock<Mutex<BTreeSet<u32>>> =
-    LazyLock::new(|| Mutex::new(BTreeSet::new()));
+/// AI 核心范围: 8-15 (共 8 个核心).
+const AI_CORE_START: u32 = 8;
+#[cfg(feature = "k3_com260kit")]
+const AI_CORE_END: u32 = 15;
+
+#[cfg(feature = "k3_com260kit")]
+static AI_THREAD_SET: LazyLock<Mutex<BTreeMap<u32, Vec<u32>>>> =
+    LazyLock::new(|| Mutex::new(BTreeMap::new()));
 
 #[cfg(feature = "k3_com260kit")]
 enum SetAiThreadCommand {
-    Mark(u32),
-    Unmark(u32),
+    Mark,
+    Unmark,
 }
 
 #[cfg(feature = "k3_com260kit")]
-fn parse_set_ai_thread_command(input: &str, current_tid: u32) -> VfsResult<SetAiThreadCommand> {
+fn parse_set_ai_thread_command(input: &str) -> VfsResult<SetAiThreadCommand> {
     let token = input.trim();
     if token.is_empty() {
         return Err(VfsError::InvalidInput);
     }
     match token {
-        "1" | "self" => return Ok(SetAiThreadCommand::Mark(current_tid)),
-        "0" | "-self" => return Ok(SetAiThreadCommand::Unmark(current_tid)),
-        _ => {}
+        "1" | "self" => Ok(SetAiThreadCommand::Mark),
+        "0" | "-self" => Ok(SetAiThreadCommand::Unmark),
+        _ => Err(VfsError::InvalidInput),
     }
-
-    if let Some(rest) = token.strip_prefix('-') {
-        let tid = rest.parse::<u32>().map_err(|_| VfsError::InvalidInput)?;
-        return Ok(SetAiThreadCommand::Unmark(tid));
-    }
-
-    let tid = token.parse::<u32>().map_err(|_| VfsError::InvalidInput)?;
-    Ok(SetAiThreadCommand::Mark(tid))
 }
 
+/// 选出当前负载最小的 AI 核心（8-15），排除 `exclude` 指定的核心。
+/// 用于重新 mark 时强制迁移到与当前所在核不同的核心。
 #[cfg(feature = "k3_com260kit")]
-fn prune_ai_thread_set(set: &mut BTreeSet<u32>) {
-    let stale = set
-        .iter()
-        .copied()
-        .filter(|tid| get_task(*tid).is_err())
-        .collect::<Vec<_>>();
-    for tid in stale {
-        set.remove(&tid);
+fn pick_least_loaded_ai_core(map: &BTreeMap<u32, Vec<u32>>, exclude: Option<u32>) -> u32 {
+    (AI_CORE_START..=AI_CORE_END)
+        .filter(|core| exclude.is_none_or(|ex| *core != ex))
+        .min_by_key(|core| map.get(core).map_or(0, |v| v.len()))
+        .unwrap_or_else(|| {
+            // 所有核都被排除（只剩 1 个 AI 核的情况），
+            // 回退到不排除的选取。
+            (AI_CORE_START..=AI_CORE_END)
+                .min_by_key(|core| map.get(core).map_or(0, |v| v.len()))
+                .unwrap_or(AI_CORE_START)
+        })
+}
+
+/// 清除 map 中已退出的线程 tid，同时清理空的 Vec。
+#[cfg(feature = "k3_com260kit")]
+fn prune_ai_thread_set(map: &mut BTreeMap<u32, Vec<u32>>) {
+    for tids in map.values_mut() {
+        tids.retain(|tid| get_task(*tid).is_ok());
     }
+    map.retain(|_, tids| !tids.is_empty());
 }
 
 #[cfg(feature = "k3_com260kit")]
@@ -107,33 +118,42 @@ fn render_set_ai_thread_file() -> String {
     writeln!(
         buf,
         "Write '1' or 'self' to mark current thread as AI thread.\nWrite '0' or '-self' to unmark \
-         current thread.\nWrite '<tid>' to mark a specific thread, '-<tid>' to unmark.\n"
+         current thread.\n"
     )
     .unwrap();
 
-    let mut set = AI_THREAD_SET.lock();
-    prune_ai_thread_set(&mut set);
+    let map = AI_THREAD_SET.lock();
+    let total: usize = map.values().map(|v| v.len()).sum();
 
-    if set.is_empty() {
+    if total == 0 {
         buf.push_str("\nNo AI threads currently marked.\n");
     } else {
-        writeln!(buf, "\nCurrent AI threads ({}):", set.len()).unwrap();
-        for &tid in set.iter() {
-            let (pid, name) = get_task(tid)
-                .ok()
-                .and_then(|t| {
-                    let thread = t.as_thread();
-                    let pid = thread.proc_data.proc.pid();
-                    let exe = thread.proc_data.exe_path.read();
-                    let name = exe
-                        .rsplit_once('/')
-                        .map(|(_, base)| base)
-                        .unwrap_or(&exe)
-                        .to_string();
-                    Some((pid, name))
-                })
-                .unwrap_or((0, "<unknown>".to_string()));
-            writeln!(buf, "  tid={:<6} pid={:<6} {}", tid, pid, name).unwrap();
+        writeln!(buf, "\nCurrent AI threads ({}):", total).unwrap();
+        for core in AI_CORE_START..=AI_CORE_END {
+            if let Some(tids) = map.get(&core) {
+                for &tid in tids {
+                    let (pid, name) = get_task(tid)
+                        .ok()
+                        .map(|t| {
+                            let thread = t.as_thread();
+                            let pid = thread.proc_data.proc.pid();
+                            let exe = thread.proc_data.exe_path.read();
+                            let name = exe
+                                .rsplit_once('/')
+                                .map(|(_, base)| base)
+                                .unwrap_or(&exe)
+                                .to_string();
+                            (pid, name)
+                        })
+                        .unwrap_or((0, "<unknown>".to_string()));
+                    writeln!(
+                        buf,
+                        "  core={:<3} tid={:<6} pid={:<6} {}",
+                        core, tid, pid, name
+                    )
+                    .unwrap();
+                }
+            }
         }
     }
 
@@ -142,28 +162,55 @@ fn render_set_ai_thread_file() -> String {
 
 #[cfg(feature = "k3_com260kit")]
 fn write_set_ai_thread_file(data: &[u8]) -> VfsResult<()> {
-    // truncate 忽略
     if data.is_empty() {
         return Ok(());
     }
 
     let input = core::str::from_utf8(data).map_err(|_| VfsError::InvalidInput)?;
+    let command = parse_set_ai_thread_command(input)?;
     let current_tid = current().as_thread().tid();
-    let command = parse_set_ai_thread_command(input, current_tid)?;
 
-    let tid = match command {
-        SetAiThreadCommand::Mark(tid) | SetAiThreadCommand::Unmark(tid) => tid,
-    };
-    get_task(tid).map_err(|_| VfsError::NotFound)?;
+    let mut map = AI_THREAD_SET.lock();
+    prune_ai_thread_set(&mut map);
 
-    let mut set = AI_THREAD_SET.lock();
-    prune_ai_thread_set(&mut set);
     match command {
-        SetAiThreadCommand::Mark(tid) => {
-            set.insert(tid);
+        SetAiThreadCommand::Mark => {
+            // 找到当前线程所在的旧核心（如果已标记过）。
+            let old_core = map
+                .iter()
+                .find(|(_, tids)| tids.contains(&current_tid))
+                .map(|(&core, _)| core);
+
+            // 从旧核心里移除当前线程。
+            for tids in map.values_mut() {
+                tids.retain(|&t| t != current_tid);
+            }
+            // 移除后如果该核心的 Vec 空了，清理掉 key。
+            map.retain(|_, tids| !tids.is_empty());
+
+            // 在 AI 核心（8-15）中选负载最小的，但排除旧核心，
+            // 确保重新 mark 时一定会迁移到和当前所在核不同的核心上（用于调试）。
+            let core = pick_least_loaded_ai_core(&map, old_core);
+            map.entry(core).or_default().push(current_tid);
+
+            // 立即将当前线程的 CPU 亲和性设置为该单一 AI 核心，
+            // 触发迁移：不在目标核上则当场切走。
+            ax_task::set_current_affinity(AxCpuMask::one_shot(core as usize));
         }
-        SetAiThreadCommand::Unmark(tid) => {
-            set.remove(&tid);
+        SetAiThreadCommand::Unmark => {
+            // 从所有 AI 核心的 Vec 中删除当前线程 tid。
+            for tids in map.values_mut() {
+                tids.retain(|&t| t != current_tid);
+            }
+            map.retain(|_, tids| !tids.is_empty());
+
+            // 构造一个仅包含普通核心 0-7 的 cpumask，
+            // 将线程的亲和性限制在非 AI 核心上，禁止再调度到 8-15。
+            let mut mask = AxCpuMask::new();
+            for cpu in 0..AI_CORE_START {
+                mask.set(cpu as usize, true);
+            }
+            ax_task::set_current_affinity(mask);
         }
     }
 
