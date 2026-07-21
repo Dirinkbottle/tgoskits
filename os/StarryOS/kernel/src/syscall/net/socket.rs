@@ -67,13 +67,13 @@ pub fn sys_socket(domain: u32, raw_ty: u32, proto: u32) -> AxResult<isize> {
 
     let socket = match (domain, ty) {
         (AF_INET | AF_INET6, SOCK_STREAM) => {
-            if proto != 0 && proto != IPPROTO_TCP as _ {
+            if proto != 0 && proto != IPPROTO_TCP as u32 {
                 return Err(AxError::from(LinuxError::EPROTONOSUPPORT));
             }
             TcpSocket::new().into()
         }
         (AF_INET | AF_INET6, SOCK_DGRAM) => {
-            if proto != 0 && proto != IPPROTO_UDP as _ {
+            if proto != 0 && proto != IPPROTO_UDP as u32 {
                 return Err(AxError::from(LinuxError::EPROTONOSUPPORT));
             }
             UdpSocket::new().into()
