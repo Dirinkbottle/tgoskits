@@ -1,14 +1,15 @@
 //! `K3SchedulerOps` 运行时回调实现：worker 线程、用户内存拷贝、tensor 映射。
 
-use alloc::collections::btree_map::BTreeMap;
+use alloc::{collections::btree_map::BTreeMap, string::String};
 
 use ax_memory_addr::{MemoryAddr, PhysAddr, VirtAddr, VirtAddrRange};
 use ax_runtime::hal::{
     cpu::asm::user_copy,
     paging::{MappingFlags, PageSize},
+    percpu::this_cpu_id,
 };
-use ax_task::{AxCpuMask, current, spawn};
-use k3_aiScheduler::K3SchedulerOps;
+use ax_task::{AxCpuMask, AxTaskExt, TaskInner, current, default_task_stack_size, spawn_task};
+use k3_ai_scheduler::K3SchedulerOps;
 
 use super::{
     registry::{
@@ -22,16 +23,44 @@ use crate::{
 };
 
 impl K3SchedulerOps for K3AiRunner {
-    fn spawn_thread(&self, f: fn(usize), arg: usize) {
-        spawn(move || {
-            // 这里让 scheduler worker 线程固定在 CPU 10 上，避免和其他非 AI 线程混跑。
-            let affinity_set = ax_task::set_current_affinity(AxCpuMask::one_shot(10));
-            warn!(
-                "k3_airunner: scheduler worker affinity target_cpu=10, set={}",
-                affinity_set
-            );
-            f(arg);
-        });
+    fn current_core_id(&self) -> u32 {
+        this_cpu_id() as u32
+    }
+
+    fn spawn_thread_on_core(&self, core_id: u32, f: fn(usize), arg: usize) {
+        // 注意：TaskInner::new()/TaskContext::new() 会按当前执行上下文初始化 satp。
+        // 这里通常是在 ioctl/run_graph 提交路径里创建 worker，如果不覆盖 satp，
+        // worker 可能继承提交进程的用户页表；提交进程退出后该页表被释放/复用，
+        // worker 再被调度时就可能用悬空 satp 跳进 trap_vector，触发指令页异常。
+        let mut worker_task = TaskInner::new(
+            move || {
+                // worker 必须固定在提交该 per-core scheduler 的 CPU 上；否则会跨 core
+                // 读写另一个 core 的无锁队列，真板子上没有额外 cache 同步保证。
+                let affinity_set =
+                    ax_task::set_current_affinity(AxCpuMask::one_shot(core_id as usize));
+                warn!(
+                    "k3_airunner: scheduler worker affinity target_cpu={}, current_cpu={}, set={}",
+                    core_id,
+                    this_cpu_id(),
+                    affinity_set,
+                );
+                f(arg);
+            },
+            String::from("k3-ai-worker"),
+            default_task_stack_size(),
+        );
+
+        // K3 scheduler worker 是内核常驻任务，不属于提交者的用户地址空间。
+        // 在放入 runqueue 前显式切到 kernel root，避免继承 submitter 的 user satp。
+        let kernel_root = ax_mm::kernel_page_table_root();
+        worker_task.ctx_mut().set_page_table_root(kernel_root);
+        worker_task.set_cpumask(AxCpuMask::one_shot(core_id as usize));
+        warn!(
+            "k3_airunner: scheduler worker spawn kernel task target_cpu={}, kernel_root={:#x}",
+            core_id,
+            kernel_root.as_usize(),
+        );
+        spawn_task(worker_task);
     }
 
     unsafe fn copy_from_user(&self, user_va: u64, buf: &mut [u8]) -> Result<(), ()> {

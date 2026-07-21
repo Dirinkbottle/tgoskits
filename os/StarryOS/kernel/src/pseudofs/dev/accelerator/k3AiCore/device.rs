@@ -7,8 +7,11 @@ use ax_memory_addr::{MemoryAddr, PhysAddr, VirtAddr, VirtAddrRange, align_up_4k}
 use ax_runtime::hal::paging::{MappingFlags, PageSize};
 use ax_task::current;
 use axfs_ng_vfs::{NodeFlags, VfsError, VfsResult};
-use k3_aiScheduler::{K3SchedulerOps, kd_kring::resolve_parsed_graph, scheduler::run_graph};
-use k3_aiUabi::{AI_ABI_VERSION, AiGraphParser, AiGraphSubmitEntry, AiTensorDesc, GraphSubmitKind};
+use k3_ai_scheduler::{K3SchedulerOps, kd_kring::resolve_parsed_graph, scheduler::run_graph};
+use k3_ai_uabi::{
+    AI_ABI_VERSION, AiGraphParser, AiGraphSubmitEntry, AiTensorDesc, GraphSubmitKind, KernelVa,
+    MAX_DIM,
+};
 use ov_channels::{ChannelId, SharedMemory};
 
 use super::{
@@ -365,7 +368,9 @@ impl K3AiRunner {
             info!(
                 "k3_airunner: SUBMIT_GRAPH rejected empty graph blob pid={}, graph_va={:#x}, \
                  size={:#x}",
-                pid, graph_entry.graph_user_va, graph_entry.graph_size
+                pid,
+                graph_entry.graph_user_va.get(),
+                graph_entry.graph_size.get()
             );
             return Err(VfsError::InvalidInput);
         }
@@ -374,10 +379,13 @@ impl K3AiRunner {
         // 必须从user空间copy过来,防止后续被篡改
         info!(
             "k3_airunner: SUBMIT_GRAPH graph_size usize conversion begin pid={}, graph_size={:#x}",
-            pid, graph_entry.graph_size
+            pid,
+            graph_entry.graph_size.get()
         );
-        let graph_size =
-            usize::try_from(graph_entry.graph_size).expect("can't read usize from graph");
+        let graph_size = graph_entry
+            .graph_size
+            .try_as_usize()
+            .map_err(|_| VfsError::InvalidInput)?;
         info!(
             "k3_airunner: SUBMIT_GRAPH graph_size usize conversion done pid={}, graph_size={:#x}",
             pid, graph_size
@@ -395,11 +403,11 @@ impl K3AiRunner {
         info!(
             "k3_airunner: SUBMIT_GRAPH copy graph blob begin pid={}, user_va={:#x}, len={:#x}",
             pid,
-            graph_entry.graph_user_va,
+            graph_entry.graph_user_va.get(),
             blob_slice.len()
         );
         let copy_result =
-            unsafe { K3AiRunner.copy_from_user(graph_entry.graph_user_va, &mut blob_slice) };
+            unsafe { K3AiRunner.copy_from_user(graph_entry.graph_user_va.get(), &mut blob_slice) };
         info!(
             "k3_airunner: SUBMIT_GRAPH copy graph blob done pid={}, ok={}",
             pid,
@@ -416,6 +424,25 @@ impl K3AiRunner {
 
         // 遍历 AiGraphNode
         for node in task_link.iter() {
+            let input_count = node
+                .desc
+                .input_count
+                .try_as_usize()
+                .map_err(|_| VfsError::InvalidInput)?;
+            let output_count = node
+                .desc
+                .output_count
+                .try_as_usize()
+                .map_err(|_| VfsError::InvalidInput)?;
+            let total_count = node
+                .desc
+                .input_count
+                .checked_total(node.desc.output_count)
+                .map_err(|_| VfsError::InvalidInput)?;
+            if total_count > node.desc.tensors.len() {
+                return Err(VfsError::InvalidInput);
+            }
+
             info!("I received the node:");
             info!("  node_id: {}", node.node_id);
             info!("  op: {:?}", node.desc.op);
@@ -426,31 +453,39 @@ impl K3AiRunner {
             );
 
             // 打印输入 tensors 信息
-            for i in 0..node.desc.input_count as usize {
+            for i in 0..input_count {
                 let tensor = &node.desc.tensors[i];
+                let ndim = tensor
+                    .ndim
+                    .try_under_max(MAX_DIM)
+                    .map_err(|_| VfsError::InvalidInput)?;
                 info!(
                     "  input[{}]: dtype={:?}, ndim={}, shape={:?}",
                     i,
                     tensor.dtype,
                     tensor.ndim,
-                    &tensor.shape[..tensor.ndim as usize]
+                    &tensor.shape[..ndim]
                 );
             }
 
             // 打印输出 tensors 信息
-            for i in 0..node.desc.output_count as usize {
-                let tensor = &node.desc.tensors[node.desc.input_count as usize + i];
+            for i in 0..output_count {
+                let tensor = &node.desc.tensors[input_count + i];
+                let ndim = tensor
+                    .ndim
+                    .try_under_max(MAX_DIM)
+                    .map_err(|_| VfsError::InvalidInput)?;
                 info!(
                     "  output[{}]: dtype={:?}, ndim={}, shape={:?}",
                     i,
                     tensor.dtype,
                     tensor.ndim,
-                    &tensor.shape[..tensor.ndim as usize]
+                    &tensor.shape[..ndim]
                 );
             }
 
             // 映射输入 tensors 到内核地址
-            for i in 0..node.desc.input_count as usize {
+            for i in 0..input_count {
                 let tensor: &mut AiTensorDesc;
                 unsafe {
                     // SAFETY: node.desc.tensors[i] is parsed from the copied blob,
@@ -468,22 +503,30 @@ impl K3AiRunner {
                 }
 
                 if tensor.user_va != 0 && tensor.size_bytes != 0 {
-                    match unsafe {
-                        K3AiRunner.map_user_to_kernel(tensor.user_va, tensor.size_bytes as usize)
-                    } {
+                    let user_va = tensor.user_va.get();
+                    let size_bytes = tensor
+                        .size_bytes
+                        .try_as_usize()
+                        .map_err(|_| VfsError::InvalidInput)?;
+                    match unsafe { K3AiRunner.map_user_to_kernel(user_va, size_bytes) } {
                         Ok(kernel_va) => {
                             // 回填kernel_va
-                            tensor.kernel_va = kernel_va;
+                            tensor.kernel_va = KernelVa::new(kernel_va);
 
                             info!(
                                 "  input[{}] mapped: user_va={:#x}, size={:#x} -> kernel_va={:#x}",
-                                i, tensor.user_va, tensor.size_bytes, kernel_va
+                                i,
+                                user_va,
+                                tensor.size_bytes.get(),
+                                kernel_va
                             );
                         }
                         Err(_) => {
                             info!(
                                 "  input[{}] map failed: user_va={:#x}, size={:#x}",
-                                i, tensor.user_va, tensor.size_bytes
+                                i,
+                                user_va,
+                                tensor.size_bytes.get()
                             );
                         }
                     }
@@ -491,35 +534,41 @@ impl K3AiRunner {
             }
 
             // 映射输出 tensors 到内核地址
-            for i in 0..node.desc.output_count as usize {
+            for i in 0..output_count {
                 let tensor: &mut AiTensorDesc;
                 unsafe {
                     // SAFETY: node.desc.tensors[i] is parsed from the copied blob,
                     // so reborrowing it as a mutable tensor descriptor does not
                     // alias user memory.
-                    let addr = (&node.desc.tensors[node.desc.input_count as usize + i]) as *const _
-                        as usize
-                        + 1;
+                    let addr = (&node.desc.tensors[input_count + i]) as *const _ as usize + 1;
                     let trans_tensor = &mut *((addr - 1) as *mut AiTensorDesc);
                     tensor = trans_tensor;
                 }
                 if tensor.user_va != 0 && tensor.size_bytes != 0 {
-                    match unsafe {
-                        K3AiRunner.map_user_to_kernel(tensor.user_va, tensor.size_bytes as usize)
-                    } {
+                    let user_va = tensor.user_va.get();
+                    let size_bytes = tensor
+                        .size_bytes
+                        .try_as_usize()
+                        .map_err(|_| VfsError::InvalidInput)?;
+                    match unsafe { K3AiRunner.map_user_to_kernel(user_va, size_bytes) } {
                         Ok(kernel_va) => {
                             // 回填kernel_va
-                            tensor.kernel_va = kernel_va;
+                            tensor.kernel_va = KernelVa::new(kernel_va);
 
                             info!(
                                 "  output[{}] mapped: user_va={:#x}, size={:#x} -> kernel_va={:#x}",
-                                i, tensor.user_va, tensor.size_bytes, kernel_va
+                                i,
+                                user_va,
+                                tensor.size_bytes.get(),
+                                kernel_va
                             );
                         }
                         Err(_) => {
                             info!(
                                 "  output[{}] map failed: user_va={:#x}, size={:#x}",
-                                i, tensor.user_va, tensor.size_bytes
+                                i,
+                                user_va,
+                                tensor.size_bytes.get()
                             );
                         }
                     }
@@ -550,6 +599,8 @@ impl K3AiRunner {
             return Err(VfsError::InvalidInput);
         }
 
+        // 到这里任务已经提交成功,等待worker进行消费
+
         info!(
             "k3_airunner: scheduler enqueue graph done pid={}, token={}",
             pid, graph_entry.user_token
@@ -558,7 +609,10 @@ impl K3AiRunner {
         info!(
             "k3_airunner: SUBMIT_GRAPH recv AiGraphSubmitEntry pid={}, token={}, graph_va={:#x}, \
              graph_size={:#x}",
-            pid, graph_entry.user_token, graph_entry.graph_user_va, graph_entry.graph_size
+            pid,
+            graph_entry.user_token,
+            graph_entry.graph_user_va.get(),
+            graph_entry.graph_size.get()
         );
 
         Ok(0)
