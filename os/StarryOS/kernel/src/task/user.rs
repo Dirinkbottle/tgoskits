@@ -308,6 +308,22 @@ pub fn new_user_task(name: &str, mut uctx: UserContext, set_child_tid: usize) ->
                                 if unsafe { uctx.emulate_mrs_id_reg() } {
                                     break 'exc;
                                 }
+                                #[cfg(all(target_arch = "riscv64", feature = "vector"))]
+                                {
+                                    let vs_bits = (uctx.sstatus.bits() >> 9) & 0x3;
+                                    let vs_name = match vs_bits {
+                                        0 => "Off",
+                                        1 => "Initial",
+                                        2 => "Clean",
+                                        3 => "Dirty",
+                                        _ => "Unknown",
+                                    };
+                                    warn!(
+                                        "IllegalInstruction (vector): sstatus={:#x}, \
+                                         VS={vs_name}({vs_bits})",
+                                        uctx.sstatus.bits(),
+                                    );
+                                }
                                 SignalInfo::new_kernel(Signo::SIGILL)
                             }
                             // x86 `#DE`: integer divide-by-zero or the

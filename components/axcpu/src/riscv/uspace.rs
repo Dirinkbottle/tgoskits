@@ -5,6 +5,8 @@ use core::ops::{Deref, DerefMut};
 use ax_memory_addr::VirtAddr;
 #[cfg(feature = "fp-simd")]
 use riscv::register::sstatus::FS;
+#[cfg(feature = "vector")]
+use riscv::register::sstatus::VS;
 use riscv::{
     interrupt::{
         Trap,
@@ -30,6 +32,8 @@ impl UserContext {
         sstatus.set_sum(true); // enable user memory access in supervisor mode
         #[cfg(feature = "fp-simd")]
         sstatus.set_fs(FS::Initial); // set the FPU to initial state
+        #[cfg(feature = "vector")]
+        sstatus.set_vs(VS::Initial); // set the vector unit to initial state
 
         #[cfg(feature = "xuantie-c9xx")]
         {
