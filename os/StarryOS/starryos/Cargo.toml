@@ -35,7 +35,6 @@ k230 = [
 ]
 k3_com260kit = ["starry-kernel/k3_com260kit"]
 
-
 rknpu = ["ax-driver/rknpu", "starry-kernel/rknpu"]
 jpeg = ["ax-driver/jpeg", "starry-kernel/jpeg"]
 rk3588-pwm = ["starry-kernel/rk3588-pwm"]

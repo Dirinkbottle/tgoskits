@@ -109,11 +109,13 @@ stack-protector = ["ax-runtime/stack-protector"]
 axtest = []
 vector = ["ax-cpu/vector"]
 
-
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(axtest)', 'cfg(feature, values("ax-std"))'] }
 
 [dependencies]
+ov-channels = "0.2"
+k3_ai_uabi = { package = "k3_aiUabi", path = "../../../../k3x-HERA-RT/k3_aiUabi" }
+k3_ai_scheduler = { package = "k3_aiScheduler", path = "../../../../k3x-HERA-RT/k3_aiScheduler" }
 ax-alloc = { workspace = true }
 ax-crate-interface.workspace = true
 ax-display.workspace = true
