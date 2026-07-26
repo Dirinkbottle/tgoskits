@@ -8,7 +8,7 @@ use ax_runtime::hal::{
     paging::{MappingFlags, PageSize},
     percpu::this_cpu_id,
 };
-use ax_task::{AxCpuMask, AxTaskExt, TaskInner, current, default_task_stack_size, spawn_task};
+use ax_task::{AxCpuMask, TaskInner, current, default_task_stack_size, spawn_task};
 use k3_ai_scheduler::K3SchedulerOps;
 
 use super::{
@@ -18,7 +18,7 @@ use super::{
     runner::K3AiRunner,
 };
 use crate::{
-    mm::{Backend, access_user_memory},
+    mm::{Backend, access_user_memory, pin_cow_pages},
     task::AsThread,
 };
 
@@ -32,6 +32,7 @@ impl K3SchedulerOps for K3AiRunner {
         // 这里通常是在 ioctl/run_graph 提交路径里创建 worker，如果不覆盖 satp，
         // worker 可能继承提交进程的用户页表；提交进程退出后该页表被释放/复用，
         // worker 再被调度时就可能用悬空 satp 跳进 trap_vector，触发指令页异常。
+        let worker_stack_size = default_task_stack_size().saturating_mul(2);
         let mut worker_task = TaskInner::new(
             move || {
                 // worker 必须固定在提交该 per-core scheduler 的 CPU 上；否则会跨 core
@@ -47,7 +48,7 @@ impl K3SchedulerOps for K3AiRunner {
                 f(arg);
             },
             String::from("k3-ai-worker"),
-            default_task_stack_size(),
+            worker_stack_size,
         );
 
         // K3 scheduler worker 是内核常驻任务，不属于提交者的用户地址空间。
@@ -56,9 +57,11 @@ impl K3SchedulerOps for K3AiRunner {
         worker_task.ctx_mut().set_page_table_root(kernel_root);
         worker_task.set_cpumask(AxCpuMask::one_shot(core_id as usize));
         warn!(
-            "k3_airunner: scheduler worker spawn kernel task target_cpu={}, kernel_root={:#x}",
+            "k3_airunner: scheduler worker spawn kernel task target_cpu={}, kernel_root={:#x}, \
+             stack_size={:#x}",
             core_id,
             kernel_root.as_usize(),
+            worker_stack_size,
         );
         spawn_task(worker_task);
     }
@@ -116,21 +119,35 @@ impl K3SchedulerOps for K3AiRunner {
         let curr = current();
         let pid = curr.as_thread().proc_data.proc.pid();
         let aspace_arc = curr.as_thread().proc_data.aspace();
-        let aspace = aspace_arc.lock();
+        let mut aspace = aspace_arc.lock();
 
-        // 当前 tensor allocator 走 MAP_SHARED mmap，这里只接受 SharedBackend。
+        // Tensor 内存优先走 MAP_SHARED；兼容 MAP_PRIVATE/COW 时先 pin 住 resident frames。
         let area = aspace.find_area(VirtAddr::from(user_va)).ok_or(())?;
         if area.start() > range_start || area.end() < range_end {
             return Err(());
         }
 
         let page_offset = (range_start - area.start()) / PageSize::Size4K as usize;
-        let shared_pages = match area.backend() {
-            Backend::Shared(shared) => shared.pages().clone(),
+        let required_pages = range_len / PageSize::Size4K as usize;
+        let backend = area.backend().clone();
+
+        let (shared_pages, page_offset) = match backend {
+            Backend::Shared(shared) => (shared.pages().clone(), page_offset),
+            Backend::Cow(_) => match pin_cow_pages(&mut aspace, range_start, range_len) {
+                Ok(shared_pages) => (shared_pages, 0),
+                Err(err) => {
+                    error!(
+                        "k3_airunner: map_user_to_kernel failed to pin COW pages pid={}, \
+                         user_va={:#x}, len={:#x}, err={:?}",
+                        pid, user_va, len, err
+                    );
+                    return Err(());
+                }
+            },
             _ => {
-                info!(
-                    "k3_airunner: map_user_to_kernel rejected non-shared user memory pid={}, \
-                     user_va={:#x}, len={:#x}",
+                error!(
+                    "k3_airunner: map_user_to_kernel rejected non-shared/non-cow user memory \
+                     pid={}, user_va={:#x}, len={:#x}",
                     pid, user_va, len
                 );
                 return Err(());
@@ -138,7 +155,6 @@ impl K3SchedulerOps for K3AiRunner {
         };
         drop(aspace);
 
-        let required_pages = range_len / PageSize::Size4K as usize;
         let required_end = page_offset.checked_add(required_pages).ok_or(())?;
         if shared_pages.len() < required_end {
             info!(

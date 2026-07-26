@@ -22,7 +22,7 @@ DEFAULT_KERNEL = Path("target/riscv64gc-unknown-linux-musl/release/starryos.bin"
 DEFAULT_DTB = Path("os/StarryOS/configs/board/spacemit-k3-com260-ifx.dtb")
 
 KERNEL_LOAD_ADDR = "0x140000000"
-KERNEL_LOAD_SIZE = "0x02000000"
+KERNEL_LOAD_SIZE = "0x04000000"
 DTB_LOAD_ADDR = "0x138000000"
 DTB_LOAD_SIZE = "0x00100000"
 

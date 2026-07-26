@@ -11,5 +11,8 @@ features = [
   "starry-kernel/vector",
   "starry-kernel/vsock",
 ]
-log = "Info"
+log = "Error"
 target = "riscv64gc-unknown-none-elf"
+[env]
+DWARF = "y"
+BACKTRACE = "y"

@@ -5,8 +5,8 @@
 
 use alloc::{collections::btree_map::BTreeMap, sync::Arc};
 
+use ax_kspin::SpinNoIrq;
 use ax_memory_addr::VirtAddr;
-use ax_sync::spin::SpinNoIrq;
 use ax_task::current;
 
 use crate::{mm::SharedPages, task::AsThread};
