@@ -1,4 +1,4 @@
-use alloc::sync::Arc;
+use alloc::{sync::Arc, vec::Vec};
 use core::{
     fmt,
     ops::DerefMut,
@@ -35,6 +35,47 @@ pub use self::{
 
 type MovedPage = (VirtAddr, VirtAddr, PhysAddr, MappingFlags, usize, bool);
 const CLONED_ADDR_SPACE_LOCK_SUBCLASS: u32 = 1;
+
+pub fn pin_cow_pages(
+    aspace: &mut AddrSpace,
+    start: VirtAddr,
+    size: usize,
+) -> AxResult<Arc<SharedPages>> {
+    aspace.validate_region(start, size)?;
+    let end = start + size;
+    let cow = {
+        let area = aspace.find_area(start).ok_or(AxError::BadAddress)?;
+        if area.start() > start || area.end() < end {
+            ax_bail!(BadAddress, "COW pin range crosses VMA boundary");
+        }
+        if !area.flags().contains(MappingFlags::WRITE) {
+            ax_bail!(BadAddress, "COW pin range is not writable");
+        }
+        let Backend::Cow(cow) = area.backend().clone() else {
+            ax_bail!(InvalidInput, "range is not backed by COW pages");
+        };
+        if cow.page_size() != PageSize::Size4K {
+            ax_bail!(InvalidInput, "only 4K COW pages can be pinned");
+        }
+        cow
+    };
+
+    // Force writable population first so a shared COW PTE is broken before the
+    // kernel alias gets a writable mapping to the resident physical page.
+    aspace.populate_area(start, size, MappingFlags::WRITE)?;
+
+    let mut phys_pages = Vec::with_capacity(size / PAGE_SIZE_4K);
+    let mut cursor = aspace.pt.cursor();
+    for vaddr in PageIter4K::new(start, end).ok_or(AxError::InvalidInput)? {
+        let (paddr, _flags, page_size) = cursor.query(vaddr).map_err(|_| AxError::BadAddress)?;
+        if page_size != PageSize::Size4K {
+            ax_bail!(InvalidInput, "only 4K COW pages can be pinned");
+        }
+        phys_pages.push(paddr);
+    }
+
+    Ok(Arc::new(cow.pin_resident_pages(phys_pages)?))
+}
 
 fn rollback_moved_pages(cursor: &mut PageTable, moved_pages: &[MovedPage]) {
     for &(src_va, dst_va, paddr, flags, page_size, dst_newly_mapped) in moved_pages.iter().rev() {

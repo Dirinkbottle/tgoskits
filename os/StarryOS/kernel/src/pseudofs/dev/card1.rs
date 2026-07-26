@@ -72,17 +72,17 @@ static RKNPU_SUBMIT_LOG_COUNT: AtomicUsize = AtomicUsize::new(0);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RknpuCmd {
     /// Action command
-    Action = 0x00,
+    Action     = 0x00,
     /// Submit command
-    Submit = 0x01,
+    Submit     = 0x01,
     /// Memory create command
-    MemCreate = 0x02,
+    MemCreate  = 0x02,
     /// Memory map command
-    MemMap = 0x03,
+    MemMap     = 0x03,
     /// Memory destroy command
     MemDestroy = 0x04,
     /// Memory sync command
-    MemSync = 0x05,
+    MemSync    = 0x05,
 }
 
 impl TryFrom<u32> for RknpuCmd {

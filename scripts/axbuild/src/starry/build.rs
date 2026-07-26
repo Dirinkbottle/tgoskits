@@ -1,5 +1,7 @@
 use std::{
-    env, fs,
+    env,
+    ffi::OsStr,
+    fs,
     io::Write as _,
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -46,6 +48,24 @@ pub(crate) fn resolve_build_info_path(
     ))
 }
 
+pub(crate) fn resolve_explicit_build_config_selector(
+    workspace_root: &Path,
+    selector: PathBuf,
+) -> anyhow::Result<PathBuf> {
+    if selector.exists() || selector.is_absolute() {
+        return Ok(selector);
+    }
+
+    let Some(board_name) = bare_board_selector_name(&selector) else {
+        return Ok(selector);
+    };
+    let Some(board) = board::find_board(workspace_root, board_name)? else {
+        return Ok(selector);
+    };
+
+    Ok(board.path)
+}
+
 pub(crate) fn load_target_from_build_config(path: &Path) -> anyhow::Result<Option<String>> {
     let content = crate::build::read_toml_with_rejector(
         path,
@@ -61,6 +81,18 @@ pub(crate) fn load_target_from_build_config(path: &Path) -> anyhow::Result<Optio
     }
 
     Err(anyhow!("invalid Starry build config {}", path.display()))
+}
+
+fn bare_board_selector_name(selector: &Path) -> Option<&str> {
+    if selector.components().count() != 1 {
+        return None;
+    }
+
+    match selector.extension().and_then(OsStr::to_str) {
+        None => selector.file_name().and_then(OsStr::to_str),
+        Some("toml") => selector.file_stem().and_then(OsStr::to_str),
+        Some(_) => None,
+    }
 }
 
 fn reject_unsupported_starry_fields(path: &Path, content: &str) -> anyhow::Result<()> {

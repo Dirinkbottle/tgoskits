@@ -82,6 +82,7 @@ k230-kpu = ["ax-hal/xuantie-c9xx", "dep:k230-kpu"]
 k3_com260kit = []
 vsock = ["ax-runtime/vsock"]
 dynamic_debug = ["ipi"]
+user_log = []
 sg2002 = [
     "ax-runtime/irq",
     "ax-driver/usb",

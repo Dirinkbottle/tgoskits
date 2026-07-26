@@ -7,7 +7,7 @@
 //!   映射 tensor，并把任务交给 `k3_aiScheduler` 调度执行。
 //!
 //! 模块按职责拆分:
-//! - [`abi`]: 与用户态 UABI 对齐的常量与结构体；
+//! - [`abi`]: 内核专属设备号；共享 UABI 直接来自 `k3_ai_uabi`；
 //! - [`registry`]: channel / tensor 的 kernel alias 记账与生命周期管理；
 //! - [`runner`]: 设备对象 [`K3AiRunner`];
 //! - [`device`]: `DeviceOps` ioctl 控制面实现；
@@ -36,6 +36,6 @@ mod runner;
 mod scheduler;
 
 // 设备节点注册需要设备号和设备对象；ioctl 命令号 / channel 布局常量 /
-// `K3AiChannelBuildParam` 属于 [`abi`] 内部 ABI，由 [`device`] 直接引用，不在此重导出。
+// `K3AiChannelBuildParam` 属于 `k3_ai_uabi`，避免内核手写镜像结构体。
 pub use abi::K3_AIRUNNER_DEVICE_ID;
 pub use runner::K3AiRunner;

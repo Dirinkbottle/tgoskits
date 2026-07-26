@@ -1,3 +1,5 @@
+#[cfg(feature = "k3_com260kit")]
+use alloc::vec::Vec;
 use alloc::{
     collections::BTreeMap,
     string::{String, ToString},
@@ -15,6 +17,8 @@ use ax_runtime::hal::{
 };
 use ax_sync::Mutex;
 
+#[cfg(feature = "k3_com260kit")]
+use super::SharedPages;
 use super::{
     AddrSpace, Backend, BackendFileInfo, BackendOps, CloneMapAccounting, MemoryAccounting,
     PopulateCallback, RssKind, alloc_frame, dealloc_frame, pages_in,
@@ -34,6 +38,58 @@ impl FrameRefCnt {
             dealloc_frame(paddr, page_size);
         }
     }
+}
+
+#[cfg(any(feature = "k3_com260kit", test))]
+struct CowPinnedFrame {
+    paddr: PhysAddr,
+    page_size: PageSize,
+    refcnt: Arc<SpinNoIrq<FrameRefCnt>>,
+}
+
+#[cfg(any(feature = "k3_com260kit", test))]
+impl CowPinnedFrame {
+    #[cfg(feature = "k3_com260kit")]
+    fn pin(paddr: PhysAddr, page_size: PageSize) -> AxResult<Self> {
+        let refcnt = FRAME_TABLE
+            .lock()
+            .get_frame_ref(paddr)
+            .ok_or(AxError::BadAddress)?;
+        Self::pin_from_refcnt(paddr, page_size, refcnt)
+    }
+
+    fn pin_from_refcnt(
+        paddr: PhysAddr,
+        page_size: PageSize,
+        refcnt: Arc<SpinNoIrq<FrameRefCnt>>,
+    ) -> AxResult<Self> {
+        {
+            let mut frame = refcnt.lock();
+            assert!(frame.count > 0, "pinning unreferenced frame");
+            if frame.count >= u8::MAX - 1 {
+                warn!("frame reference count overflow");
+                return Err(AxError::BadAddress);
+            }
+            frame.count += 1;
+        }
+        Ok(Self {
+            paddr,
+            page_size,
+            refcnt,
+        })
+    }
+}
+
+#[cfg(any(feature = "k3_com260kit", test))]
+impl Drop for CowPinnedFrame {
+    fn drop(&mut self) {
+        self.refcnt.lock().drop_frame(self.paddr, self.page_size);
+    }
+}
+
+#[cfg(feature = "k3_com260kit")]
+struct CowPinnedPages {
+    _frames: Vec<CowPinnedFrame>,
 }
 
 struct FrameTableRefCount {
@@ -235,6 +291,24 @@ impl CowBackend {
         let frame = alloc_frame(zeroed, self.size)?;
         FRAME_TABLE.lock().init_frame(frame);
         Ok(frame)
+    }
+
+    #[cfg(feature = "k3_com260kit")]
+    pub(in crate::mm::aspace) fn pin_resident_pages(
+        &self,
+        phys_pages: Vec<PhysAddr>,
+    ) -> AxResult<SharedPages> {
+        let mut pinned_frames = Vec::with_capacity(phys_pages.len());
+        for &paddr in &phys_pages {
+            pinned_frames.push(CowPinnedFrame::pin(paddr, self.size)?);
+        }
+        SharedPages::borrowed(
+            phys_pages,
+            self.size,
+            Some(Arc::new(CowPinnedPages {
+                _frames: pinned_frames,
+            })),
+        )
     }
 
     fn alloc_new_at(
@@ -623,7 +697,6 @@ impl BackendOps for CowBackend {
 
     fn shrink_right(&mut self, _shrink_size: usize) {}
 }
-
 impl Backend {
     pub fn new_cow(
         start: VirtAddr,
@@ -678,4 +751,31 @@ pub(crate) fn cow_file_max_read_len_boundary_rules_hold_for_test() -> bool {
         && matches!(cow_file_max_read_len(8192, Some(4096), 8192, 4096), Ok(0))
         // Explicit end == offset yields zero (EOF reached within bounds).
         && matches!(cow_file_max_read_len(8192, Some(4096), 4096, 4096), Ok(0))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pinned_cow_frame_balances_framecnt_on_drop() {
+        let paddr = PhysAddr::from_usize(0x1000);
+        let refcnt = Arc::new(SpinNoIrq::new(FrameRefCnt { count: 1 }));
+
+        let pinned =
+            CowPinnedFrame::pin_from_refcnt(paddr, PageSize::Size4K, refcnt.clone()).unwrap();
+
+        assert_eq!(refcnt.lock().count, 2);
+        drop(pinned);
+        assert_eq!(refcnt.lock().count, 1);
+    }
+
+    #[test]
+    fn pinned_cow_frame_rejects_refcnt_overflow_without_incrementing() {
+        let paddr = PhysAddr::from_usize(0x2000);
+        let refcnt = Arc::new(SpinNoIrq::new(FrameRefCnt { count: u8::MAX - 1 }));
+
+        assert!(CowPinnedFrame::pin_from_refcnt(paddr, PageSize::Size4K, refcnt.clone()).is_err());
+        assert_eq!(refcnt.lock().count, u8::MAX - 1);
+    }
 }
