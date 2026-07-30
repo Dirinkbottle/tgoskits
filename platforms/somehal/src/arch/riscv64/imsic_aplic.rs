@@ -286,11 +286,14 @@ pub fn is_aia_active() -> bool {
 }
 
 pub fn begin_external_irq() -> Option<super::plic::ActiveIrq> {
-    // Safety: 在 S-mode 外部中断 trap 上下文中调用，本 hart 的 ssaia 已由 probe 期间
-    // 的 init_local_file 初始化，满足 `claim`(stopei) 的本地 hart + S-mode 契约。
-    let (eiid, _prio) = unsafe { ax_riscv_imsic::claim() }?;
-    Some(super::plic::ActiveIrq::new_no_completion(
+    let raw = unsafe { ax_riscv_imsic::stopei_read() };
+    let (eiid, _prio) = ax_riscv_imsic::parse_stopei(raw)?;
+
+    // 读 stopei 只返回 pending ID，不自动清 pending（QEMU riscv_imsic_topei_rmw
+    // 的 read 侧）。记录 raw 值，在 ActiveIrq::drop 时写回 stopei 完成清除。
+    Some(super::plic::ActiveIrq::new_imsic(
         (eiid as usize).into(),
+        raw,
     ))
 }
 

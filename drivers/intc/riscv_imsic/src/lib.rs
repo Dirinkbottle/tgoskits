@@ -286,6 +286,27 @@ pub unsafe fn claim() -> Option<(u32, u32)> {
     parse_stopei(unsafe { stopei_read() })
 }
 
+/// 写 `stopei` 完成中断的 pending 清除（对应 QEMU riscv_imsic_topei_rmw 的 write 侧）。
+///
+/// 读 stopei 只返回 pending 中断的 ID，不自动清除 pending 位；必须再写 stopei
+/// （写任意 non-zero 值即可触发 QEMU 的清 pending 路径）才算"完成"该中断。
+/// 不写 stopei 则 pending 位永不释放 → IRQ 线保持 asserted → 反复 trap。
+///
+/// # Safety
+///
+/// 必须在本地 hart、S-mode、ssaia 扩展可用时调用。
+/// 只应在同一次中断处理流程中 claim 后调用。
+#[cfg(target_arch = "riscv64")]
+pub unsafe fn complete_stopei(val: u32) {
+    unsafe {
+        core::arch::asm!(
+            "csrw {csr}, {val}",
+            csr = const csr::STOPEI,
+            val = in(reg) val as usize,
+        );
+    }
+}
+
 /// 经 IMSIC 发 IPI：写目标 hart 中断文件页的 EID 0（IPI 专用 identity）。
 ///
 /// # Safety
