@@ -13,7 +13,10 @@
 
 #![no_std]
 
-use core::{num::NonZeroU32, ptr::read_volatile, ptr::write_volatile};
+use core::{
+    num::NonZeroU32,
+    ptr::{read_volatile, write_volatile},
+};
 
 // ── 寄存器偏移（Linux riscv-aplic.h，多源核对一致） ───────────────────
 
@@ -95,6 +98,33 @@ impl SourceTrigger {
             SourceTrigger::LevelLow => SM_LEVEL_LOW,
         }
     }
+
+    /// 从 RISC-V 设备树 interrupt specifier 的触发标志 cell（第二 cell）
+    /// 解析 APLIC 触发类型。
+    ///
+    /// RISC-V DT binding 沿用 POSIX `interrupts extended` 标志位编码：
+    /// - `0x01` → edge rising（低→高边沿）
+    /// - `0x02` → edge falling（高→低边沿）
+    /// - `0x04` → level high（高电平有效）
+    /// - `0x08` → level low（低电平有效）
+    ///
+    /// 其它值（含 `0`）返回 `None`，由调用方决定缺省策略（多数平台 fallback
+    /// 为 `LevelHigh`，见 somehal 集成层）。
+    ///
+    /// 历史背景：本映射曾因错误推论"PCI INTx 必为 level-low"被绕过，导致
+    /// QEMU virt 下所有 wired 源被硬编码为 `LevelLow`，rectified 信号反极性，
+    /// virtio-blk INTx 永不触发。把映射集中到 driver core 层并锁定回归测试，
+    /// 避免再次回退到平台级硬编码。
+    #[inline]
+    pub const fn from_fdt_interrupt_spec(flag: u32) -> Option<Self> {
+        match flag {
+            0x01 => Some(SourceTrigger::EdgeRise),
+            0x02 => Some(SourceTrigger::EdgeFall),
+            0x04 => Some(SourceTrigger::LevelHigh),
+            0x08 => Some(SourceTrigger::LevelLow),
+            _ => None,
+        }
+    }
 }
 
 /// APLIC MSI 目标（写进 target[i] 寄存器）：hart_index + guest_index + eiid。
@@ -123,6 +153,20 @@ pub struct MsiConfig {
     pub lhxs: u32,
     pub hhxw: u32,
     pub hhxs: u32,
+}
+
+/// 把 [`MsiConfig`] 编码成 `smsicfgaddrh`（偏移 0x1bcc）寄存器值。
+///
+/// 纯函数，供 [`Aplic::init_msi_mode`] 与单测共享同一段位打包逻辑。
+/// 位置约束见上方 `CFGADDRH_*` 常量块：S-mode 下仅 LHXS+BAPPN 段被硬件采纳。
+#[inline]
+pub const fn pack_smsicfg_addrh(cfg: &MsiConfig) -> u32 {
+    CFGADDRH_L
+        | ((cfg.hhxs & CFGADDRH_HHXS_MASK) << CFGADDRH_HHXS_SHIFT)
+        | ((cfg.lhxs & CFGADDRH_LHXS_MASK) << CFGADDRH_LHXS_SHIFT)
+        | ((cfg.hhxw & CFGADDRH_HHXW_MASK) << CFGADDRH_HHXW_SHIFT)
+        | ((cfg.lhxw & CFGADDRH_LHXW_MASK) << CFGADDRH_LHXW_SHIFT)
+        | ((cfg.base_ppn >> 32) as u32 & CFGADDRH_BAPPN_MASK)
 }
 
 /// Advanced Platform-Level Interrupt Controller（MSI 模式）。
@@ -224,12 +268,7 @@ impl Aplic {
     /// S-mode 直写这些位无害但无效。调用方需确认目标平台的固件已配置 MSI 几何。
     pub fn init_msi_mode(&mut self, cfg: &MsiConfig) {
         let addr_lo = cfg.base_ppn as u32;
-        let addr_hi: u32 = CFGADDRH_L
-            | ((cfg.hhxs & CFGADDRH_HHXS_MASK) << CFGADDRH_HHXS_SHIFT)
-            | ((cfg.lhxs & CFGADDRH_LHXS_MASK) << CFGADDRH_LHXS_SHIFT)
-            | ((cfg.hhxw & CFGADDRH_HHXW_MASK) << CFGADDRH_HHXW_SHIFT)
-            | ((cfg.lhxw & CFGADDRH_LHXW_MASK) << CFGADDRH_LHXW_SHIFT)
-            | ((cfg.base_ppn >> 32) as u32 & CFGADDRH_BAPPN_MASK);
+        let addr_hi = pack_smsicfg_addrh(cfg);
         self.write(SMSICFGADDR, addr_lo);
         self.write(SMSICFGADDRH, addr_hi);
         let dom = self.read(DOMAINCFG) | DOMAINCFG_IE | DOMAINCFG_DM;
@@ -308,5 +347,102 @@ mod tests {
         assert_eq!(Aplic::source_offset(s1, SOURCECFG_BASE), 0x0004);
         assert_eq!(Aplic::source_offset(s2, SOURCECFG_BASE), 0x0008);
         assert_eq!(Aplic::source_offset(s1, TARGET_BASE), 0x3004);
+    }
+
+    #[test]
+    fn pack_smsicfg_addrh_encodes_geometry_and_base_ppn() {
+        // L 位（bit31）必须置位；各几何字段按 CFGADDRH_* 段打包。
+        let cfg = MsiConfig {
+            base_ppn: 0x0000_0001_2345_6789, // 高 32 位 = 0x1 → BAPPN 段
+            lhxw: 2,
+            lhxs: 3,
+            hhxw: 4,
+            hhxs: 5,
+        };
+        let v = pack_smsicfg_addrh(&cfg);
+        assert_eq!(v & CFGADDRH_L, CFGADDRH_L, "L 位必须置位");
+        assert_eq!(
+            (v >> CFGADDRH_HHXS_SHIFT) & CFGADDRH_HHXS_MASK,
+            5,
+            "HHXS 段"
+        );
+        assert_eq!(
+            (v >> CFGADDRH_LHXS_SHIFT) & CFGADDRH_LHXS_MASK,
+            3,
+            "LHXS 段"
+        );
+        assert_eq!(
+            (v >> CFGADDRH_HHXW_SHIFT) & CFGADDRH_HHXW_MASK,
+            4,
+            "HHXW 段"
+        );
+        assert_eq!(
+            (v >> CFGADDRH_LHXW_SHIFT) & CFGADDRH_LHXW_MASK,
+            2,
+            "LHXW 段"
+        );
+        assert_eq!(v & CFGADDRH_BAPPN_MASK, 1, "BAPPN = base_ppn 高 32 位");
+    }
+
+    #[test]
+    fn pack_smsicfg_addrh_masks_overflowing_fields() {
+        // 字段超出 mask 的高位必须被丢弃，不得污染相邻段。
+        let cfg = MsiConfig {
+            base_ppn: 0xffff_ffff_ffff_ffff,
+            lhxw: 0xff,
+            lhxs: 0xff,
+            hhxw: 0xff,
+            hhxs: 0xff,
+        };
+        let v = pack_smsicfg_addrh(&cfg);
+        assert_eq!(
+            (v >> CFGADDRH_HHXS_SHIFT) & CFGADDRH_HHXS_MASK,
+            CFGADDRH_HHXS_MASK
+        );
+        assert_eq!(
+            (v >> CFGADDRH_LHXS_SHIFT) & CFGADDRH_LHXS_MASK,
+            CFGADDRH_LHXS_MASK
+        );
+        assert_eq!(
+            (v >> CFGADDRH_HHXW_SHIFT) & CFGADDRH_HHXW_MASK,
+            CFGADDRH_HHXW_MASK
+        );
+        assert_eq!(
+            (v >> CFGADDRH_LHXW_SHIFT) & CFGADDRH_LHXW_MASK,
+            CFGADDRH_LHXW_MASK
+        );
+        assert_eq!(v & CFGADDRH_BAPPN_MASK, CFGADDRH_BAPPN_MASK);
+    }
+
+    #[test]
+    fn from_fdt_interrupt_spec_maps_posix_flags() {
+        // 回归锁定：0x04 → LevelHigh。此前曾因"PCI INTx 必为 level-low"的
+        // 错误推论被绕过、硬编码为 LevelLow，导致 QEMU virt 下 rectified 信号
+        // 反极性、virtio-blk INTx 永不触发（见 commit 15d166ba8）。
+        assert_eq!(
+            SourceTrigger::from_fdt_interrupt_spec(0x01),
+            Some(SourceTrigger::EdgeRise)
+        );
+        assert_eq!(
+            SourceTrigger::from_fdt_interrupt_spec(0x02),
+            Some(SourceTrigger::EdgeFall)
+        );
+        assert_eq!(
+            SourceTrigger::from_fdt_interrupt_spec(0x04),
+            Some(SourceTrigger::LevelHigh)
+        );
+        assert_eq!(
+            SourceTrigger::from_fdt_interrupt_spec(0x08),
+            Some(SourceTrigger::LevelLow)
+        );
+    }
+
+    #[test]
+    fn from_fdt_interrupt_spec_rejects_unknown_and_zero() {
+        // 未知 flag / 缺省（0）必须返回 None，由调用方决定 fallback
+        // （somehal 集成层 fallback 为 LevelHigh）。禁止猜测成具体触发类型。
+        assert_eq!(SourceTrigger::from_fdt_interrupt_spec(0), None);
+        assert_eq!(SourceTrigger::from_fdt_interrupt_spec(0x10), None);
+        assert_eq!(SourceTrigger::from_fdt_interrupt_spec(u32::MAX), None);
     }
 }

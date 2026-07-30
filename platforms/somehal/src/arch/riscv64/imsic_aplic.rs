@@ -8,6 +8,7 @@
 use alloc::{format, vec::Vec};
 use core::num::NonZeroU32;
 
+use ax_kspin::SpinNoIrq;
 use ax_riscv_aplic::{Aplic, MsiConfig, MsiTarget, SourceTrigger};
 use ax_riscv_imsic::{self, ImsicGeometry};
 use kernutil::StaticCell;
@@ -16,24 +17,15 @@ use rdif_msi::{
     Interface as MsiInterface, IrqAffinity as MsiIrqAffinity, Msi, MsiAllocation, MsiEventId,
     MsiMessage, MsiProviderId, MsiRequest, MsiVector, MsiVectorIndex,
 };
-use rdrive::{
-    module_driver,
-    probe::OnProbeError,
-    register::ProbeFdt,
-    DriverGeneric,
-};
+use rdrive::{DriverGeneric, module_driver, probe::OnProbeError, register::ProbeFdt};
 
 use crate::{
     common::ioremap,
     irq::{
-        alloc_child_irq_domain, alloc_irq_domain, domain_by_kind_fast, map_irq_route, HwIrq,
-        IrqDomainKind, IrqId,
+        HwIrq, IrqDomainId, IrqDomainKind, IrqId, alloc_child_irq_domain, alloc_irq_domain,
+        domain_by_kind_fast, map_irq_route,
     },
 };
-
-use ax_kspin::SpinNoIrq;
-
-use crate::irq::IrqDomainId;
 
 static IMSIC_STATE: StaticCell<ImsicState> = StaticCell::uninit();
 
@@ -223,8 +215,8 @@ fn probe_aplic(probe: ProbeFdt<'_>) -> Result<(), OnProbeError> {
     let imsic_domain = domain_by_kind_fast(IrqDomainKind::RiscvImsic).ok_or_else(|| {
         OnProbeError::other("IMSIC domain not found; APLIC needs IMSIC to probe first")
     })?;
-    let state = get_imsic_state()
-        .ok_or_else(|| OnProbeError::other("IMSIC state not initialized"))?;
+    let state =
+        get_imsic_state().ok_or_else(|| OnProbeError::other("IMSIC state not initialized"))?;
     let geo = &state.geometry;
 
     let msi_cfg = MsiConfig {
@@ -268,16 +260,9 @@ fn fdt_u32(info: &rdrive::register::FdtInfo<'_>, name: &str) -> Option<u32> {
 }
 
 /// 读取 AIA DT binding 的必填 u32 属性，缺失则 probe 失败。
-fn fdt_u32_required(
-    info: &rdrive::register::FdtInfo<'_>,
-    name: &str,
-) -> Result<u32, OnProbeError> {
+fn fdt_u32_required(info: &rdrive::register::FdtInfo<'_>, name: &str) -> Result<u32, OnProbeError> {
     fdt_u32(info, name).ok_or_else(|| {
-        OnProbeError::other(format!(
-            "[{}] 缺少必填属性 `{}`",
-            info.node.name(),
-            name
-        ))
+        OnProbeError::other(format!("[{}] 缺少必填属性 `{}`", info.node.name(), name))
     })
 }
 
@@ -326,11 +311,7 @@ impl Interface for RiscvImsic {
         Err(rdif_intc::IrqError::Unsupported)
     }
 
-    fn set_enabled(
-        &mut self,
-        hwirq: HwIrq,
-        enabled: bool,
-    ) -> Result<(), rdif_intc::IrqError> {
+    fn set_enabled(&mut self, hwirq: HwIrq, enabled: bool) -> Result<(), rdif_intc::IrqError> {
         // hwirq 即 IMSIC 的 EID（MSI 向量分配时由 EidAllocator 派发，APPLIC 有线源
         // 的 set_enabled 也以 EID 形式回灌到此）。此处被 IRQ 框架在注册/使能 MSI-X
         // 叶子 handler 时，经 leaf→parent 解析后调用。
@@ -376,7 +357,10 @@ impl Interface for RiscvAplicDriver {
         if source == 0 || source > self.num_sources {
             return Err(rdif_intc::IrqError::InvalidIrq);
         }
-        let trigger = irq_prop.get(1).copied().and_then(fdt_flag_to_aplic_trigger);
+        let trigger = irq_prop
+            .get(1)
+            .copied()
+            .and_then(SourceTrigger::from_fdt_interrupt_spec);
         if let Some(trigger) = trigger {
             self.source_trigger.lock()[source as usize] = Some(trigger);
         }
@@ -394,11 +378,7 @@ impl Interface for RiscvAplicDriver {
         false
     }
 
-    fn set_enabled(
-        &mut self,
-        hwirq: HwIrq,
-        enabled: bool,
-    ) -> Result<(), rdif_intc::IrqError> {
+    fn set_enabled(&mut self, hwirq: HwIrq, enabled: bool) -> Result<(), rdif_intc::IrqError> {
         let source = NonZeroU32::new(hwirq.0).ok_or(rdif_intc::IrqError::InvalidIrq)?;
         if source.get() > self.num_sources {
             return Err(rdif_intc::IrqError::InvalidIrq);
@@ -508,17 +488,10 @@ impl MsiInterface for ImsicMsiProvider {
         Ok(vectors)
     }
 
-    fn compose_message(
-        &self,
-        vector: &MsiVector,
-    ) -> Result<MsiMessage, rdif_intc::IrqError> {
+    fn compose_message(&self, vector: &MsiVector) -> Result<MsiMessage, rdif_intc::IrqError> {
         let hart_index = crate::cpu::current_cpu_idx().unwrap_or(0) as u32;
-        let msg = ax_riscv_imsic::compose_msi_message(
-            &self.geometry,
-            hart_index,
-            0,
-            vector.event.0,
-        );
+        let msg =
+            ax_riscv_imsic::compose_msi_message(&self.geometry, hart_index, 0, vector.event.0);
         Ok(MsiMessage::new(msg.address as u64, msg.data))
     }
 
@@ -550,24 +523,11 @@ impl MsiInterface for ImsicMsiProvider {
         }
     }
 
-    fn free_vectors(
-        &mut self,
-        allocation: MsiAllocation,
-    ) -> Result<(), rdif_intc::IrqError> {
+    fn free_vectors(&mut self, allocation: MsiAllocation) -> Result<(), rdif_intc::IrqError> {
         for vector in allocation.vectors() {
             let _ = crate::irq::unmap_irq_route(vector.parent_irq, vector.irq);
             self.eid_allocator.free(vector.event.0);
         }
         Ok(())
     }
-}
-
-fn fdt_flag_to_aplic_trigger(cell: u32) -> Option<SourceTrigger> {
-    Some(match cell {
-        0x01 => SourceTrigger::EdgeRise,
-        0x02 => SourceTrigger::EdgeFall,
-        0x04 => SourceTrigger::LevelHigh,
-        0x08 => SourceTrigger::LevelLow,
-        _ => return None,
-    })
 }

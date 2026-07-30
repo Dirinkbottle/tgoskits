@@ -99,9 +99,7 @@ pub struct MsiMessage {
 /// K3 验证（见单测）：hart0=0xe0400000, hart1=0xe0440000, ... hart15=0xe07c0000。
 #[inline]
 pub fn interrupt_file_addr(geo: &ImsicGeometry, hart_index: u32, guest_index: u32) -> usize {
-    geo.base_addr
-        + (hart_index as usize) * geo.hart_stride()
-        + (guest_index as usize) * PAGE_SIZE
+    geo.base_addr + (hart_index as usize) * geo.hart_stride() + (guest_index as usize) * PAGE_SIZE
 }
 
 /// 组成 MSI 消息：address = 目标中断文件页 base（写此地址即 SETEIPNUM_LE），
@@ -292,6 +290,12 @@ pub unsafe fn claim() -> Option<(u32, u32)> {
 /// （写任意 non-zero 值即可触发 QEMU 的清 pending 路径）才算"完成"该中断。
 /// 不写 stopei 则 pending 位永不释放 → IRQ 线保持 asserted → 反复 trap。
 ///
+/// **QEMU 适配说明**：AIA 规范本身规定 stopei 读应原子完成 claim、priority-drop
+/// 与 activate（即读后 pending 自动清除）。但 QEMU 的 `riscv_imsic_topei_rmw`
+/// 实现把 read 和 write 分开：read 只返回值，write 才清 pending，偏离了规范。
+/// 因此本函数目前是 QEMU 行为适配；移植到严格遵循 AIA 规范的真硬件时，需复核
+/// 多写一次 stopei 是否被硬件忽略（规范未明确禁止重复 complete，但实现各异）。
+///
 /// # Safety
 ///
 /// 必须在本地 hart、S-mode、ssaia 扩展可用时调用。
@@ -398,5 +402,55 @@ mod tests {
     #[test]
     fn ipi_uses_eid_zero() {
         assert_eq!(IPI_EIID, 0);
+    }
+
+    #[test]
+    fn interrupt_file_addr_guest_pages_within_hart_stride() {
+        // K3 几何：每 hart 步长 0x40000（=2^6 guest * 4KB），guest 文件以 4KB 页排布。
+        let geo = k3();
+        let base = geo.base_addr;
+        // guest 0..3 应在第一个 hart 步长内，相邻 guest 差 4KB。
+        assert_eq!(interrupt_file_addr(&geo, 0, 0), base);
+        assert_eq!(interrupt_file_addr(&geo, 0, 1), base + 0x1000);
+        assert_eq!(interrupt_file_addr(&geo, 0, 2), base + 0x2000);
+        assert_eq!(interrupt_file_addr(&geo, 0, 63), base + 63 * 0x1000);
+        // guest 63 + 1 必须跨入下一 hart 步长（边界检查）。
+        assert_eq!(interrupt_file_addr(&geo, 1, 0), base + 0x40000);
+    }
+
+    #[test]
+    fn interrupt_file_addr_zero_geometry_is_single_page_layout() {
+        // QEMU virt (aia=aplic-imsic) 的 IMSIC 节点不带位宽属性，缺省全 0：
+        // 单 hart、单 guest、单 group，所有中断文件共享同一个 4KB 页。
+        let geo = ImsicGeometry {
+            base_addr: 0x2800_0000,
+            hart_index_bits: 0,
+            guest_index_bits: 0,
+            group_index_bits: 0,
+            group_index_shift: 24,
+            num_ids: 255,
+        };
+        assert_eq!(geo.hart_stride(), 0x1000, "单 guest → 步长 = 一页");
+        assert_eq!(geo.max_harts(), 1);
+        assert_eq!(interrupt_file_addr(&geo, 0, 0), 0x2800_0000);
+    }
+
+    #[test]
+    fn group_base_ppn_clears_group_index_bits() {
+        // 多 group 几何：group 索引位落在 base_addr 的高位，group_base_ppn
+        // 必须把这些位清零，APLIC 才能用 base_ppn + 几何字段重构正确地址。
+        let geo = ImsicGeometry {
+            // group_index_shift=24, group_index_bits=4 → group 位占 [28:32)。
+            // 设 base 的 bit28..32 为非零（模拟某 group 起始地址）。
+            base_addr: 0xe040_0000 | (0b1010 << 28),
+            hart_index_bits: 4,
+            guest_index_bits: 6,
+            group_index_bits: 4,
+            group_index_shift: 24,
+            num_ids: 511,
+        };
+        let bppn = group_base_ppn(&geo);
+        // group 位被清零后，base 应回落到 group 0 的起始（0xe040_0000）。
+        assert_eq!(bppn, 0xe040_0000 >> 12);
     }
 }
