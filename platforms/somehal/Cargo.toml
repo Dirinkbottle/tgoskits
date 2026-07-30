@@ -49,6 +49,8 @@ ax-cpu = { workspace = true, features = ["arm-el2"], optional = true }
 
 [target.'cfg(target_arch = "riscv64")'.dependencies]
 ax-riscv-plic = { workspace = true }
+ax-riscv-imsic = { path = "../../drivers/intc/riscv_imsic" }
+ax-riscv-aplic = { path = "../../drivers/intc/riscv_aplic" }
 riscv.workspace = true
 sbi-rt = { workspace = true, features = ["legacy"] }
 

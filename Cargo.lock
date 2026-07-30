@@ -1209,6 +1209,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "ax-riscv-aplic"
+version = "0.1.0"
+
+[[package]]
+name = "ax-riscv-imsic"
+version = "0.1.0"
+
+[[package]]
 name = "ax-riscv-plic"
 version = "0.4.9"
 dependencies = [
@@ -7948,6 +7956,8 @@ dependencies = [
  "arm-gic-driver",
  "ax-cpu",
  "ax-kspin 0.3.16",
+ "ax-riscv-aplic",
+ "ax-riscv-imsic",
  "ax-riscv-plic",
  "cpu-local",
  "irq-framework",

@@ -1,0 +1,15 @@
+[package]
+name = "ax-riscv-imsic"
+version = "0.1.0"
+repository = "https://github.com/rcore-os/tgoskits"
+edition.workspace = true
+authors = ["Oveln <oveln@example.com>"]
+description = "RISC-V Incoming MSI Controller (IMSIC) register definitions, CSR indirect access, and MSI target address computation (AIA)"
+keywords = ["arceos", "riscv", "riscv64", "imsic", "interrupt-controller"]
+categories = ["embedded", "no-std", "hardware-support", "os"]
+license = "Apache-2.0"
+
+# 无外部依赖：本 crate 只用 core::ptr 与内联汇编做 CSR / MMIO 访问，
+# 寄存器语义由本文件内的常量与封装函数直接表达（不引入 tock-registers，
+# 因 IMSIC 配置走 siselect/sireg CSR 间接访问，非内存映射位域，无法套用
+# tock-registers 的 register_bitfields 宏）。

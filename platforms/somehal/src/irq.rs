@@ -47,6 +47,8 @@ pub enum IrqDomainKind {
     X86Msi,
     AArch64Gic,
     RiscvPlic,
+    RiscvImsic,
+    RiscvAplic,
     LoongArchEioIntc,
     LoongArchPchPic,
     LoongArchLioIntc,
@@ -79,6 +81,7 @@ static X86_IOAPIC_DOMAIN_SLOT: AtomicU16 = AtomicU16::new(INVALID_IRQ_DOMAIN);
 static X86_MSI_DOMAIN_SLOT: AtomicU16 = AtomicU16::new(INVALID_IRQ_DOMAIN);
 static AARCH64_GIC_DOMAIN_SLOT: AtomicU16 = AtomicU16::new(INVALID_IRQ_DOMAIN);
 static RISCV_PLIC_DOMAIN_SLOT: AtomicU16 = AtomicU16::new(INVALID_IRQ_DOMAIN);
+static RISCV_IMSIC_DOMAIN_SLOT: AtomicU16 = AtomicU16::new(INVALID_IRQ_DOMAIN);
 static LOONGARCH_EIOINTC_DOMAIN_SLOT: AtomicU16 = AtomicU16::new(INVALID_IRQ_DOMAIN);
 static LOONGARCH_PCH_PIC_DOMAIN_SLOT: AtomicU16 = AtomicU16::new(INVALID_IRQ_DOMAIN);
 static LOONGARCH_LIOINTC_DOMAIN_SLOT: AtomicU16 = AtomicU16::new(INVALID_IRQ_DOMAIN);
@@ -190,10 +193,11 @@ fn domain_slot(kind: IrqDomainKind) -> Option<&'static AtomicU16> {
         IrqDomainKind::X86Msi => Some(&X86_MSI_DOMAIN_SLOT),
         IrqDomainKind::AArch64Gic => Some(&AARCH64_GIC_DOMAIN_SLOT),
         IrqDomainKind::RiscvPlic => Some(&RISCV_PLIC_DOMAIN_SLOT),
+        IrqDomainKind::RiscvImsic => Some(&RISCV_IMSIC_DOMAIN_SLOT),
         IrqDomainKind::LoongArchEioIntc => Some(&LOONGARCH_EIOINTC_DOMAIN_SLOT),
         IrqDomainKind::LoongArchPchPic => Some(&LOONGARCH_PCH_PIC_DOMAIN_SLOT),
         IrqDomainKind::LoongArchLioIntc => Some(&LOONGARCH_LIOINTC_DOMAIN_SLOT),
-        IrqDomainKind::MsiParent | IrqDomainKind::PciMsix => None,
+        IrqDomainKind::RiscvAplic | IrqDomainKind::MsiParent | IrqDomainKind::PciMsix => None,
     }
 }
 
@@ -562,6 +566,7 @@ mod tests {
             IrqDomainKind::X86Msi,
             IrqDomainKind::AArch64Gic,
             IrqDomainKind::RiscvPlic,
+            IrqDomainKind::RiscvImsic,
             IrqDomainKind::LoongArchEioIntc,
             IrqDomainKind::LoongArchPchPic,
             IrqDomainKind::LoongArchLioIntc,
