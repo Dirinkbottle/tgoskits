@@ -65,6 +65,16 @@ impl PlatOp for Plat {
         if crate::irq::domain_is_kind(irq.domain, crate::irq::IrqDomainKind::RiscvPlic) {
             return plic::irq_set_affinity(irq.hwirq, affinity);
         }
+        // AIA（APLIC wired / IMSIC MSI）的 affinity 即 MSI target hart。source 在
+        // set_enabled 时经 configure_source 已绑定到 current hart；当前单 hart 场景
+        // 下 set_affinity 无需操作。多 hart 时需要 reconfigure APLIC source 的
+        // hart_index（重新 configure_source 切换 MSI 目标 hart），届时在此实现。
+        // TODO: 多 hart APLIC source re-target。
+        if crate::irq::domain_is_kind(irq.domain, crate::irq::IrqDomainKind::RiscvAplic)
+            || crate::irq::domain_is_kind(irq.domain, crate::irq::IrqDomainKind::RiscvImsic)
+        {
+            return Ok(());
+        }
         Err(IrqError::InvalidIrq)
     }
 
