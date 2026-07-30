@@ -3,11 +3,13 @@ use crate::{
     irq::{CPU_LOCAL_IRQ_DOMAIN, HwIrq, IrqError, IrqId, IrqSource},
 };
 
+mod imsic_aplic;
 mod plic;
 
 use crate::irq_routing::{
-    RISCV_INTERRUPT_BIT, RISCV_S_SOFT_CAUSE, riscv_cpu_local_hwirq_is_runtime_irq,
-    riscv_cpu_local_irq_from_raw, riscv_local_irq_raw, riscv_resolve_controller_line,
+    RISCV_INTERRUPT_BIT, RISCV_S_SOFT_CAUSE, RiscvTrapIrq, classify_riscv_trap,
+    riscv_cpu_local_hwirq_is_runtime_irq, riscv_cpu_local_irq_from_raw, riscv_local_irq_raw,
+    riscv_resolve_controller_line,
 };
 
 pub struct Plat;
@@ -37,7 +39,10 @@ impl PlatOp for Plat {
         if irq.domain == CPU_LOCAL_IRQ_DOMAIN {
             return plic::local_irq_set_enable(riscv_local_irq_raw(irq)?.into(), enable);
         }
-        if crate::irq::domain_is_kind(irq.domain, crate::irq::IrqDomainKind::RiscvPlic) {
+        if crate::irq::domain_is_kind(irq.domain, crate::irq::IrqDomainKind::RiscvPlic)
+            || crate::irq::domain_is_kind(irq.domain, crate::irq::IrqDomainKind::RiscvAplic)
+            || crate::irq::domain_is_kind(irq.domain, crate::irq::IrqDomainKind::RiscvImsic)
+        {
             return crate::irq::set_controller_irq_enabled(irq, enable);
         }
         Err(IrqError::InvalidIrq)
@@ -54,13 +59,26 @@ impl PlatOp for Plat {
     }
 
     fn begin_irq(raw: usize) -> Option<Self::ActiveIrq> {
-        plic::begin_irq(raw)
+        match classify_riscv_trap(raw) {
+            RiscvTrapIrq::External if imsic_aplic::is_aia_active() => {
+                imsic_aplic::begin_external_irq()
+            }
+            _ => plic::begin_irq(raw),
+        }
     }
 
     fn active_irq_id(active: &Self::ActiveIrq) -> IrqId {
         let raw: usize = active.id().into();
         if raw & RISCV_INTERRUPT_BIT != 0 {
-            riscv_cpu_local_irq_from_raw(raw).expect("active RISC-V local IRQ must be validated")
+            riscv_cpu_local_irq_from_raw(raw)
+                .expect("active RISC-V local IRQ must be validated")
+        } else if imsic_aplic::is_aia_active() {
+            // stopei returns an EID. Always attribute it to the IMSIC root
+            // domain; resolve_irq_route walks parent→leaf to find the correct
+            // child-domain handler (APLIC wired or PCI MSI-X).
+            let imsic = crate::irq::domain_by_kind_fast(crate::irq::IrqDomainKind::RiscvImsic)
+                .expect("AIA active but IMSIC domain missing");
+            IrqId::new(imsic, HwIrq(raw as u32))
         } else {
             plic_irq_id_from_claimed_source(raw)
                 .expect("active RISC-V PLIC source must come from a validated claim")
@@ -78,11 +96,17 @@ impl PlatOp for Plat {
                 source,
                 IrqSource::ControllerLine { domain, .. }
                     if crate::irq::domain_is_kind(domain, crate::irq::IrqDomainKind::RiscvPlic)
+                        || crate::irq::domain_is_kind(domain, crate::irq::IrqDomainKind::RiscvAplic)
             )
         })?;
         match source {
             IrqSource::ControllerLine { domain, hwirq } if domain == CPU_LOCAL_IRQ_DOMAIN => {
                 checked_cpu_local_irq(hwirq)
+            }
+            IrqSource::ControllerLine { domain, hwirq }
+                if crate::irq::domain_is_kind(domain, crate::irq::IrqDomainKind::RiscvAplic) =>
+            {
+                Ok(IrqId::new(domain, hwirq))
             }
             IrqSource::ControllerLine { domain, hwirq } => {
                 plic::source_from_hwirq(hwirq)?;
@@ -97,7 +121,13 @@ impl PlatOp for Plat {
     fn init_boot_irq_cpu(cpu_idx: usize, role: crate::irq::CpuBootRole) {
         match role {
             crate::irq::CpuBootRole::Primary => {}
-            crate::irq::CpuBootRole::Secondary => plic::secondary_init_intc(cpu_idx),
+            crate::irq::CpuBootRole::Secondary => {
+                if imsic_aplic::is_aia_active() {
+                    imsic_aplic::secondary_init_intc();
+                } else {
+                    plic::secondary_init_intc(cpu_idx);
+                }
+            }
         }
     }
 

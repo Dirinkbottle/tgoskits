@@ -104,6 +104,19 @@ impl ActiveIrq {
     pub fn id(&self) -> rdrive::IrqId {
         self.irq
     }
+
+    /// 构造一个**无需 Drop 完成动作**的 `ActiveIrq`。
+    ///
+    /// 供 AIA（IMSIC）外部中断路径使用：AIA 的 `stopei` 读取原子地完成
+    /// claim + priority-drop + deactivate（见 AIA 规范），故不需要像 PLIC
+    /// 那样在 Drop 时再写 claim/complete 寄存器。`irq` 携带的是 stopei 返回
+    /// 的 EIID（无域信息，由 `Plat::active_irq_id` 再归属到 IMSIC 根域）。
+    pub fn new_no_completion(irq: rdrive::IrqId) -> Self {
+        Self {
+            irq,
+            completion: Completion::None,
+        }
+    }
 }
 
 impl Drop for ActiveIrq {

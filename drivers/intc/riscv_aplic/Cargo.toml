@@ -1,0 +1,14 @@
+[package]
+name = "ax-riscv-aplic"
+version = "0.1.0"
+repository = "https://github.com/rcore-os/tgoskits"
+edition.workspace = true
+authors = ["Oveln <oveln@example.com>"]
+description = "RISC-V Advanced Platform-Level Interrupt Controller (APLIC) register definitions and MSI-mode operations (AIA)"
+keywords = ["arceos", "riscv", "riscv64", "aplic", "interrupt-controller"]
+categories = ["embedded", "no-std", "hardware-support", "os"]
+license = "Apache-2.0"
+
+# 无外部依赖：本 crate 只用 core::ptr 的 read_volatile/write_volatile 做
+# MMIO 访问，寄存器偏移与位域由常量直接表达。（APLIC 是纯 MMIO，后续如需
+# 与同仓 ax-riscv-plic 风格对齐，可再引入 tock-registers 重构位域封装。）
