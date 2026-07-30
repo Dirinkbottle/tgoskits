@@ -2,6 +2,7 @@ use alloc::{format, vec, vec::Vec};
 use core::{num::NonZeroU32, ptr::NonNull};
 
 use ax_riscv_plic::{PLICRegs, Plic, PlicIrqHandler};
+use ax_riscv_imsic;
 use kernutil::StaticCell;
 use rdif_intc::Interface;
 use rdrive::{
@@ -93,6 +94,10 @@ pub fn irq_set_affinity(
 enum Completion {
     None,
     Plic(PlicClaim),
+    /// IMSIC stopei 写回值。读 stopei 只返回 pending 中断 ID，不自动清除
+    /// pending 位（QEMU riscv_imsic_topei_rmw 的 read 侧）。必须再写 stopei
+    /// 才能清 pending、完成中断。
+    Imsic(u32),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -122,10 +127,21 @@ impl ActiveIrq {
     }
 
     pub(super) fn take_plic_claim(&mut self) -> Option<PlicClaim> {
-        match core::mem::replace(&mut self.completion, Completion::None) {
-            Completion::None => None,
+        let completion = core::mem::replace(&mut self.completion, Completion::None);
+        match completion {
             Completion::Plic(claim) => Some(claim),
-            _ => None,
+            other => {
+                self.completion = other;
+                None
+            }
+        }
+    }
+
+    /// 供 AIA（IMSIC）使用：Drop 时写回 `stopei` 完成 pending 清除。
+    pub fn new_imsic(irq: rdrive::IrqId, stopei_val: u32) -> Self {
+        Self {
+            irq,
+            completion: Completion::Imsic(stopei_val),
         }
     }
 
@@ -135,6 +151,7 @@ impl ActiveIrq {
     /// claim + priority-drop + deactivate（见 AIA 规范），故不需要像 PLIC
     /// 那样在 Drop 时再写 claim/complete 寄存器。`irq` 携带的是 stopei 返回
     /// 的 EIID（无域信息，由 `Plat::active_irq_id` 再归属到 IMSIC 根域）。
+    #[deprecated = "stopei read does NOT clear pending in QEMU; use `new_imsic` with stopei write"]
     pub fn new_no_completion(irq: rdrive::IrqId) -> Self {
         Self {
             irq,
@@ -145,8 +162,10 @@ impl ActiveIrq {
 
 impl Drop for ActiveIrq {
     fn drop(&mut self) {
-        if let Some(claim) = self.take_plic_claim() {
-            complete_external_irq_claim(claim);
+        match core::mem::replace(&mut self.completion, Completion::None) {
+            Completion::Plic(claim) => complete_external_irq_claim(claim),
+            Completion::Imsic(val) => unsafe { ax_riscv_imsic::complete_stopei(val) },
+            Completion::None => {}
         }
     }
 }
