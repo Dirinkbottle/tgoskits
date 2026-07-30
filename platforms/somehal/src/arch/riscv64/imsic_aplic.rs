@@ -253,6 +253,7 @@ fn probe_aplic(probe: ProbeFdt<'_>) -> Result<(), OnProbeError> {
             aplic_domain: domain,
             eid_allocator: &state.eid_allocator,
             source_eid: SpinNoIrq::new(vec![None; num_sources as usize + 1]),
+            source_trigger: SpinNoIrq::new(vec![None; num_sources as usize + 1]),
         },
     ));
     info!("APLIC probed: num_sources={num_sources}, MSI mode configured");
@@ -351,6 +352,7 @@ struct RiscvAplicDriver {
     aplic_domain: IrqDomainId,
     eid_allocator: &'static EidAllocator,
     source_eid: SpinNoIrq<Vec<Option<u32>>>,
+    source_trigger: SpinNoIrq<Vec<Option<SourceTrigger>>>,
 }
 
 impl DriverGeneric for RiscvAplicDriver {
@@ -371,7 +373,22 @@ impl Interface for RiscvAplicDriver {
         if source == 0 || source > self.num_sources {
             return Err(rdif_intc::IrqError::InvalidIrq);
         }
+        let trigger = irq_prop.get(1).copied().and_then(fdt_flag_to_aplic_trigger);
+        if let Some(trigger) = trigger {
+            self.source_trigger.lock()[source as usize] = Some(trigger);
+        }
         Ok(rdif_intc::ControllerIrqTranslation::new(HwIrq(source)))
+    }
+
+    fn configure(
+        &mut self,
+        _translation: &rdif_intc::IrqTranslation,
+    ) -> Result<(), rdif_intc::IrqError> {
+        Ok(())
+    }
+
+    fn supports_acpi_gsi(&self, _route: &rdif_intc::AcpiGsiRoute) -> bool {
+        false
     }
 
     fn set_enabled(
@@ -408,18 +425,22 @@ impl Interface for RiscvAplicDriver {
             // plane path runs with IRQs disabled).
             unsafe { ax_riscv_imsic::enable_eid(eid) };
 
-            // trigger 必须是 level-sensitive 且匹配 INTx 的 active-low 极性。
-            // QEMU virt 上 APLIC 的 wired source 均为 PCI INTx（FDT 标 0x4 =
-            // level-low，符合 PCI INTx active-low 规范）：设备 assert 时 gsi
-            // level=0（低），deassert 时 level=1（高），故用 LevelLow。
-            // 此前误用 EdgeRise：INTx 仅在 deassert（0→1 上升沿）时 set pending，
-            // handler 读 ISR ack 后设备 deassert → 再次触发 MSI → 循环 storm
-            // （45k 次/14s）。EdgeRise storm 本身证明了 active-low 极性。
-            // FIXME: trigger 应由来源（FDT interrupt spec / PCI INTx 规范）决定，
-            // 当前写死 LevelLow 假设所有 wired source 都是 PCI INTx active-low。
+            // 触发类型优先从 FDT interrupt specifier 提取，fallback 为 LevelHigh。
+            // QEMU virt GPIO 模型下，所有中断源 assert 时 level=1（raise）、deassert
+            // 时 level=0（lower），因此 LevelHigh 是正确的缺省值。
+            let trigger = {
+                let guard = self.source_trigger.lock();
+                guard[source.get() as usize]
+            };
+            let trigger = trigger.unwrap_or(SourceTrigger::LevelHigh);
+            // 配置前先清掉之前可能残留的 pending。
+            // configure_source 写 sourcecfg 时 QEMU 会基于当前 rectified 电平
+            // 重新评估 pending：若设备线已 assert → pending=1，随后 enable_source
+            // 立即投递 MSI，正确处理"使能时设备已就绪"的场景。
+            self.inner.clear_source_pending(source);
             self.inner.configure_source(
                 source,
-                SourceTrigger::LevelLow,
+                trigger,
                 MsiTarget {
                     hart_index: hart_idx,
                     guest_index: 0,
@@ -434,11 +455,6 @@ impl Interface for RiscvAplicDriver {
                 IrqId::new(self.aplic_domain, hwirq),
             )?;
 
-            // 清掉 configure_source 写 sourcecfg 时，因当前 INTx 电平的 rectified
-            // 值意外置上的 pending：否则 enable_source 会立即 ENPEND → 发 spurious
-            // MSI，而此刻仍在 request_shared_irq 内部（handler 刚注册、可能持锁），
-            // 中断重入导致死锁。真实中断由设备后续 assert 触发。
-            self.inner.clear_source_pending(source);
             self.inner.enable_source(source);
         } else {
             self.inner.disable_source(source);
@@ -541,4 +557,14 @@ impl MsiInterface for ImsicMsiProvider {
         }
         Ok(())
     }
+}
+
+fn fdt_flag_to_aplic_trigger(cell: u32) -> Option<SourceTrigger> {
+    Some(match cell {
+        0x01 => SourceTrigger::EdgeRise,
+        0x02 => SourceTrigger::EdgeFall,
+        0x04 => SourceTrigger::LevelHigh,
+        0x08 => SourceTrigger::LevelLow,
+        _ => return None,
+    })
 }
