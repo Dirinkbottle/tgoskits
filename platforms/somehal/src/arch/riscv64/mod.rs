@@ -80,8 +80,7 @@ impl PlatOp for Plat {
     fn active_irq_id(active: &Self::ActiveIrq) -> IrqId {
         let raw: usize = active.id().into();
         if raw & RISCV_INTERRUPT_BIT != 0 {
-            riscv_cpu_local_irq_from_raw(raw)
-                .expect("active RISC-V local IRQ must be validated")
+            riscv_cpu_local_irq_from_raw(raw).expect("active RISC-V local IRQ must be validated")
         } else if imsic_aplic::is_aia_active() {
             // stopei returns an EID. Always attribute it to the IMSIC root
             // domain; resolve_irq_route walks parent→leaf to find the correct
