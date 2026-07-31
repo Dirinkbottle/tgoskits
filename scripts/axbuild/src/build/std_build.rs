@@ -68,6 +68,8 @@ pub(super) fn std_build_target_for(target: &str) -> anyhow::Result<StdBuildTarge
         ("x86_64-unknown-linux-musl", "x86_64-linux-musl")
     } else if target.starts_with("aarch64-") {
         ("aarch64-unknown-linux-musl", "aarch64-linux-musl")
+    } else if target.starts_with("riscv64gcv-") {
+        ("riscv64gcv-unknown-linux-musl", "riscv64-linux-musl")
     } else if target.starts_with("riscv64") {
         ("riscv64gc-unknown-linux-musl", "riscv64-linux-musl")
     } else if target.starts_with("loongarch64-") {

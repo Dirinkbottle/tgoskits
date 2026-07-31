@@ -11,6 +11,10 @@ name = "some-serial"
 repository.workspace = true
 version = "0.7.1"
 
+[features]
+default = []
+pxa-uart = []
+
 [dependencies]
 bitflags.workspace = true
 enum_dispatch.workspace = true

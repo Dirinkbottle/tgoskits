@@ -224,6 +224,49 @@ target = "aarch64-unknown-none-softfloat"
 }
 
 #[test]
+fn prepare_starry_request_explicit_board_name_resolves_board_config() {
+    let root = tempdir().unwrap();
+    prepare_starry_workspace(root.path());
+    let board_config = root
+        .path()
+        .join("os/StarryOS/configs/board/qemu-aarch64.toml");
+    fs::create_dir_all(board_config.parent().unwrap()).unwrap();
+    fs::write(
+        &board_config,
+        r#"
+target = "aarch64-unknown-none-softfloat"
+features = ["ax-driver/serial"]
+log = "Warn"
+"#,
+    )
+    .unwrap();
+
+    let app = test_app_context(root.path());
+
+    let (request, snapshot) = prepare_starry_request(
+        &app,
+        StarryCliArgs {
+            config: Some(PathBuf::from("qemu-aarch64")),
+            arch: None,
+            target: None,
+            smp: None,
+            debug: false,
+        },
+        None,
+        None,
+    )
+    .unwrap();
+
+    assert_eq!(request.arch, "aarch64");
+    assert_eq!(request.target, "aarch64-unknown-none-softfloat");
+    assert_eq!(request.build_info_path, board_config);
+    assert_eq!(
+        snapshot.config,
+        Some(PathBuf::from("os/StarryOS/configs/board/qemu-aarch64.toml"))
+    );
+}
+
+#[test]
 fn prepare_starry_request_rejects_mismatched_arch_and_target() {
     let root = tempdir().unwrap();
     prepare_starry_workspace(root.path());

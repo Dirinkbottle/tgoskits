@@ -592,7 +592,6 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
             Arc::new(rtc::Rtc),
         ),
     );
-
     #[cfg(feature = "k230-kpu")]
     {
         if let Some(kpu_device) = kpu::KpuDevice::probe().map(Arc::new) {

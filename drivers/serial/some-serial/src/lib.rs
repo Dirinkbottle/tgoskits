@@ -25,6 +25,10 @@
 //! - 支持 IO Port（x86_64）、MMIO（通用）和 DesignWare APB 访问方式
 //! - 支持 16 字节 FIFO 缓冲
 //!
+//! ### PXA/XScale UART
+//! - SpacemiT K1/K3 串口控制器
+//! - 通过 `pxa-uart` feature 启用
+//!
 //! ## 快速开始
 //!
 //! ```rust,no_run
@@ -59,6 +63,8 @@ extern crate std;
 
 pub mod ns16550;
 pub mod pl011;
+#[cfg(feature = "pxa-uart")]
+pub mod pxa_uart;
 
 use core::fmt::Display;
 

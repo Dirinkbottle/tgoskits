@@ -16,7 +16,7 @@ export DISK_IMG := rootfs-$(ARCH).img
 export A := $(CURDIR)/starryos
 export NO_AXSTD := y
 export AX_LIB := ax-std
-export APP_FEATURES := qemu
+export APP_FEATURES ?= qemu
 
 ifeq ($(MEMTRACK), y)
 	APP_FEATURES += starry-api/memtrack

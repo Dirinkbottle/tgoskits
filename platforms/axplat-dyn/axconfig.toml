@@ -1,0 +1,15 @@
+arch = "riscv64"
+platform = "qemu-rt-async"
+package = "axplat-dyn"
+
+[plat]
+max-cpu-num = 1
+phys-memory-base = 0x80000000
+phys-memory-size = 0x10000000
+kernel-base-paddr = 0x80200000
+kernel-base-vaddr = "0xffffffc080200000"
+phys-virt-offset = "0xffffffc000000000"
+phys-bus-offset = 0
+kernel-aspace-base = "0xffffffc000000000"
+kernel-aspace-size = "0x0000003ffffff000"
+boot-stack-size = 0x40000

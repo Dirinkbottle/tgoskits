@@ -187,6 +187,12 @@ impl AppContext {
                 .then_some(snapshot.config.as_ref())
                 .flatten(),
         );
+        let resolved_config = match (cli.config.is_some(), resolved_config) {
+            (true, Some(path)) => Some(
+                crate::starry::build::resolve_explicit_build_config_selector(&self.root, path)?,
+            ),
+            (_, path) => path,
+        };
         let config_target = resolved_config
             .as_deref()
             .filter(|_| cli.config.is_some() && cli.target.is_none())

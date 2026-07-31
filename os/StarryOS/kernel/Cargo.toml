@@ -78,8 +78,10 @@ rk3588-pwm = [
     "dep:rdif-pwm",
 ]
 k230-kpu = ["ax-hal/xuantie-c9xx", "dep:axklib", "dep:k230-kpu"]
+k3_com260kit = ["dep:k3_aiUabi", "dep:k3_aiScheduler"]
 vsock = ["ax-runtime/vsock"]
 dynamic_debug = ["ipi"]
+user_log = []
 sg2002 = [
     "ax-runtime/irq",
     "ax-driver/usb",
@@ -108,11 +110,15 @@ smp = ["ax-std/smp"]
 stack-guard-page = ["ax-runtime/stack-guard-page"]
 stack-protector = ["ax-runtime/stack-protector"]
 axtest = []
+vector = ["ax-cpu/vector"]
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(axtest)', 'cfg(feature, values("ax-std"))'] }
 
 [dependencies]
+ov-channels = "0.2"
+k3_aiUabi = { git = "https://github.com/Dirinkbottle/k3x-HERA-RT.git", optional = true }
+k3_aiScheduler = { git = "https://github.com/Dirinkbottle/k3x-HERA-RT.git", optional = true }
 ax-alloc = { workspace = true }
 ax-crate-interface.workspace = true
 ax-display.workspace = true
@@ -144,6 +150,7 @@ ax-task = { workspace = true, features = [
     "sched-rr",
     "axtest",
 ] }
+mmio-api.workspace = true
 ax-dma = { workspace = true, optional = true }
 rockchip-rga = { workspace = true, optional = true }
 sg2002-tpu = { workspace = true, optional = true }

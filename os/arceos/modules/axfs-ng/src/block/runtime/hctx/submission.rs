@@ -45,6 +45,7 @@ pub(super) struct SubmissionLoop<'a> {
     pub(super) next_channel: &'a mut usize,
     pub(super) prefer_retry: &'a mut bool,
     pub(super) scratch: &'a mut SubmissionScratch,
+    pub(super) observer: &'a Weak<dyn HctxObserver>,
 }
 
 #[derive(Default)]
@@ -106,25 +107,44 @@ pub(super) fn submit_available(
             if commit_result.is_err() {
                 set_hctx_fatal(context.state, context.fatal_error, BlkError::Io);
             }
+            // Reconcile submission ownership BEFORE draining completions.
+            // Synchronous drivers execute requests during submit and produce
+            // completions immediately — the pending map must already contain
+            // the matching entries so the completion sink can resolve them.
+            let deadline = wall_time().saturating_add(REQUEST_TIMEOUT);
+            let ownership_valid = reconcile_submission_batch(
+                &mut context.scratch.requests,
+                &mut context.scratch.metadata,
+                &context.scratch.accepted.ids,
+                removed,
+                SubmissionReconciliation {
+                    deadline,
+                    pending: context.pending,
+                    retry_submissions: context.retry_submissions,
+                    protocol_failed: context.protocol_failed,
+                },
+            );
+            super::super::metrics::record_submission_batch(removed, context.pending.len());
+            if !ownership_valid {
+                set_hctx_fatal(context.state, context.fatal_error, BlkError::Io);
+            }
+            // Drain completions after pending entries are established.
+            let mut unexpected = false;
+            let mut sink = HctxCompletionSink {
+                pending: context.pending,
+                observer: context.observer,
+                override_error: None,
+                unexpected_completion: &mut unexpected,
+            };
+            if let Err(error) = queue.drain_completions(&mut sink) {
+                set_hctx_fatal(context.state, context.fatal_error, error);
+            } else if unexpected {
+                set_hctx_fatal(context.state, context.fatal_error, BlkError::Io);
+            }
         }
 
-        let deadline = wall_time().saturating_add(REQUEST_TIMEOUT);
-        let ownership_valid = reconcile_submission_batch(
-            &mut context.scratch.requests,
-            &mut context.scratch.metadata,
-            &context.scratch.accepted.ids,
-            removed,
-            SubmissionReconciliation {
-                deadline,
-                pending: context.pending,
-                retry_submissions: context.retry_submissions,
-                protocol_failed: context.protocol_failed,
-            },
-        );
-        super::super::metrics::record_submission_batch(removed, context.pending.len());
-
         progress.made_progress |= removed != 0;
-        if !contract_valid || !ownership_valid {
+        if !contract_valid {
             set_hctx_fatal(context.state, context.fatal_error, BlkError::Io);
         }
         match result.disposition() {

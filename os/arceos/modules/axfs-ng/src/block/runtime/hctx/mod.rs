@@ -327,6 +327,7 @@ fn run_hctx(
                     next_channel: &mut next_channel,
                     prefer_retry: &mut prefer_retry,
                     scratch: &mut submission_scratch,
+                    observer: &observer,
                 },
             )
         };

@@ -1,0 +1,12 @@
+env = {}
+features = [
+  "k3_com260kit",
+  "ax-driver/serial",
+  "ax-driver/k3-pxa-uart",
+  "ax-driver/k3-ufs",
+  "ax-driver/zicbom",
+  "axplat-dyn/zicbom",
+  "starry-kernel/vector",
+]
+log = "Info"
+target = "riscv64gc-unknown-none-elf"
