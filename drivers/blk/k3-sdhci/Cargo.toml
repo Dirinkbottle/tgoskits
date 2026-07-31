@@ -1,0 +1,25 @@
+[package]
+name = "k3-sdhci"
+version = "0.1.0"
+repository.workspace = true
+edition = "2024"
+license = "Apache-2.0"
+description = "SpacemiT K3 SDHCI host controller driver (no_std)"
+keywords = ["spacemit", "k3", "sdhci", "embedded", "no_std"]
+categories = ["embedded", "no-std", "hardware-support"]
+
+[dependencies]
+sdhci-host = { path = "../sdhci-host" }
+sdmmc-protocol = { workspace = true, default-features = false }
+log.workspace = true
+dma-api.workspace = true
+mmio-api.workspace = true
+bitflags = "2"
+
+# Platform integration dependencies
+rdrive = { workspace = true, optional = true }
+axklib = { workspace = true, optional = true }
+
+[features]
+default = []
+platform = ["rdrive", "axklib"]
