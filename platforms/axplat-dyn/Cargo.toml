@@ -11,6 +11,7 @@ repository.workspace = true
 
 [features]
 default = ["smp", "irq" ]
+debug-runtime-console-output = ["somehal/debug-runtime-console-output"]
 smp = ["ax-plat/smp"]
 irq = ["ax-plat/irq"]
 rtc = []
@@ -20,6 +21,7 @@ tls = ["somehal/tls", "ax-cpu/tls", "cpu-local/tls"]
 uspace = ["somehal/uspace"]
 hv = ["somehal/hv"]
 thead-mae = ["somehal/thead-mae", "ax-cpu/xuantie-c9xx"]
+zicbom = ["somehal/zicbom"]
 
 [dependencies]
 anyhow = { version = "1", default-features = false }

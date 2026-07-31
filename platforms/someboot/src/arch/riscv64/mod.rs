@@ -425,7 +425,11 @@ impl ArchTrait for Arch {
         {
             thead_dcache_range(op, addr, size);
         }
-        #[cfg(not(feature = "thead-mae"))]
+        #[cfg(feature = "zicbom")]
+        {
+            zicbom_ops::zicbom_dcache_range(op, addr, size);
+        }
+        #[cfg(not(any(feature = "thead-mae", feature = "zicbom")))]
         {
             let _ = (op, addr, size);
             riscv_dma_fence();
@@ -497,6 +501,88 @@ fn thead_dcache_range_inner(paddr: usize, size: usize, op: TheadDCacheOp) {
 fn riscv_dma_fence() {
     unsafe {
         core::arch::asm!("fence rw, rw", options(nostack, preserves_flags));
+    }
+}
+
+#[cfg(feature = "zicbom")]
+mod zicbom_ops {
+    use super::*;
+
+    // ── Zicbom CBO-based cache maintenance ────────────────────────────
+    //
+    // Standard RISC-V Zicbom extension uses CBO (Cache Block Operation)
+    // instructions operating on *virtual* addresses. Block size is
+    // determined by the `riscv,cbom-block-size` DTS property; on K3 it is 64.
+    const ZICBOM_BLOCK_SIZE: usize = 64;
+
+    #[inline(always)]
+    unsafe fn cbo_clean(addr: usize) {
+        unsafe {
+            core::arch::asm!(
+                ".insn i 15, 2, x0, {addr}, 1",
+                addr = in(reg) addr,
+                options(nostack)
+            );
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn cbo_inval(addr: usize) {
+        unsafe {
+            core::arch::asm!(
+                ".insn i 15, 2, x0, {addr}, 0",
+                addr = in(reg) addr,
+                options(nostack)
+            );
+        }
+    }
+
+    #[inline(always)]
+    unsafe fn cbo_flush(addr: usize) {
+        unsafe {
+            core::arch::asm!(
+                ".insn i 15, 2, x0, {addr}, 2",
+                addr = in(reg) addr,
+                options(nostack)
+            );
+        }
+    }
+
+    pub(super) fn zicbom_dcache_range(op: DCacheOp, vaddr: usize, size: usize) {
+        if size == 0 {
+            return;
+        }
+
+        let start = vaddr & !(ZICBOM_BLOCK_SIZE - 1);
+        let end = vaddr.saturating_add(size);
+
+        match op {
+            DCacheOp::Clean => {
+                riscv_dma_fence();
+                let mut cur = start;
+                while cur < end {
+                    unsafe { cbo_clean(cur) };
+                    cur = cur.saturating_add(ZICBOM_BLOCK_SIZE);
+                }
+            }
+            DCacheOp::Invalidate => {
+                let mut cur = start;
+                while cur < end {
+                    unsafe { cbo_inval(cur) };
+                    cur = cur.saturating_add(ZICBOM_BLOCK_SIZE);
+                }
+                riscv_dma_fence();
+            }
+            DCacheOp::CleanInvalidate => {
+                riscv_dma_fence();
+                let mut cur = start;
+                while cur < end {
+                    unsafe { cbo_flush(cur) };
+                    cur = cur.saturating_add(ZICBOM_BLOCK_SIZE);
+                }
+                riscv_dma_fence();
+            }
+        }
     }
 }
 

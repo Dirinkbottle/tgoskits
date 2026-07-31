@@ -8,6 +8,9 @@ cfg_if::cfg_if! {
     if #[cfg(target_arch = "aarch64")] {
         #[path = "aarch64.rs"]
         pub mod arch;
+    } else if #[cfg(target_arch = "riscv64")] {
+        #[path = "riscv64.rs"]
+        pub mod arch;
     } else{
         #[path = "nop.rs"]
         pub mod arch;
@@ -108,7 +111,10 @@ pub trait DmaOp: Sync + Send + 'static {
         ) {
             self.flush(unsafe { handle.as_ptr().add(offset) }, size);
         } else if matches!(direction, DmaDirection::FromDevice) {
-            self.invalidate(unsafe { handle.as_ptr().add(offset) }, size);
+            // Match Linux RISC-V non-coherent DMA: clean before a device write,
+            // then invalidate after completion. This prevents later writeback of
+            // dirty CPU lines from corrupting device-written data.
+            self.flush(unsafe { handle.as_ptr().add(offset) }, size);
         }
     }
 
@@ -150,14 +156,14 @@ pub trait DmaOp: Sync + Send + 'static {
                 }
                 self.flush(target, size);
             } else if matches!(direction, DmaDirection::FromDevice) {
-                self.invalidate(target, size);
+                self.flush(target, size);
             }
             return;
         }
 
         match direction {
             DmaDirection::ToDevice => self.flush(source, size),
-            DmaDirection::FromDevice => self.invalidate(source, size),
+            DmaDirection::FromDevice => self.flush(source, size),
             DmaDirection::Bidirectional => self.flush_invalidate(source, size),
         }
     }

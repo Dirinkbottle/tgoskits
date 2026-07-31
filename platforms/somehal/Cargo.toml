@@ -11,11 +11,13 @@ version = "0.8.1"
 
 [features]
 axtest = []
+debug-runtime-console-output = ["someboot/debug-runtime-console-output"]
 efi = ["someboot/efi"]
 hv = ["mmu", "someboot/hv", "dep:ax-cpu"]
 mmu = ["someboot/mmu"]
 thead-mae = ["someboot/thead-mae"]
 tls = ["someboot/tls"]
+zicbom = ["someboot/zicbom"]
 uspace = ["mmu", "someboot/uspace"]
 
 [lints.rust]

@@ -11,6 +11,7 @@ version = "0.9.3"
 
 [features]
 axtest = ["dep:axtest"]
+zicbom = []
 
 [dependencies]
 axtest = { workspace = true, optional = true }
