@@ -111,10 +111,15 @@ pub trait DmaOp: Sync + Send + 'static {
         ) {
             self.flush(unsafe { handle.as_ptr().add(offset) }, size);
         } else if matches!(direction, DmaDirection::FromDevice) {
-            // Match Linux RISC-V non-coherent DMA: clean before a device write,
-            // then invalidate after completion. This prevents later writeback of
-            // dirty CPU lines from corrupting device-written data.
+            // Match Linux RISC-V non-coherent DMA on Zicbom platforms: clean
+            // before a device write, then invalidate after completion. This
+            // prevents later writeback of dirty CPU lines from corrupting
+            // device-written data. Other architectures invalidate before the
+            // device owns the buffer as usual.
+            #[cfg(all(target_arch = "riscv64", feature = "zicbom"))]
             self.flush(unsafe { handle.as_ptr().add(offset) }, size);
+            #[cfg(not(all(target_arch = "riscv64", feature = "zicbom")))]
+            self.invalidate(unsafe { handle.as_ptr().add(offset) }, size);
         }
     }
 
@@ -156,14 +161,22 @@ pub trait DmaOp: Sync + Send + 'static {
                 }
                 self.flush(target, size);
             } else if matches!(direction, DmaDirection::FromDevice) {
+                #[cfg(all(target_arch = "riscv64", feature = "zicbom"))]
                 self.flush(target, size);
+                #[cfg(not(all(target_arch = "riscv64", feature = "zicbom")))]
+                self.invalidate(target, size);
             }
             return;
         }
 
         match direction {
             DmaDirection::ToDevice => self.flush(source, size),
-            DmaDirection::FromDevice => self.flush(source, size),
+            DmaDirection::FromDevice => {
+                #[cfg(all(target_arch = "riscv64", feature = "zicbom"))]
+                self.flush(source, size);
+                #[cfg(not(all(target_arch = "riscv64", feature = "zicbom")))]
+                self.invalidate(source, size);
+            }
             DmaDirection::Bidirectional => self.flush_invalidate(source, size),
         }
     }
