@@ -30,7 +30,7 @@ SECTIONS {
 
     .kallsyms : ALIGN(4K) {
         __kallsyms_start = .;
-        . += 4M; /* reserve space for kallsyms, can be recycled */
+        . += 8M; /* reserve space for kallsyms, can be recycled */
         __kallsyms_end = .;
     }
 }

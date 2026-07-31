@@ -199,12 +199,7 @@ pub fn claim_runtime_output() {
     RUNTIME_OUTPUT_CLAIMED.store(true, Ordering::Release);
 }
 
-#[cfg(feature = "debug-runtime-console-output")]
-fn runtime_output_claimed() -> bool {
-    false
-}
-
-#[cfg(all(not(feature = "debug-runtime-console-output"), not(test)))]
+#[cfg(not(test))]
 fn runtime_output_claimed() -> bool {
     // On AArch64, exclusive atomic instructions such as LDXR/LDAXR are not
     // reliable before the MMU is enabled. Keep the pre-MMU boot console path
@@ -212,7 +207,7 @@ fn runtime_output_claimed() -> bool {
     crate::mem::mmu::is_mmu_enabled() && RUNTIME_OUTPUT_CLAIMED.load(Ordering::Acquire)
 }
 
-#[cfg(all(not(feature = "debug-runtime-console-output"), test))]
+#[cfg(test)]
 fn runtime_output_claimed() -> bool {
     RUNTIME_OUTPUT_CLAIMED.load(Ordering::Acquire)
 }
