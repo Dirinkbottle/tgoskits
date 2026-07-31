@@ -43,6 +43,7 @@ const REG_UTP_TRANSFER_REQ_DOOR_BELL: usize = 0x58;
 const REG_UTP_TRANSFER_REQ_LIST_RUN_STOP: usize = 0x60;
 const REG_UTP_TASK_REQ_LIST_BASE_L: usize = 0x70;
 const REG_UTP_TASK_REQ_LIST_BASE_H: usize = 0x74;
+const REG_UTP_TASK_REQ_DOOR_BELL: usize = 0x78;
 const REG_UTP_TASK_REQ_LIST_RUN_STOP: usize = 0x80;
 const REG_UIC_COMMAND: usize = 0x90;
 const REG_UIC_COMMAND_ARG1: usize = 0x94;
@@ -339,6 +340,21 @@ struct K3UfsHost {
     utrd_list: Option<ContiguousArray<u8>>,
     utmrd_list: Option<ContiguousArray<u8>>,
     ucd_buf: Option<ContiguousArray<u8>>,
+    /// Rotating slot counter for SCSI I/O (Linux: blk-mq tag for ufshcd_queue_command).
+    /// Device management commands always use the reserved slot `nutrs - 1`.
+    next_io_slot: usize,
+}
+
+/// Which doorbell slot class an UPIU uses.
+///
+/// Linux keeps the last slot (`nutrs - 1`) reserved for device management
+/// commands (`ufshcd_exec_dev_cmd`) and issues regular SCSI I/O on the
+/// remaining slots (`ufshcd_queue_command`). Keeping the two classes apart
+/// prevents a stuck SCSI transfer from blocking NOP/QUERY recovery traffic.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum UpiuSlotKind {
+    DevCmd,
+    ScsiIo,
 }
 
 // SAFETY: MMIO register access is thread-safe for this hardware
@@ -662,6 +678,25 @@ impl K3UfsHost {
              ucd_slot_size={}",
             utrd_phys, utmrd_phys, ucd_phys, UCD_SLOT_SIZE
         );
+
+        self.utrd_list = Some(utrd_list);
+        self.utmrd_list = Some(utmrd_list);
+        self.ucd_buf = Some(ucd_buf);
+        self.program_transfer_lists()?;
+
+        info!("[k3-ufs] Transfer lists configured (Linux sequence)");
+        Ok(())
+    }
+
+    /// Program UTRL/UTMRL base addresses, interrupt enable, and run-stop
+    /// registers. The DMA buffers must already be allocated. An HCE reset
+    /// (controller recovery) clears these registers, so this sequence is
+    /// replayed after recovery without reallocating the DMA buffers.
+    fn program_transfer_lists(&mut self) -> Result<(), &'static str> {
+        let utrd_list = self.utrd_list.as_ref().ok_or("UTRD not allocated")?;
+        let utmrd_list = self.utmrd_list.as_ref().ok_or("UTMRD not allocated")?;
+        let utrd_phys = utrd_list.dma_addr().as_u64();
+        let utmrd_phys = utmrd_list.dma_addr().as_u64();
         unsafe {
             // 1. Enable required interrupts (Linux: ufshcd_enable_intr)
             let old_ie = self.read32(REG_INTERRUPT_ENABLE);
@@ -698,12 +733,34 @@ impl K3UfsHost {
             self.write32(REG_UTP_TRANSFER_REQ_LIST_RUN_STOP, 1);
         }
 
-        self.utrd_list = Some(utrd_list);
-        self.utmrd_list = Some(utmrd_list);
-        self.ucd_buf = Some(ucd_buf);
+        // A non-zero transfer doorbell after (re)enable means stale bits
+        // survived; such a slot would be silently ignored again.
+        let db = unsafe { self.read32(REG_UTP_TRANSFER_REQ_DOOR_BELL) };
+        if db != 0 {
+            warn!(
+                "[k3-ufs] doorbell not clear after controller (re)enable: DB=0x{:08x}",
+                db
+            );
+        }
 
-        info!("[k3-ufs] Transfer lists configured (Linux sequence)");
         Ok(())
+    }
+
+    /// Allocate a doorbell slot for SCSI I/O, rotating through 0..nutrs-2 so
+    /// ordinary commands never collide with the reserved device-management
+    /// slot (nutrs - 1). Transfers are submitted and awaited synchronously,
+    /// so a rotating counter is sufficient; there is no outstanding request
+    /// to collide with.
+    fn alloc_io_slot(&mut self) -> usize {
+        debug_assert!(
+            self.nutrs > 1,
+            "k3-ufs: nutrs={} leaves no distinct SCSI I/O slot",
+            self.nutrs
+        );
+        let n = self.nutrs.saturating_sub(1).max(1);
+        let slot = self.next_io_slot % n;
+        self.next_io_slot = self.next_io_slot.wrapping_add(1);
+        slot
     }
 
     /// Dump UTRD for debugging (Linux: ufshcd_print_tr)
@@ -806,16 +863,71 @@ impl K3UfsHost {
         upiu[16..16 + cdb_len].copy_from_slice(&cdb[..cdb_len]);
     }
 
-    /// Unified UPIU submission using reserved slot (Linux: ufshcd_exec_dev_cmd)
+    /// Submit an UPIU and wait for completion.
+    ///
+    /// Device management commands (NOP OUT, QUERY) use the reserved slot
+    /// `nutrs - 1`; SCSI I/O rotates through slots 0..nutrs-2. On timeout or
+    /// controller error the host is fully recovered (HCE reset + link
+    /// startup, Linux: ufshcd_err_handler) and the command is resubmitted
+    /// once. Without this recovery a wedged slot keeps its doorbell bit set
+    /// forever and every later submission to it is silently ignored.
     fn submit_upiu(
         &mut self,
         upiu: &[u8; 512],
         mut data_buf: Option<&mut ContiguousArray<u8>>,
         data_len: u32,
         data_dir: u8,
+        kind: UpiuSlotKind,
     ) -> Result<[u8; 512], &'static str> {
-        // Linux: reserved_slot = nutrs - 1 (ufshcd_exec_dev_cmd)
-        let slot = if self.nutrs > 0 { self.nutrs - 1 } else { 0 };
+        let slot = match kind {
+            UpiuSlotKind::DevCmd => self.nutrs.saturating_sub(1),
+            UpiuSlotKind::ScsiIo => self.alloc_io_slot(),
+        };
+        // `Option<&mut T>` is not Copy, so reborrow the buffer for each
+        // attempt instead of moving it into submit_upiu_once.
+        match self.submit_upiu_once(
+            upiu,
+            data_buf.as_mut().map(|b| &mut **b),
+            data_len,
+            data_dir,
+            slot,
+        ) {
+            Err(e) if e == "Timeout" || e == "OCS error" || e == "Controller fatal error" => {
+                warn!(
+                    "[k3-ufs] slot {} failed ({e}); recovering controller and retrying once",
+                    slot
+                );
+                if self.recover_controller().is_ok() {
+                    let slot = match kind {
+                        UpiuSlotKind::DevCmd => self.nutrs.saturating_sub(1),
+                        UpiuSlotKind::ScsiIo => self.alloc_io_slot(),
+                    };
+                    self.submit_upiu_once(
+                        upiu,
+                        data_buf.as_mut().map(|b| &mut **b),
+                        data_len,
+                        data_dir,
+                        slot,
+                    )
+                } else {
+                    Err("Controller recovery failed")
+                }
+            }
+            other => other,
+        }
+    }
+
+    /// Single-shot UPIU submission on an explicit slot: prepare UTRD/UCD,
+    /// ring the doorbell, and poll for completion (Linux: ufshcd_send_command
+    /// + __ufshcd_transfer_req_compl).
+    fn submit_upiu_once(
+        &mut self,
+        upiu: &[u8; 512],
+        mut data_buf: Option<&mut ContiguousArray<u8>>,
+        data_len: u32,
+        data_dir: u8,
+        slot: usize,
+    ) -> Result<[u8; 512], &'static str> {
         let slot_mask = 1u32 << slot;
 
         {
@@ -888,7 +1000,14 @@ impl K3UfsHost {
             let db = unsafe { self.read32(REG_UTP_TRANSFER_REQ_DOOR_BELL) };
 
             if i % 500 == 0 {
+                // Surface controller fatal errors instead of spinning to the
+                // full 1 s timeout (Linux: ufshcd_check_errors + err_handler).
                 let is = unsafe { self.read32(REG_INTERRUPT_STATUS) };
+                if is & UFSHCD_ERROR_MASK != 0 {
+                    warn!("[k3-ufs] Fatal error interrupt: IS=0x{:08x}", is);
+                    self.dump_transfer_state(slot, "FATAL ERROR");
+                    return Err("Controller fatal error");
+                }
                 let ocs = {
                     let utrd_list = self.utrd_list.as_mut().ok_or("UTRD not initialized")?;
                     utrd_list.complete_for_cpu(slot * 32, 32);
@@ -948,6 +1067,81 @@ impl K3UfsHost {
         Err("Timeout")
     }
 
+    /// Recover the UFS host after a transfer timeout or fatal error.
+    ///
+    /// Mirrors Linux ufshcd_err_handler(): stop the transfer/task lists,
+    /// reset the host controller (HCE toggle), re-run link startup, and
+    /// reprogram the list base addresses. An HCE reset clears the
+    /// UTRLBA/UTMRLBA/IE/run-stop registers, so the whole re-enable sequence
+    /// is replayed; the DMA buffers themselves are reused.
+    fn recover_controller(&mut self) -> Result<(), &'static str> {
+        info!("[k3-ufs] Recovering UFS controller after transfer error");
+
+        // Stop both list run-stop registers (Linux: ufshcd_hba_stop).
+        unsafe {
+            self.write32(REG_UTP_TRANSFER_REQ_LIST_RUN_STOP, 0);
+            self.write32(REG_UTP_TASK_REQ_LIST_RUN_STOP, 0);
+            self.write32(REG_INTERRUPT_STATUS, 0xFFFFFFFF);
+        }
+
+        // ufshcd_hba_stop: HCE=0 and wait for it to take effect.
+        unsafe { self.write32(REG_CONTROLLER_ENABLE, 0) };
+        for _ in 0..100 {
+            let hce = unsafe { self.read32(REG_CONTROLLER_ENABLE) };
+            if hce & 1 == 0 {
+                break;
+            }
+            axklib::time::busy_wait(core::time::Duration::from_millis(1));
+        }
+
+        // Clear both doorbell registers once the controller is confirmed
+        // disabled (Linux: ufshcd_hba_stop). An HCE reset does NOT clear the
+        // doorbell bits by itself, and a stale bit left set would be silently
+        // ignored again once the controller re-enables - the exact wedge this
+        // recovery exists to break. Clearing avoids a later ghost re-scan of
+        // the failed slot's UTRD (whose PRDT may point at a freed buffer).
+        unsafe {
+            self.write32(REG_UTP_TRANSFER_REQ_DOOR_BELL, 0);
+            self.write32(REG_UTP_TASK_REQ_DOOR_BELL, 0);
+        }
+
+        // ufshcd_hba_start + link startup: re-enable the host, re-run the
+        // UNIPRO/PA attribute programming and link startup, then reprogram
+        // the transfer/task list base addresses and run-stop.
+        self.host_init()?;
+        self.unipro_init()?;
+        self.link_startup()?;
+        self.link_startup_post()?;
+
+        // HCE reset and link startup may latch fresh error interrupt bits;
+        // clear them before program_transfer_lists re-enables the interrupt
+        // enable register, or a stale IS bit would raise a spurious IRQ.
+        unsafe { self.write32(REG_INTERRUPT_STATUS, 0xFFFFFFFF) };
+        self.program_transfer_lists()?;
+
+        // Verify the link with a NOP before retrying the failed command
+        // (Linux: ufshcd_verify_dev_init). Uses the raw single-shot path so a
+        // failed NOP cannot recursively re-enter recover_controller.
+        self.verify_link_with_nop()?;
+
+        info!("[k3-ufs] UFS controller recovered");
+        Ok(())
+    }
+
+    /// Send a NOP OUT on the reserved slot without the recovery wrapper, used
+    /// to verify the link after controller recovery. Returns an error when
+    /// the device does not answer, which fails the recovery attempt.
+    fn verify_link_with_nop(&mut self) -> Result<(), &'static str> {
+        let mut upiu = [0u8; 512];
+        self.build_nop_upiu(&mut upiu, 0);
+        let slot = self.nutrs.saturating_sub(1);
+        match self.submit_upiu_once(&upiu, None, 0, 0, slot) {
+            Ok(response) if response[0] == UPIU_TRANSACTION_NOP_IN => Ok(()),
+            Ok(_) => Err("NOP verification: unexpected response"),
+            Err(e) => Err(e),
+        }
+    }
+
     /// NOP OUT command (Linux: ufshcd_prepare_utp_nop_upiu, ufshcd.c:2851)
     fn nop_out(&mut self) -> Result<(), &'static str> {
         info!("[k3-ufs] Sending NOP OUT...");
@@ -956,7 +1150,7 @@ impl K3UfsHost {
             let mut upiu = [0u8; 512];
             self.build_nop_upiu(&mut upiu, 0);
 
-            match self.submit_upiu(&upiu, None, 0, 0) {
+            match self.submit_upiu(&upiu, None, 0, 0, UpiuSlotKind::DevCmd) {
                 Ok(response) => {
                     if response[0] == UPIU_TRANSACTION_NOP_IN {
                         info!("[k3-ufs] NOP IN received");
@@ -989,7 +1183,7 @@ impl K3UfsHost {
         let mut upiu = [0u8; 512];
         self.build_query_upiu(&mut upiu, 0, query_func, opcode, idn);
 
-        let response = self.submit_upiu(&upiu, None, 0, 0)?;
+        let response = self.submit_upiu(&upiu, None, 0, 0, UpiuSlotKind::DevCmd)?;
 
         if response[0] != UPIU_TRANSACTION_QUERY_RSP {
             warn!("[k3-ufs] QUERY: unexpected response 0x{:02x}", response[0]);
@@ -1057,6 +1251,7 @@ impl K3UfsHost {
             Some(&mut data_buf),
             data_len as u32,
             UTP_DATA_DIR_TO_HOST,
+            UpiuSlotKind::ScsiIo,
         )?;
 
         if response[0] != UPIU_TRANSACTION_RESPONSE {
@@ -1081,7 +1276,7 @@ impl K3UfsHost {
         let mut upiu = [0u8; 512];
         self.build_scsi_upiu(&mut upiu, 0, self.active_lun, UPIU_CMD_FLAGS_NONE, cdb, 0);
 
-        let response = self.submit_upiu(&upiu, None, 0, 0)?;
+        let response = self.submit_upiu(&upiu, None, 0, 0, UpiuSlotKind::ScsiIo)?;
         if response[0] != UPIU_TRANSACTION_RESPONSE {
             warn!(
                 "[k3-ufs] {} invalid response transaction=0x{:02x}, rsp[0..32]={:02x?}",
@@ -1654,6 +1849,7 @@ impl K3UfsHost {
             Some(&mut data_buf),
             transfer_len,
             UTP_DATA_DIR_TO_HOST,
+            UpiuSlotKind::ScsiIo,
         )?;
 
         if response[0] != UPIU_TRANSACTION_RESPONSE || response[7] != SAM_STAT_GOOD {
@@ -1718,6 +1914,7 @@ impl K3UfsHost {
             Some(&mut data_buf),
             transfer_len,
             UTP_DATA_DIR_TO_DEVICE,
+            UpiuSlotKind::ScsiIo,
         )?;
 
         if response[0] != UPIU_TRANSACTION_RESPONSE || response[7] != SAM_STAT_GOOD {
@@ -1835,6 +2032,7 @@ fn probe(probe: ProbeFdt<'_>) -> Result<(), OnProbeError> {
         utrd_list: None,
         utmrd_list: None,
         ucd_buf: None,
+        next_io_slot: 0,
     };
 
     host.mphy_init()
