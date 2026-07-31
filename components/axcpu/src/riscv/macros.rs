@@ -144,6 +144,187 @@ macro_rules! include_fp_asm_macros {
     };
 }
 
+#[cfg(feature = "vector")]
+macro_rules! include_vec_asm_macros {
+    () => {
+        concat!(
+            r#"
+            .ifndef VEC_MACROS_FLAG
+            .equ VEC_MACROS_FLAG, 1
+
+            .macro PUSH_VEC_REG  base_reg, vlenb_reg, reg_idx
+                .option push
+                .option arch, +v
+                vsetvli  x0, \vlenb_reg, e8, m1
+                vse8.v   v\reg_idx, (\base_reg)
+                .option pop
+                add      \base_reg, \base_reg, \vlenb_reg
+            .endm
+
+            .macro POP_VEC_REG  base_reg, vlenb_reg, reg_idx
+                .option push
+                .option arch, +v
+                vsetvli  x0, \vlenb_reg, e8, m1
+                vle8.v   v\reg_idx, (\base_reg)
+                .option pop
+                add      \base_reg, \base_reg, \vlenb_reg
+            .endm
+
+            .macro CLEAR_VEC_REG  reg_idx
+                .option push
+                .option arch, +v
+                vmv.v.i  v\reg_idx, 0
+                .option pop
+            .endm
+
+            .macro PUSH_VEC_REGS_32  base_reg, vlenb_reg
+            "#,
+            include_vec_regs_push!(),
+            r#"
+            .endm
+
+            .macro POP_VEC_REGS_32  base_reg, vlenb_reg
+            "#,
+            include_vec_regs_pop!(),
+            r#"
+            .endm
+
+            .macro CLEAR_VEC_REGS_32
+                .option push
+                .option arch, +v
+                vsetvli  t0, x0, e8, m1
+                .option pop
+            "#,
+            include_vec_regs_clear!(),
+            r#"
+            .endm
+
+            .endif"#
+        )
+    };
+}
+
+// Generate 32 repeated calls at the Rust-macro level.
+#[cfg(feature = "vector")]
+macro_rules! include_vec_regs_push {
+    () => {
+        concat!(
+            "PUSH_VEC_REG \\base_reg, \\vlenb_reg, 0\n",
+            "PUSH_VEC_REG \\base_reg, \\vlenb_reg, 1\n",
+            "PUSH_VEC_REG \\base_reg, \\vlenb_reg, 2\n",
+            "PUSH_VEC_REG \\base_reg, \\vlenb_reg, 3\n",
+            "PUSH_VEC_REG \\base_reg, \\vlenb_reg, 4\n",
+            "PUSH_VEC_REG \\base_reg, \\vlenb_reg, 5\n",
+            "PUSH_VEC_REG \\base_reg, \\vlenb_reg, 6\n",
+            "PUSH_VEC_REG \\base_reg, \\vlenb_reg, 7\n",
+            "PUSH_VEC_REG \\base_reg, \\vlenb_reg, 8\n",
+            "PUSH_VEC_REG \\base_reg, \\vlenb_reg, 9\n",
+            "PUSH_VEC_REG \\base_reg, \\vlenb_reg, 10\n",
+            "PUSH_VEC_REG \\base_reg, \\vlenb_reg, 11\n",
+            "PUSH_VEC_REG \\base_reg, \\vlenb_reg, 12\n",
+            "PUSH_VEC_REG \\base_reg, \\vlenb_reg, 13\n",
+            "PUSH_VEC_REG \\base_reg, \\vlenb_reg, 14\n",
+            "PUSH_VEC_REG \\base_reg, \\vlenb_reg, 15\n",
+            "PUSH_VEC_REG \\base_reg, \\vlenb_reg, 16\n",
+            "PUSH_VEC_REG \\base_reg, \\vlenb_reg, 17\n",
+            "PUSH_VEC_REG \\base_reg, \\vlenb_reg, 18\n",
+            "PUSH_VEC_REG \\base_reg, \\vlenb_reg, 19\n",
+            "PUSH_VEC_REG \\base_reg, \\vlenb_reg, 20\n",
+            "PUSH_VEC_REG \\base_reg, \\vlenb_reg, 21\n",
+            "PUSH_VEC_REG \\base_reg, \\vlenb_reg, 22\n",
+            "PUSH_VEC_REG \\base_reg, \\vlenb_reg, 23\n",
+            "PUSH_VEC_REG \\base_reg, \\vlenb_reg, 24\n",
+            "PUSH_VEC_REG \\base_reg, \\vlenb_reg, 25\n",
+            "PUSH_VEC_REG \\base_reg, \\vlenb_reg, 26\n",
+            "PUSH_VEC_REG \\base_reg, \\vlenb_reg, 27\n",
+            "PUSH_VEC_REG \\base_reg, \\vlenb_reg, 28\n",
+            "PUSH_VEC_REG \\base_reg, \\vlenb_reg, 29\n",
+            "PUSH_VEC_REG \\base_reg, \\vlenb_reg, 30\n",
+            "PUSH_VEC_REG \\base_reg, \\vlenb_reg, 31\n",
+        )
+    };
+}
+
+#[cfg(feature = "vector")]
+macro_rules! include_vec_regs_pop {
+    () => {
+        concat!(
+            "POP_VEC_REG \\base_reg, \\vlenb_reg, 0\n",
+            "POP_VEC_REG \\base_reg, \\vlenb_reg, 1\n",
+            "POP_VEC_REG \\base_reg, \\vlenb_reg, 2\n",
+            "POP_VEC_REG \\base_reg, \\vlenb_reg, 3\n",
+            "POP_VEC_REG \\base_reg, \\vlenb_reg, 4\n",
+            "POP_VEC_REG \\base_reg, \\vlenb_reg, 5\n",
+            "POP_VEC_REG \\base_reg, \\vlenb_reg, 6\n",
+            "POP_VEC_REG \\base_reg, \\vlenb_reg, 7\n",
+            "POP_VEC_REG \\base_reg, \\vlenb_reg, 8\n",
+            "POP_VEC_REG \\base_reg, \\vlenb_reg, 9\n",
+            "POP_VEC_REG \\base_reg, \\vlenb_reg, 10\n",
+            "POP_VEC_REG \\base_reg, \\vlenb_reg, 11\n",
+            "POP_VEC_REG \\base_reg, \\vlenb_reg, 12\n",
+            "POP_VEC_REG \\base_reg, \\vlenb_reg, 13\n",
+            "POP_VEC_REG \\base_reg, \\vlenb_reg, 14\n",
+            "POP_VEC_REG \\base_reg, \\vlenb_reg, 15\n",
+            "POP_VEC_REG \\base_reg, \\vlenb_reg, 16\n",
+            "POP_VEC_REG \\base_reg, \\vlenb_reg, 17\n",
+            "POP_VEC_REG \\base_reg, \\vlenb_reg, 18\n",
+            "POP_VEC_REG \\base_reg, \\vlenb_reg, 19\n",
+            "POP_VEC_REG \\base_reg, \\vlenb_reg, 20\n",
+            "POP_VEC_REG \\base_reg, \\vlenb_reg, 21\n",
+            "POP_VEC_REG \\base_reg, \\vlenb_reg, 22\n",
+            "POP_VEC_REG \\base_reg, \\vlenb_reg, 23\n",
+            "POP_VEC_REG \\base_reg, \\vlenb_reg, 24\n",
+            "POP_VEC_REG \\base_reg, \\vlenb_reg, 25\n",
+            "POP_VEC_REG \\base_reg, \\vlenb_reg, 26\n",
+            "POP_VEC_REG \\base_reg, \\vlenb_reg, 27\n",
+            "POP_VEC_REG \\base_reg, \\vlenb_reg, 28\n",
+            "POP_VEC_REG \\base_reg, \\vlenb_reg, 29\n",
+            "POP_VEC_REG \\base_reg, \\vlenb_reg, 30\n",
+            "POP_VEC_REG \\base_reg, \\vlenb_reg, 31\n",
+        )
+    };
+}
+
+#[cfg(feature = "vector")]
+macro_rules! include_vec_regs_clear {
+    () => {
+        concat!(
+            "CLEAR_VEC_REG 0\n",
+            "CLEAR_VEC_REG 1\n",
+            "CLEAR_VEC_REG 2\n",
+            "CLEAR_VEC_REG 3\n",
+            "CLEAR_VEC_REG 4\n",
+            "CLEAR_VEC_REG 5\n",
+            "CLEAR_VEC_REG 6\n",
+            "CLEAR_VEC_REG 7\n",
+            "CLEAR_VEC_REG 8\n",
+            "CLEAR_VEC_REG 9\n",
+            "CLEAR_VEC_REG 10\n",
+            "CLEAR_VEC_REG 11\n",
+            "CLEAR_VEC_REG 12\n",
+            "CLEAR_VEC_REG 13\n",
+            "CLEAR_VEC_REG 14\n",
+            "CLEAR_VEC_REG 15\n",
+            "CLEAR_VEC_REG 16\n",
+            "CLEAR_VEC_REG 17\n",
+            "CLEAR_VEC_REG 18\n",
+            "CLEAR_VEC_REG 19\n",
+            "CLEAR_VEC_REG 20\n",
+            "CLEAR_VEC_REG 21\n",
+            "CLEAR_VEC_REG 22\n",
+            "CLEAR_VEC_REG 23\n",
+            "CLEAR_VEC_REG 24\n",
+            "CLEAR_VEC_REG 25\n",
+            "CLEAR_VEC_REG 26\n",
+            "CLEAR_VEC_REG 27\n",
+            "CLEAR_VEC_REG 28\n",
+            "CLEAR_VEC_REG 29\n",
+            "CLEAR_VEC_REG 30\n",
+            "CLEAR_VEC_REG 31\n",
+        )
+    };
+}
+
 macro_rules! include_asm_macros {
     () => {
         concat!(

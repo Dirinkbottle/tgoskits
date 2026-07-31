@@ -5,6 +5,8 @@ use core::{
 };
 
 use ax_memory_addr::VirtAddr;
+#[cfg(feature = "vector")]
+use riscv::register::sstatus::VS;
 use cpu_local::{CurrentThreadHeader, PreparedThreadSwitch};
 use riscv::register::sstatus::{self, FS};
 
@@ -124,6 +126,201 @@ impl FpState {
         // SAFETY: the same IRQ-disabled, CPU-pinned handoff still owns this
         // hart, and every FS variant is a valid architectural encoding.
         unsafe { sstatus::set_fs(next_fp_state.fs) };
+    }
+}
+
+/// Upper bound on per-register vector length in bytes.
+///
+/// RISC-V allows VLEN up to 65536 bits (8192 bytes), but 1024 bytes (VLEN=8192)
+/// covers current hardware (K3 X60: 32 bytes, A100-scale: up to 1024).
+/// The actual bytes saved per register is min(this, current core's `vlenb`).
+#[cfg(feature = "vector")]
+const VLEN_BYTES: usize = 1024;
+
+/// Vector register state of RISC-V V extension.
+///
+/// Contains 32 vector registers (v0-v31), each up to [`VLEN_BYTES`] wide, plus
+/// the seven unprivileged control CSRs. `vlenb` differs between AI cores (8-15)
+/// and standard cores (0-7), and is read from the current core's CSR at save time.
+#[cfg(feature = "vector")]
+#[repr(C, align(16))]
+#[derive(Debug, Clone)]
+pub struct VState {
+    /// vector registers v0-v31, each up to [`VLEN_BYTES`] wide
+    pub v_regs: [[u8; VLEN_BYTES]; 32],
+    /// Vector start index CSR (vstart)
+    pub vstart: usize,
+    /// Fixed-point saturation flag CSR (vxsat)
+    pub vxsat: usize,
+    /// Fixed-point rounding mode CSR (vxrm)
+    pub vxrm: usize,
+    /// Vector control and status register CSR (vcsr)
+    pub vcsr: usize,
+    /// Vector type register CSR (vtype)
+    pub vtype: usize,
+    /// Vector length CSR (vl)
+    pub vl: usize,
+    /// `vlenb` of the core where this state was last saved (bytes per register).
+    /// Read-only in hardware; saved for reference, and used at restore to determine
+    /// the byte count per register. Not restored to hardware.
+    pub vlenb: usize,
+    /// Vector context status (off, initial, clean, dirty)
+    pub vs: VS,
+}
+
+#[cfg(feature = "vector")]
+impl Default for VState {
+    fn default() -> Self {
+        Self {
+            v_regs: [[0u8; VLEN_BYTES]; 32],
+            vstart: 0,
+            vxsat: 0,
+            vxrm: 0,
+            vcsr: 0,
+            vtype: 0,
+            vl: 0,
+            vlenb: 0,
+            vs: VS::Initial,
+        }
+    }
+}
+
+// Vector CSR addresses (RISC-V V spec §31.3, Table 31.1)
+#[cfg(feature = "vector")]
+const CSR_VSTART: u16 = 0x008;
+#[cfg(feature = "vector")]
+const CSR_VXSAT: u16 = 0x009;
+#[cfg(feature = "vector")]
+const CSR_VXRM: u16 = 0x00A;
+#[cfg(feature = "vector")]
+const CSR_VCSR: u16 = 0x00F;
+#[cfg(feature = "vector")]
+const CSR_VL: u16 = 0xC20;
+#[cfg(feature = "vector")]
+const CSR_VTYPE: u16 = 0xC21;
+#[cfg(feature = "vector")]
+const CSR_VLENB: u16 = 0xC22;
+
+/// Reads a vector CSR by number.
+#[cfg(feature = "vector")]
+macro_rules! vec_csr_read {
+    ($csr:expr) => {{
+        let val: usize;
+        unsafe {
+            core::arch::asm!(
+                "csrrs {val}, {csr}, x0",
+                csr = const $csr,
+                val = out(reg) val,
+            );
+        }
+        val
+    }};
+}
+
+/// Writes a vector CSR by number.
+#[cfg(feature = "vector")]
+macro_rules! vec_csr_write {
+    ($csr:expr, $val:expr) => {{
+        unsafe {
+            core::arch::asm!(
+                "csrrw x0, {csr}, {val}",
+                csr = const $csr,
+                val = in(reg) $val,
+            );
+        }
+    }};
+}
+
+#[cfg(feature = "vector")]
+impl VState {
+    #[inline]
+    fn set_vl_vtype(vl: usize, vtype: usize) {
+        unsafe {
+            core::arch::asm!(
+                ".option push",
+                ".option arch, +v",
+                "vsetvl x0, {vl}, {vtype}",
+                ".option pop",
+                vl = in(reg) vl,
+                vtype = in(reg) vtype,
+            );
+        }
+    }
+
+    /// Restores vector registers and vector CSRs.
+    ///
+    /// The bulk register load uses byte vectors, so it temporarily changes `vl`
+    /// and `vtype`. Restore the saved `vl/vtype` afterwards with `vsetvl`, and
+    /// keep `vstart` at zero during the save/restore helpers so a preempted
+    /// vector instruction cannot make `vle/vse/vmv` start from the middle.
+    #[inline]
+    pub fn restore(&self) {
+        vec_csr_write!(CSR_VSTART, 0);
+        unsafe {
+            restore_vector_regs(self.v_regs.as_ptr() as *const u8, self.vlenb);
+        }
+        vec_csr_write!(CSR_VSTART, 0);
+        Self::set_vl_vtype(self.vl, self.vtype);
+        vec_csr_write!(CSR_VXSAT, self.vxsat);
+        vec_csr_write!(CSR_VXRM, self.vxrm);
+        vec_csr_write!(CSR_VCSR, self.vcsr);
+        vec_csr_write!(CSR_VSTART, self.vstart);
+    }
+
+    /// Saves vector registers and vector CSRs from hardware.
+    ///
+    /// `vstart` must be captured before clearing it for the helper stores.
+    /// The helper stores use `vsetvli`, so `vl/vtype` must be captured before
+    /// the register dump as well.
+    /// Reads `vlenb` from the current core — differs between AI cores (8-15)
+    /// and standard cores (0-7).
+    #[inline]
+    pub fn save(&mut self) {
+        self.vlenb = vec_csr_read!(CSR_VLENB);
+        self.vstart = vec_csr_read!(CSR_VSTART);
+        self.vxsat = vec_csr_read!(CSR_VXSAT);
+        self.vxrm = vec_csr_read!(CSR_VXRM);
+        self.vcsr = vec_csr_read!(CSR_VCSR);
+        self.vl = vec_csr_read!(CSR_VL);
+        self.vtype = vec_csr_read!(CSR_VTYPE);
+        vec_csr_write!(CSR_VSTART, 0);
+        unsafe {
+            save_vector_regs(self.v_regs.as_mut_ptr() as *mut u8, self.vlenb);
+        }
+        vec_csr_write!(CSR_VSTART, self.vstart);
+    }
+
+    /// Clears all 32 hardware vector registers to zero.
+    #[inline]
+    pub fn clear() {
+        vec_csr_write!(CSR_VSTART, 0);
+        unsafe { clear_vector_regs() }
+        Self::set_vl_vtype(0, 0);
+        vec_csr_write!(CSR_VCSR, 0);
+        vec_csr_write!(CSR_VSTART, 0);
+    }
+
+    /// Lazy vector context switch, mirrors [`FpState::switch_to`]:
+    /// save current if Dirty → restore/clear next based on its VS.
+    pub fn switch_to(&mut self, next_v_state: &VState) {
+        let current_vs = sstatus::read().vs();
+        if current_vs == VS::Dirty {
+            self.save();
+            self.vs = VS::Clean;
+        }
+        match next_v_state.vs {
+            VS::Clean => {
+                unsafe { sstatus::set_vs(VS::Dirty) };
+                next_v_state.restore();
+            }
+            VS::Initial => {
+                unsafe { sstatus::set_vs(VS::Dirty) };
+                VState::clear();
+            }
+            VS::Off => {}
+            VS::Dirty => unreachable!("V state of the next task should not be dirty"),
+        }
+        unsafe { sstatus::set_vs(next_v_state.vs) };
     }
 }
 
@@ -317,6 +514,8 @@ pub struct TaskContext {
     page_table_root: ax_memory_addr::PhysAddr,
     #[cfg(feature = "fp-simd")]
     pub fp_state: FpState,
+    #[cfg(feature = "vector")]
+    pub v_state: VState,
 }
 
 // RISC-V load/store macros accept a machine-word index. Derive every index
@@ -374,6 +573,10 @@ impl TaskContext {
         #[cfg(feature = "fp-simd")]
         {
             self.fp_state.switch_to(&_next_ctx.fp_state);
+        }
+        #[cfg(feature = "vector")]
+        {
+            self.v_state.switch_to(&_next_ctx.v_state);
         }
         #[cfg(feature = "uspace")]
         if self.page_table_root != _next_ctx.page_table_root {
@@ -438,6 +641,41 @@ unsafe extern "C" fn clear_fp_registers() {
         include_fp_asm_macros!(),
         "
         CLEAR_FLOAT_REGS
+        ret"
+    )
+}
+
+#[cfg(feature = "vector")]
+#[unsafe(naked)]
+unsafe extern "C" fn save_vector_regs(buf: *mut u8, vlenb_bytes: usize) {
+    naked_asm!(
+        include_vec_asm_macros!(),
+        "
+        // a0 = ptr to v_regs buffer, a1 = vlenb (bytes per register)
+        PUSH_VEC_REGS_32 a0, a1
+        ret"
+    )
+}
+
+#[cfg(feature = "vector")]
+#[unsafe(naked)]
+unsafe extern "C" fn restore_vector_regs(buf: *const u8, vlenb_bytes: usize) {
+    naked_asm!(
+        include_vec_asm_macros!(),
+        "
+        // a0 = ptr to v_regs buffer, a1 = vlenb (bytes per register)
+        POP_VEC_REGS_32 a0, a1
+        ret"
+    )
+}
+
+#[cfg(feature = "vector")]
+#[unsafe(naked)]
+unsafe extern "C" fn clear_vector_regs() {
+    naked_asm!(
+        include_vec_asm_macros!(),
+        "
+        CLEAR_VEC_REGS_32
         ret"
     )
 }
