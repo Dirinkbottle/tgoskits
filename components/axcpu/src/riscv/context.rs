@@ -5,9 +5,9 @@ use core::{
 };
 
 use ax_memory_addr::VirtAddr;
+use cpu_local::{CurrentThreadHeader, PreparedThreadSwitch};
 #[cfg(feature = "vector")]
 use riscv::register::sstatus::VS;
-use cpu_local::{CurrentThreadHeader, PreparedThreadSwitch};
 use riscv::register::sstatus::{self, FS};
 
 use crate::{KernelTlsBase, TaskLocalState};

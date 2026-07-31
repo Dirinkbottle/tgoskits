@@ -49,6 +49,12 @@
   - 支持 16 字节 FIFO 缓冲和中断驱动
   - 广泛兼容 PC 兼容串口设备和嵌入式系统
 
+- ✅ **PXA/XScale UART** - SpacemiT K1/K3 串口控制器
+  - 通过 `pxa-uart` feature 启用，入口为 `some_serial::pxa_uart::PxaUart`
+  - 32-bit MMIO 访问（reg-shift=2）、64 字节扩展 FIFO
+  - PXA 扩展位域：IER UUE/RTOIE/DMAE、FCR PXAR1/PXAR8/PXAR32、MCR AFE
+  - 通过 `SplitUart::split()` 拆分为 `UartPort` 数据端点与 `UartIrq` 中断端点
+
 ### 计划支持
 
 - 🚧 **更多 ARM UART 驱动** - 扩展 ARM 平台支持

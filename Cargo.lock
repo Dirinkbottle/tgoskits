@@ -823,7 +823,6 @@ dependencies = [
  "fxmac_rs",
  "heapless",
  "irq-framework",
- "k3-sdhci",
  "log",
  "mmio-api",
  "nvme-driver",
@@ -862,6 +861,7 @@ dependencies = [
  "some-serial",
  "spin",
  "starfive-jh7110-dwmmc",
+ "thiserror 2.0.19",
  "tock-registers 0.10.1",
  "virtio-drivers",
  "x86",
@@ -4777,14 +4777,10 @@ version = "0.1.0"
 name = "k3-sdhci"
 version = "0.1.0"
 dependencies = [
- "axklib",
  "bitflags 2.13.1",
- "dma-api 0.9.3",
  "log",
  "mmio-api",
- "rdrive",
- "sdhci-host",
- "sdmmc-protocol",
+ "thiserror 2.0.19",
 ]
 
 [[package]]

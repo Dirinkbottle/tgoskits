@@ -24,6 +24,10 @@ use super::{
     PopulateCallback, RssKind, alloc_frame, dealloc_frame, pages_in,
 };
 
+/// Maximum frame reference count. Incrementing a frame at or above this
+/// threshold is refused to keep `count` from saturating `u8::MAX`.
+const MAX_FRAME_REF: u8 = u8::MAX - 1;
+
 struct FrameRefCnt {
     count: u8,
 }
@@ -65,7 +69,7 @@ impl CowPinnedFrame {
         {
             let mut frame = refcnt.lock();
             assert!(frame.count > 0, "pinning unreferenced frame");
-            if frame.count >= u8::MAX - 1 {
+            if frame.count >= MAX_FRAME_REF {
                 warn!("frame reference count overflow");
                 return Err(AxError::BadAddress);
             }
@@ -654,11 +658,11 @@ impl BackendOps for CowBackend {
                         .ok_or(AxError::BadAddress)?;
                     let mut frame = frame.lock();
                     assert!(frame.count > 0, "referencing unreferenced frame");
-                    frame.count += 1;
-                    if frame.count == u8::MAX {
+                    if frame.count >= MAX_FRAME_REF {
                         warn!("frame reference count overflow");
                         return Err(AxError::BadAddress);
                     }
+                    frame.count += 1;
                     old_pt.protect(vaddr, cow_flags)?;
                     new_pt.map(vaddr, paddr, self.size, cow_flags)?;
                     if let (Some(parent), Some(child)) = (acct.parent, acct.child)

@@ -128,6 +128,18 @@ fn handle_breakpoint(tf: &mut KernelTrapFrame<'_>) {
     tf.set_ip(tf.ip() + 2);
 }
 
+fn panic_illegal_instruction(tf: &KernelTrapFrame<'_>) -> ! {
+    let snapshot = tf.snapshot();
+    let bt = snapshot.backtrace();
+    panic!(
+        "IllegalInstruction @ {:#x}, stval={:#x}:\n{:#x?}\n{}",
+        tf.raw.0.sepc,
+        stval::read(),
+        snapshot,
+        bt.kind("trap")
+    );
+}
+
 fn handle_page_fault(tf: &mut KernelTrapFrame<'_>, access_flags: PageFaultFlags) {
     let vaddr = va!(stval::read());
     if crate::trap::call_page_fault_handler_with_parent_irqs(
@@ -184,35 +196,22 @@ fn handle_trap(tf: &mut KernelTrapFrame<'_>) {
                 {
                     let current_vs = sstatus::read().vs();
                     if current_vs == VS::Off {
-                        warn!(
+                        // Lazy vector enable: the task's first vector
+                        // instruction faulted while VS was Off. Enable the
+                        // extension and re-execute the instruction.
+                        debug!(
                             "vector extension not enabled, enabling VS = Initial @ {:#x}",
                             tf.ip()
                         );
                         unsafe { sstatus::set_vs(VS::Initial) };
                         // fall through to update tf.sstatus below
                     } else {
-                        let snapshot = tf.snapshot();
-                        let bt = snapshot.backtrace();
-                        panic!(
-                            "IllegalInstruction @ {:#x}, stval={:#x}:\n{:#x?}\n{}",
-                            tf.raw.0.sepc,
-                            stval::read(),
-                            snapshot,
-                            bt.kind("trap")
-                        );
+                        panic_illegal_instruction(tf);
                     }
                 }
                 #[cfg(not(feature = "vector"))]
                 {
-                    let snapshot = tf.snapshot();
-                    let bt = snapshot.backtrace();
-                    panic!(
-                        "IllegalInstruction @ {:#x}, stval={:#x}:\n{:#x?}\n{}",
-                        tf.raw.0.sepc,
-                        stval::read(),
-                        snapshot,
-                        bt.kind("trap")
-                    );
+                    panic_illegal_instruction(tf);
                 }
             }
             Trap::Interrupt(_) => {

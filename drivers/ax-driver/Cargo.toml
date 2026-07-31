@@ -85,12 +85,7 @@ k230-sdhci = [
     "dep:sdmmc-protocol",
     "sdmmc-protocol/rdif",
 ]
-k3-sdhci = [
-    "block",
-    "dep:k3-sdhci",
-]
 k3-ufs = ["block"]
-k3-gmac = ["net"]
 k3-pxa-uart = ["serial", "some-serial/pxa-uart"]
 zicbom = ["dma-api/zicbom"]
 phytium-mci = [
@@ -170,7 +165,6 @@ fdt-edit = { workspace = true }
 fxmac_rs = { workspace = true, optional = true }
 heapless.workspace = true
 irq-framework.workspace = true
-k3-sdhci = { path = "../blk/k3-sdhci", features = ["platform"], optional = true }
 log.workspace = true
 mmio-api.workspace = true
 nvme-driver = { workspace = true, optional = true }
@@ -208,6 +202,7 @@ sg200x-bsp = { workspace = true, optional = true }
 some-serial = { workspace = true, optional = true }
 spin.workspace = true
 starfive-jh7110-dwmmc = { workspace = true, optional = true }
+thiserror.workspace = true
 tock-registers = { workspace = true, optional = true }
 virtio-drivers = { workspace = true, optional = true }
 

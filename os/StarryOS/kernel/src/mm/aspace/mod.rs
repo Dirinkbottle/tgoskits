@@ -1,4 +1,6 @@
-use alloc::{sync::Arc, vec::Vec};
+use alloc::sync::Arc;
+#[cfg(feature = "k3_com260kit")]
+use alloc::vec::Vec;
 use core::{
     fmt,
     ops::DerefMut,
@@ -36,6 +38,10 @@ pub use self::{
 type MovedPage = (VirtAddr, VirtAddr, PhysAddr, MappingFlags, PageSize, bool);
 const CLONED_ADDR_SPACE_LOCK_SUBCLASS: u32 = 1;
 
+/// Pins the resident COW pages of `[start, start + size)` so the frames stay
+/// alive for another core (AMP shared memory). Requires the `k3_com260kit`
+/// feature, which provides the frame-pinning backend.
+#[cfg(feature = "k3_com260kit")]
 pub fn pin_cow_pages(
     aspace: &mut AddrSpace,
     start: VirtAddr,

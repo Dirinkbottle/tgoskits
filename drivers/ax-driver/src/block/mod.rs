@@ -13,8 +13,6 @@ mod irq_bound;
 mod cvsd;
 #[cfg(feature = "k230-sdhci")]
 pub mod k230_sdhci;
-#[cfg(feature = "k3-sdhci")]
-pub mod k3_sdhci;
 #[cfg(feature = "k3-ufs")]
 pub mod k3_ufs;
 #[cfg(feature = "nvme")]
@@ -38,17 +36,15 @@ mod sync_block_dev {
     //! request is executed synchronously against the underlying driver and its
     //! DMA backing is returned to the runtime through the completion sink.
 
+    use alloc::{boxed::Box, collections::VecDeque, sync::Arc, vec::Vec};
     use core::slice;
 
-    use alloc::{boxed::Box, collections::VecDeque, sync::Arc, vec::Vec};
-
     use ax_kspin::SpinRaw as Mutex;
-    use rdif_block::dma_api::CompletedDma;
     use rdif_block::{
-        BatchSubmitDisposition, BatchSubmitResult, BlkError, BlockController, BHardwareQueue,
+        BHardwareQueue, BatchSubmitDisposition, BatchSubmitResult, BlkError, BlockController,
         CompletedRequest, CompletionSink, ControllerEvent, ControllerState, ControllerUpdate,
         DeviceInfo, DriverGeneric, HardwareQueue, OwnedRequest, OwnedRequestBatch, QueueInfo,
-        QueueLimits, RequestId, RequestOp, SubmissionSink,
+        QueueLimits, RequestId, RequestOp, SubmissionSink, dma_api::CompletedDma,
     };
 
     use crate::block::PlatformDeviceBlock;
@@ -130,10 +126,7 @@ mod sync_block_dev {
             1
         }
 
-        fn advance(
-            &mut self,
-            event: ControllerEvent,
-        ) -> Result<ControllerUpdate, BlkError> {
+        fn advance(&mut self, event: ControllerEvent) -> Result<ControllerUpdate, BlkError> {
             match event {
                 ControllerEvent::Start { .. } if !self.queue_taken => {
                     self.queue_taken = true;
@@ -249,10 +242,7 @@ mod sync_block_dev {
             Ok(())
         }
 
-        fn drain_completions(
-            &mut self,
-            sink: &mut dyn CompletionSink,
-        ) -> Result<(), BlkError> {
+        fn drain_completions(&mut self, sink: &mut dyn CompletionSink) -> Result<(), BlkError> {
             while let Some((id, result, data)) = self.completed.pop_front() {
                 sink.complete(CompletedRequest::new(id, result, data));
             }
