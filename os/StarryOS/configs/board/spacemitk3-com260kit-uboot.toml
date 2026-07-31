@@ -1,9 +1,0 @@
-# Runtime U-Boot config for SpacemiT K3 COM260 Kit
-serial = "/dev/ttyUSB0"
-baud_rate = "115200"
-dtb_file = "os/StarryOS/configs/board/spacemit-k3-com260-ifx.dtb"
-
-success_regex = []
-fail_regex = [
-  "panicked at",
-]
