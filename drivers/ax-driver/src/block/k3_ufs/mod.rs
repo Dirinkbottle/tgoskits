@@ -8,7 +8,8 @@
 //! - `regs`: register map and hardware constants
 //! - `error`: the `UfsError` driver error type
 //! - `desc`: UTRD/PRDT/UCD descriptors and UPIU build helpers
-//! - `init`: MPHY / UNIPRO / link-startup initialization sequence
+//! - `init`: MPHY / UNIPRO / link-startup / HS power-mode init sequence
+//! - `uic`: UIC command transport (DME_GET/DME_SET, link startup)
 //! - `transfer`: UPIU submission, completion polling, controller recovery
 //! - `scsi`: SCSI command layer and LUN selection
 
@@ -18,6 +19,7 @@ mod init;
 mod regs;
 mod scsi;
 mod transfer;
+mod uic;
 
 use alloc::format;
 use core::ptr::NonNull;
@@ -32,8 +34,12 @@ use rdrive::{
 use crate::mmio::iomap;
 
 /// Reference clock frequency of the K3 UFS MPHY (491.52 MHz), used to derive
-/// the 1 us and symbol-clock timer values programmed in [`K3UfsHost::host_init`].
+/// the 1 us and symbol-clock timer values programmed in
+/// [`K3UfsHost::link_startup_pre`].
 const DEFAULT_K3_UFS_CLOCK_HZ: u32 = 491_520_000;
+/// Default lane count when neither the device nor the dts declares one
+/// (Linux: UFS_DEFAULT_LANES_PER_DIRECTION).
+const DEFAULT_K3_UFS_LANES_PER_DIRECTION: u32 = 2;
 /// Fallback MMIO window size when the FDT node's `reg` property carries no
 /// size cell (Linux ufs-spacemit.dtsi uses 0x40000).
 const DEFAULT_K3_UFS_MMIO_SIZE: u64 = 0x40000;
@@ -79,9 +85,22 @@ fn probe(probe: ProbeFdt<'_>) -> Result<(), OnProbeError> {
     let mmio_base = iomap(base_reg.address as usize, mmio_size)?;
     let dma = axklib::dma::device_with_mask(0xFFFFFFFFFFFFFFFF);
 
+    // Fallback lane count from the dts `lanes-per-direction` property
+    // (Linux: ufs-common.yaml binding), used when the device reports no
+    // connected/available lanes during power-mode negotiation.
+    let max_lanes = info
+        .node
+        .as_node()
+        .get_property("lanes-per-direction")
+        .and_then(|p| p.get_u32())
+        .filter(|lanes| *lanes != 0)
+        .unwrap_or(DEFAULT_K3_UFS_LANES_PER_DIRECTION);
+    info!("[k3-ufs] lanes-per-direction: {}", max_lanes);
+
     let mut host = K3UfsHost {
         mmio_base,
         clock_freq: DEFAULT_K3_UFS_CLOCK_HZ,
+        max_lanes,
         nutrs: 0,
         active_lun: 0,
         num_blocks: 0,
@@ -94,13 +113,16 @@ fn probe(probe: ProbeFdt<'_>) -> Result<(), OnProbeError> {
         fatal: false,
     };
 
-    // Bring up the PHY and link before any descriptor work can happen.
-    host.mphy_init()
-        .map_err(|e| OnProbeError::other(format!("MPHY init failed: {e}")))?;
+    // Bring up the PHY and link, then upgrade the link to the negotiated HS
+    // gear before any descriptor work or LUN scan (Linux ufshcd flow).
     host.host_init()
         .map_err(|e| OnProbeError::other(format!("Host init failed: {e}")))?;
+    host.mphy_init()
+        .map_err(|e| OnProbeError::other(format!("MPHY init failed: {e}")))?;
     host.unipro_init()
         .map_err(|e| OnProbeError::other(format!("UNIPRO init failed: {e}")))?;
+    host.link_startup_pre()
+        .map_err(|e| OnProbeError::other(format!("Link startup pre failed: {e}")))?;
     host.link_startup()
         .map_err(|e| OnProbeError::other(format!("Link startup failed: {e}")))?;
     host.link_startup_post()
@@ -121,7 +143,15 @@ fn probe(probe: ProbeFdt<'_>) -> Result<(), OnProbeError> {
     host.complete_dev_init()
         .map_err(|e| OnProbeError::other(format!("Device init failed: {e}")))?;
 
-    // Step 3: Linux registers WLUNs and then calls scsi_scan_host(), which
+    // Step 3: Apply device quirks and upgrade the link from the default PWM
+    // gear to the negotiated HS gear (Linux: ufshcd_tune_unipro_params then
+    // ufshcd_post_device_init). A failed HS negotiation degrades back to PWM.
+    host.apply_dev_quirks()
+        .map_err(|e| OnProbeError::other(format!("Device quirks failed: {e}")))?;
+    host.upgrade_link_to_hs()
+        .map_err(|e| OnProbeError::other(format!("HS link upgrade failed: {e}")))?;
+
+    // Step 4: Linux registers WLUNs and then calls scsi_scan_host(), which
     // uses REPORT_LUNS and probes each regular LU. Do the same minimal scan
     // here and select the first LU that looks like a data disk.
     let (scsi_lun, num_blocks, block_size) = host
@@ -171,6 +201,9 @@ fn decode_fdt_irq(interrupts: &[InterruptRef]) -> Option<usize> {
 struct K3UfsHost {
     mmio_base: NonNull<u8>,
     clock_freq: u32,
+    /// Lane count from the dts `lanes-per-direction`, used as the fallback in
+    /// `read_lane_count` when the device reports no connected lanes.
+    max_lanes: u32,
     nutrs: usize,
     active_lun: u8,
     num_blocks: u64,
