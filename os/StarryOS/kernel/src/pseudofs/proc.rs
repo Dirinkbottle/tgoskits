@@ -1892,6 +1892,21 @@ fn mq_sysctl_file(
     )
 }
 
+/// Builds an integer sysctl whose owning resource limit is not implemented.
+///
+/// Do not acknowledge writes until PID allocation and VMA admission consume
+/// these settings. Returning `EOPNOTSUPP` keeps procfs from reporting a limit
+/// that the kernel does not enforce.
+fn unsupported_limit_sysctl_file(fs: &Arc<SimpleFs>, value: &'static str) -> Arc<SimpleFile> {
+    SimpleFile::new_regular(
+        fs.clone(),
+        RwFile::new(move |operation| match operation {
+            SimpleFileOperation::Read => Ok(Some(value)),
+            SimpleFileOperation::Write(_) => Err(VfsError::OperationNotSupported),
+        }),
+    )
+}
+
 fn builder(fs: Arc<SimpleFs>) -> DirMaker {
     let mut root = DirMapping::new();
     root.add(
@@ -2021,10 +2036,7 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
         sys.add("kernel", {
             let mut kernel = DirMapping::new();
 
-            kernel.add(
-                "pid_max",
-                SimpleFile::new_regular(fs.clone(), || Ok("32768\n")),
-            );
+            kernel.add("pid_max", unsupported_limit_sysctl_file(&fs, "32768\n"));
             kernel.add(
                 "osrelease",
                 SimpleFile::new_regular(fs.clone(), || Ok("6.6.0-starry\n")),
@@ -2067,7 +2079,7 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
             );
             vm.add(
                 "max_map_count",
-                SimpleFile::new_regular(fs.clone(), || Ok("65530\n")),
+                unsupported_limit_sysctl_file(&fs, "65530\n"),
             );
             SimpleDir::new_maker(fs.clone(), Arc::new(vm))
         });
