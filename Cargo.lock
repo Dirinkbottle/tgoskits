@@ -1181,6 +1181,7 @@ dependencies = [
  "rdif-intc",
  "rdrive",
  "spin",
+ "thiserror 2.0.19",
 ]
 
 [[package]]
