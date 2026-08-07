@@ -971,7 +971,6 @@ dependencies = [
  "ax-lazyinit",
  "ax-percpu",
  "log",
- "quote",
 ]
 
 [[package]]
