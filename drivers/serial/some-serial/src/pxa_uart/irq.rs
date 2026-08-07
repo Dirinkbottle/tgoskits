@@ -8,10 +8,13 @@ use rdif_serial::{IrqRxSink, SerialEventSet, SerialIrqEvent, UartIrq};
 
 use super::{
     ier_for_events, read_reg_base,
-    regs::{UART_IER, UART_IIR, UART_MSR, ier, iir, lsr, msr},
+    regs::{UART_IER, UART_IIR, UART_LSR, UART_MSR, ier, iir, lsr, msr},
     rx::{read_rx_sample, rx_errors_from_sample},
     write_reg_base,
 };
+
+/// Maximum samples drained from the RX FIFO in one IRQ pass.
+const RX_SAMPLE_BUDGET: usize = 256;
 
 /// Hard-IRQ endpoint for a PXA/XScale UART.
 ///
@@ -67,32 +70,71 @@ impl PxaUartIrq {
         ier.remove(ier_for_events(events));
         self.write_flags(UART_IER, ier);
     }
+
+    /// Drain RX samples from the FIFO, applying the PXA Errata #20 RTOIE
+    /// toggle around the drain (mirror of Linux `serial_spacemit.c
+    /// receive_chars()`: disable IER[RTOIE] before reading, re-enable it once
+    /// the FIFO is empty). Returns the number of samples read.
+    fn drain_rx_samples(
+        &mut self,
+        rx: &mut dyn IrqRxSink,
+        event: &mut SerialIrqEvent,
+        rx_samples: &mut usize,
+    ) -> usize {
+        let mut ier = self.read_flags::<ier::Flags>(UART_IER);
+        ier.remove(ier::Flags::RTOIE);
+        self.write_flags(UART_IER, ier);
+
+        let start = *rx_samples;
+        while *rx_samples < RX_SAMPLE_BUDGET {
+            let Some(sample) = read_rx_sample(self.base, &mut self.saved_lsr) else {
+                break;
+            };
+            event.rx_errors |= rx_errors_from_sample(sample);
+            rx.push(sample);
+            *rx_samples += 1;
+        }
+
+        let mut ier = self.read_flags::<ier::Flags>(UART_IER);
+        ier.insert(ier::Flags::RTOIE);
+        self.write_flags(UART_IER, ier);
+
+        *rx_samples - start
+    }
 }
 
 impl UartIrq for PxaUartIrq {
     fn handle(&mut self, rx: &mut dyn IrqRxSink) -> Option<SerialIrqEvent> {
         const IRQ_PASS_BUDGET: usize = 32;
-        const RX_SAMPLE_BUDGET: usize = 256;
 
         let mut event = SerialIrqEvent::default();
         let mut rx_samples = 0;
         for _ in 0..IRQ_PASS_BUDGET {
             let Some(current) = self.next_event() else {
+                // IIR reports no pending interrupt, yet RX data or errors are
+                // still in the FIFO. This is the Errata #20 signature: the
+                // receiver-timeout condition (RTOIE/CTI) was lost while bytes
+                // sat below the FIFO trigger level. Drain them here so input
+                // cannot freeze with data stranded, and re-arm RTOIE for the
+                // next batch.
+                let lsr = self.read_flags::<lsr::Flags>(UART_LSR);
+                // This LSR read clears sticky error bits; fold them into the
+                // saved latch before the drain re-reads LSR, or the error
+                // flag for a stranded byte is lost (mirror of
+                // `read_lsr_preserving`).
+                self.saved_lsr
+                    .insert(lsr & (lsr::Flags::ERROR_MASK | lsr::Flags::FIFOE));
+                if lsr.intersects(lsr::Flags::DR | lsr::Flags::ERROR_MASK) {
+                    self.drain_rx_samples(rx, &mut event, &mut rx_samples);
+                    event.events |= SerialEventSet::RX_DATA;
+                }
                 break;
             };
             event.events |= current;
 
             if current.intersects(SerialEventSet::RX) {
-                let before = rx_samples;
-                while rx_samples < RX_SAMPLE_BUDGET {
-                    let Some(sample) = read_rx_sample(self.base, &mut self.saved_lsr) else {
-                        break;
-                    };
-                    event.rx_errors |= rx_errors_from_sample(sample);
-                    rx.push(sample);
-                    rx_samples += 1;
-                }
-                if rx_samples == RX_SAMPLE_BUDGET || rx_samples == before {
+                let drained = self.drain_rx_samples(rx, &mut event, &mut rx_samples);
+                if drained == 0 {
                     break;
                 }
             }
