@@ -3,8 +3,8 @@
 use alloc::{boxed::Box, collections::btree_map::BTreeMap, vec, vec::Vec};
 use core::any::Any;
 
-use ax_memory_addr::{MemoryAddr, PhysAddr, VirtAddr, VirtAddrRange, align_up_4k};
-use ax_runtime::hal::paging::{MappingFlags, PageSize};
+use ax_memory_addr::{MemoryAddr, PAGE_SIZE_4K, PhysAddr, VirtAddr, VirtAddrRange, align_up_4k};
+use ax_runtime::hal::paging::MappingFlags;
 use ax_task::current;
 use axfs_ng_vfs::{NodeFlags, VfsError, VfsResult};
 use k3_ai_scheduler::{K3SchedulerOps, kd_kring::resolve_parsed_graph, scheduler::run_graph};
@@ -102,7 +102,7 @@ impl K3AiRunner {
         }
 
         // range_len 已经页对齐，alias 需要映射同样数量的 4K 页。
-        let required_pages = range_len / PageSize::Size4K as usize;
+        let required_pages = range_len / PAGE_SIZE_4K;
         if shared_pages.len() < required_pages {
             info!(
                 "k3_airunner: BUILD_CHANNEL rejected short SharedPages pid={}, pages={}, \
@@ -179,7 +179,7 @@ impl K3AiRunner {
                     .map_linear(
                         virt_start,
                         PhysAddr::from_usize(paddr.as_usize()),
-                        PageSize::Size4K as usize,
+                        PAGE_SIZE_4K,
                         MappingFlags::READ | MappingFlags::WRITE,
                     )
                     .is_err()
@@ -191,7 +191,7 @@ impl K3AiRunner {
                     }
                     return Err(VfsError::InvalidInput);
                 }
-                virt_start += PageSize::Size4K as usize;
+                virt_start += PAGE_SIZE_4K;
             }
             (kernel_va, range_len)
         };

@@ -60,7 +60,7 @@ pub fn pin_cow_pages(
         let Backend::Cow(cow) = area.backend().clone() else {
             ax_bail!(InvalidInput, "range is not backed by COW pages");
         };
-        if cow.page_size() != PageSize::Size4K {
+        if cow.page_size() != PAGE_SIZE_4K {
             ax_bail!(InvalidInput, "only 4K COW pages can be pinned");
         }
         cow
@@ -71,10 +71,9 @@ pub fn pin_cow_pages(
     aspace.populate_area(start, size, MappingFlags::WRITE)?;
 
     let mut phys_pages = Vec::with_capacity(size / PAGE_SIZE_4K);
-    let mut cursor = aspace.pt.cursor();
     for vaddr in PageIter4K::new(start, end).ok_or(AxError::InvalidInput)? {
-        let (paddr, _flags, page_size) = cursor.query(vaddr).map_err(|_| AxError::BadAddress)?;
-        if page_size != PageSize::Size4K {
+        let (paddr, _flags, page_size) = aspace.pt.query(vaddr).map_err(|_| AxError::BadAddress)?;
+        if page_size != PAGE_SIZE_4K {
             ax_bail!(InvalidInput, "only 4K COW pages can be pinned");
         }
         phys_pages.push(paddr);
