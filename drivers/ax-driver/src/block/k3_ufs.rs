@@ -58,7 +58,9 @@ const REG_UIC_COMMAND_ARG2: usize = 0x98;
 const REG_UIC_COMMAND_ARG3: usize = 0x9C;
 
 /// UIC Commands
+const UIC_CMD_DME_GET: u32 = 0x01;
 const UIC_CMD_DME_SET: u32 = 0x02;
+const UIC_CMD_DME_PEER_GET: u32 = 0x03;
 const UIC_CMD_DME_LINK_STARTUP: u32 = 0x16;
 
 /// UIC attributes (from Linux ufs-spacemit.c)
@@ -80,6 +82,30 @@ const PA_MK2EXTENSIONGUARDBAND: u32 = 0x15AB;
 const PA_STALLNOCONFIGTIME: u32 = 0x15A3;
 const PA_TACTIVATE: u32 = 0x15A8;
 const PA_TXTRAILINGCLOCKS: u32 = 0x1564;
+const PA_ACTIVETXDATALANES: u32 = 0x1560;
+const PA_CONNECTEDTXDATALANES: u32 = 0x1561;
+const PA_TXGEAR: u32 = 0x1568;
+const PA_TXTERMINATION: u32 = 0x1569;
+const PA_HSSERIES: u32 = 0x156A;
+const PA_PWRMODE: u32 = 0x1571;
+const PA_ACTIVERXDATALANES: u32 = 0x1580;
+const PA_CONNECTEDRXDATALANES: u32 = 0x1581;
+const PA_RXGEAR: u32 = 0x1583;
+const PA_RXTERMINATION: u32 = 0x1584;
+const PA_MAXRXHSGEAR: u32 = 0x1587;
+
+const PA_HS_MODE_B: u32 = 2;
+const PA_FAST_MODE: u32 = 1;
+const PA_FASTAUTO_MODE: u32 = 4;
+const PA_PWRMODE_RX_OFFSET: u32 = 4;
+
+/// K3 supports a symmetric HS-G3, two-lane UFS link in HS Series B.
+const K3_HOST_POWER_CAPABILITIES: PowerModeCapabilities = PowerModeCapabilities {
+    lanes_rx: 2,
+    lanes_tx: 2,
+    hs_gear_rx: 3,
+    hs_gear_tx: 3,
+};
 
 /// RX/TX lane-specific attributes
 const RX_LS_PRE_LEN_CAP: u32 = 0x008D;
@@ -100,11 +126,21 @@ const UFS_DL_AFC0REQTIMEOUTVAL_MAX: u32 = 0xFFFF;
 /// dma_rmb() = rmb() = fence ir,ir  (Linux: __ufshcd_transfer_req_compl K3 path)
 #[inline(always)]
 fn dma_wmb() {
-    unsafe { core::arch::asm!("fence ow, ow", options(nostack)) };
+    #[cfg(target_arch = "riscv64")]
+    unsafe {
+        core::arch::asm!("fence ow, ow", options(nostack));
+    }
+    #[cfg(not(target_arch = "riscv64"))]
+    core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::Release);
 }
 #[inline(always)]
 fn dma_rmb() {
-    unsafe { core::arch::asm!("fence ir, ir", options(nostack)) };
+    #[cfg(target_arch = "riscv64")]
+    unsafe {
+        core::arch::asm!("fence ir, ir", options(nostack));
+    }
+    #[cfg(not(target_arch = "riscv64"))]
+    core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::Acquire);
 }
 
 /// Helper to build UIC MIB selector
@@ -122,6 +158,7 @@ const fn uic_arg_mib_sel(attr: u32, sel: u32) -> u32 {
 const UTP_TRANSFER_REQ_COMPL: u32 = 0x1;
 const UTP_TASK_REQ_COMPL: u32 = 0x200;
 const UIC_ERROR: u32 = 0x4;
+const UIC_POWER_MODE: u32 = 0x10;
 const UIC_LINK_LOST: u32 = 0x80;
 const DEVICE_FATAL_ERROR: u32 = 0x800;
 const UTP_ERROR: u32 = 0x1000;
@@ -156,6 +193,8 @@ fn decode_fdt_irq(interrupts: &[rdrive::probe::fdt::InterruptRef]) -> Option<usi
 const SYSTEM_BUS_FATAL_ERROR: u32 = 0x20000;
 const CRYPTO_ENGINE_FATAL_ERROR: u32 = 0x40000;
 const UIC_COMMAND_COMPL: u32 = 1 << 10;
+const UIC_POWER_MODE_CHANGE_STATUS_MASK: u32 = 0x7 << 8;
+const UIC_POWER_MODE_CHANGE_LOCAL: u32 = 0x1 << 8;
 
 const INT_FATAL_ERRORS: u32 = DEVICE_FATAL_ERROR
     | CONTROLLER_FATAL_ERROR
@@ -165,6 +204,60 @@ const INT_FATAL_ERRORS: u32 = DEVICE_FATAL_ERROR
     | UTP_ERROR;
 const UFSHCD_ERROR_MASK: u32 = UIC_ERROR | INT_FATAL_ERRORS;
 const UFSHCD_ENABLE_INTRS: u32 = UTP_TRANSFER_REQ_COMPL | UTP_TASK_REQ_COMPL | UFSHCD_ERROR_MASK;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PowerModeCapabilities {
+    lanes_rx: u32,
+    lanes_tx: u32,
+    hs_gear_rx: u32,
+    hs_gear_tx: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PowerMode {
+    gear_rx: u32,
+    gear_tx: u32,
+    lanes_rx: u32,
+    lanes_tx: u32,
+    hs_series: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PowerModeChangeOutcome {
+    Fast,
+    FastAutoFallback,
+}
+
+fn negotiate_power_mode(
+    host: PowerModeCapabilities,
+    device: PowerModeCapabilities,
+) -> Result<PowerMode, &'static str> {
+    if host.lanes_rx == 0
+        || host.lanes_tx == 0
+        || host.hs_gear_rx == 0
+        || host.hs_gear_tx == 0
+        || device.lanes_rx == 0
+        || device.lanes_tx == 0
+        || device.hs_gear_rx == 0
+        || device.hs_gear_tx == 0
+    {
+        return Err("invalid UFS power capability");
+    }
+
+    let gear = host
+        .hs_gear_rx
+        .min(host.hs_gear_tx)
+        .min(device.hs_gear_rx)
+        .min(device.hs_gear_tx);
+
+    Ok(PowerMode {
+        gear_rx: gear,
+        gear_tx: gear,
+        lanes_rx: host.lanes_rx.min(device.lanes_rx),
+        lanes_tx: host.lanes_tx.min(device.lanes_tx),
+        hs_series: PA_HS_MODE_B,
+    })
+}
 
 /// Controller status bits
 const DEVICE_PRESENT: u32 = 1 << 0;
@@ -357,16 +450,26 @@ impl K3UfsHost {
         let v =
             unsafe { core::ptr::read_volatile(self.mmio_base.as_ptr().add(offset) as *const u32) };
         // Linux: __io_ar() = fence i,ir (arch/riscv/include/asm/mmio.h)
-        unsafe { core::arch::asm!("fence i, ir", options(nostack)) };
+        #[cfg(target_arch = "riscv64")]
+        unsafe {
+            core::arch::asm!("fence i, ir", options(nostack));
+        }
+        #[cfg(not(target_arch = "riscv64"))]
+        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::Acquire);
         v
     }
 
     unsafe fn write32(&self, offset: usize, value: u32) {
+        // Linux: __io_bw() = fence w,o (arch/riscv/include/asm/mmio.h)
+        #[cfg(target_arch = "riscv64")]
         unsafe {
-            // Linux: __io_bw() = fence w,o (arch/riscv/include/asm/mmio.h)
             core::arch::asm!("fence w, o", options(nostack));
-            core::ptr::write_volatile(self.mmio_base.as_ptr().add(offset) as *mut u32, value);
         }
+        #[cfg(not(target_arch = "riscv64"))]
+        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::Release);
+        unsafe {
+            core::ptr::write_volatile(self.mmio_base.as_ptr().add(offset) as *mut u32, value)
+        };
     }
 
     unsafe fn read_utrd_ocs(utrd: *const Utrd) -> u32 {
@@ -507,9 +610,199 @@ impl K3UfsHost {
         if result != 0 {
             warn!(
                 "[k3-ufs] DME_SET(0x{:04x})={} failed: 0x{:08x}",
-                attr, value, result
+                attr >> 16,
+                value,
+                result
             );
             return Err("DME_SET failed");
+        }
+        Ok(())
+    }
+
+    fn dme_get(&self, attr: u32, peer: bool) -> Result<u32, &'static str> {
+        let command = if peer {
+            UIC_CMD_DME_PEER_GET
+        } else {
+            UIC_CMD_DME_GET
+        };
+        let result = self.uic_cmd(command, attr, 0, 0)?;
+        if result != 0 {
+            warn!(
+                "[k3-ufs] DME_{}GET(0x{:04x}) failed: 0x{:08x}",
+                if peer { "PEER_" } else { "" },
+                attr >> 16,
+                result
+            );
+            return Err("DME_GET failed");
+        }
+
+        unsafe { Ok(self.read32(REG_UIC_COMMAND_ARG3)) }
+    }
+
+    fn read_link_power_capabilities(&self) -> Result<PowerModeCapabilities, &'static str> {
+        let capabilities = PowerModeCapabilities {
+            lanes_rx: self.dme_get(uic_arg_mib(PA_CONNECTEDRXDATALANES), false)?,
+            lanes_tx: self.dme_get(uic_arg_mib(PA_CONNECTEDTXDATALANES), false)?,
+            hs_gear_rx: self.dme_get(uic_arg_mib(PA_MAXRXHSGEAR), false)?,
+            // The peer's maximum RX gear limits this host's TX gear.
+            hs_gear_tx: self.dme_get(uic_arg_mib(PA_MAXRXHSGEAR), true)?,
+        };
+
+        info!(
+            "[k3-ufs] UniPro link capability: connected_rx_lanes={}, connected_tx_lanes={}, \
+             local_max_hs_gear_rx={}, peer_max_hs_gear_rx={}",
+            capabilities.lanes_rx,
+            capabilities.lanes_tx,
+            capabilities.hs_gear_rx,
+            capabilities.hs_gear_tx
+        );
+        Ok(capabilities)
+    }
+
+    fn configure_power_mode_attributes(&self, power_mode: PowerMode) -> Result<(), &'static str> {
+        self.dme_set(uic_arg_mib(PA_RXGEAR), power_mode.gear_rx)?;
+        self.dme_set(uic_arg_mib(PA_ACTIVERXDATALANES), power_mode.lanes_rx)?;
+        self.dme_set(uic_arg_mib(PA_RXTERMINATION), 1)?;
+        self.dme_set(uic_arg_mib(PA_TXGEAR), power_mode.gear_tx)?;
+        self.dme_set(uic_arg_mib(PA_ACTIVETXDATALANES), power_mode.lanes_tx)?;
+        self.dme_set(uic_arg_mib(PA_TXTERMINATION), 1)?;
+        self.dme_set(uic_arg_mib(PA_HSSERIES), power_mode.hs_series)?;
+        Ok(())
+    }
+
+    fn request_power_mode(&self, mode: u32) -> Result<(), &'static str> {
+        let interrupt_mask = UIC_COMMAND_COMPL | UIC_POWER_MODE | UIC_ERROR;
+
+        unsafe {
+            self.write32(REG_INTERRUPT_STATUS, interrupt_mask);
+            self.write32(REG_UIC_COMMAND_ARG1, uic_arg_mib(PA_PWRMODE));
+            self.write32(REG_UIC_COMMAND_ARG2, 0);
+            self.write32(REG_UIC_COMMAND_ARG3, mode);
+            self.write32(REG_UIC_COMMAND, UIC_CMD_DME_SET);
+
+            for _ in 0..5000 {
+                let interrupt_status = self.read32(REG_INTERRUPT_STATUS);
+                if interrupt_status & UIC_ERROR != 0 {
+                    self.write32(REG_INTERRUPT_STATUS, interrupt_mask);
+                    warn!(
+                        "[k3-ufs] Power mode request 0x{:02x} raised UIC_ERROR: IS=0x{:08x}",
+                        mode, interrupt_status
+                    );
+                    return Err("power mode change UIC error");
+                }
+
+                if interrupt_status & (UIC_COMMAND_COMPL | UIC_POWER_MODE)
+                    == UIC_COMMAND_COMPL | UIC_POWER_MODE
+                {
+                    self.write32(REG_INTERRUPT_STATUS, interrupt_mask);
+
+                    let result = self.read32(REG_UIC_COMMAND_ARG2);
+                    if result != 0 {
+                        warn!(
+                            "[k3-ufs] Power mode request 0x{:02x} failed: 0x{:08x}",
+                            mode, result
+                        );
+                        return Err("power mode change DME_SET failed");
+                    }
+
+                    let controller_status = self.read32(REG_CONTROLLER_STATUS);
+                    let power_status = controller_status & UIC_POWER_MODE_CHANGE_STATUS_MASK;
+                    if power_status != UIC_POWER_MODE_CHANGE_LOCAL {
+                        warn!(
+                            "[k3-ufs] Power mode request 0x{:02x} rejected: HCS=0x{:08x}, \
+                             UPMCRS=0x{:x}",
+                            mode,
+                            controller_status,
+                            power_status >> 8
+                        );
+                        return Err("power mode change was not accepted locally");
+                    }
+
+                    return Ok(());
+                }
+                axklib::time::busy_wait(core::time::Duration::from_micros(100));
+            }
+        }
+
+        Err("power mode change timeout")
+    }
+
+    fn verify_power_mode(&self, expected: u32) -> Result<(), &'static str> {
+        let actual = self.dme_get(uic_arg_mib(PA_PWRMODE), false)?;
+        if actual & 0xff != expected {
+            warn!(
+                "[k3-ufs] Power mode readback mismatch: expected=0x{:02x}, actual=0x{:02x}",
+                expected,
+                actual & 0xff
+            );
+            return Err("power mode readback mismatch");
+        }
+        Ok(())
+    }
+
+    fn change_power_mode(
+        &self,
+        power_mode: PowerMode,
+    ) -> Result<PowerModeChangeOutcome, &'static str> {
+        self.configure_power_mode_attributes(power_mode)?;
+
+        let fast_auto = PA_FASTAUTO_MODE << PA_PWRMODE_RX_OFFSET | PA_FASTAUTO_MODE;
+        self.request_power_mode(fast_auto)?;
+        self.verify_power_mode(fast_auto)?;
+
+        // K3 Linux performs this intermediate FastAuto transition before Fast.
+        axklib::time::busy_wait(core::time::Duration::from_millis(100));
+
+        let fast = PA_FAST_MODE << PA_PWRMODE_RX_OFFSET | PA_FAST_MODE;
+        match self
+            .request_power_mode(fast)
+            .and_then(|()| self.verify_power_mode(fast))
+        {
+            Ok(()) => Ok(PowerModeChangeOutcome::Fast),
+            Err(error) => {
+                warn!(
+                    "[k3-ufs] HS Fast transition failed after FastAuto: {}; using verified \
+                     FastAuto fallback",
+                    error
+                );
+                self.verify_power_mode(fast_auto)?;
+                Ok(PowerModeChangeOutcome::FastAutoFallback)
+            }
+        }
+    }
+
+    fn negotiate_and_change_power_mode(&self) -> Result<(), &'static str> {
+        let link_capabilities = self.read_link_power_capabilities()?;
+        let power_mode = negotiate_power_mode(K3_HOST_POWER_CAPABILITIES, link_capabilities)?;
+
+        info!(
+            "[k3-ufs] Power capability host: rx_lanes={}, tx_lanes={}, max_hs_gear_rx={}, \
+             max_hs_gear_tx={}, hs_series=B",
+            K3_HOST_POWER_CAPABILITIES.lanes_rx,
+            K3_HOST_POWER_CAPABILITIES.lanes_tx,
+            K3_HOST_POWER_CAPABILITIES.hs_gear_rx,
+            K3_HOST_POWER_CAPABILITIES.hs_gear_tx
+        );
+        info!(
+            "[k3-ufs] Power negotiation target: HS-G{} RX / HS-G{} TX, {} RX lane(s), {} TX \
+             lane(s), HS Series {}",
+            power_mode.gear_rx,
+            power_mode.gear_tx,
+            power_mode.lanes_rx,
+            power_mode.lanes_tx,
+            match power_mode.hs_series {
+                PA_HS_MODE_B => "B",
+                _ => "unknown",
+            }
+        );
+
+        match self.change_power_mode(power_mode)? {
+            PowerModeChangeOutcome::Fast => {
+                info!("[k3-ufs] Power mode change complete: HS Fast");
+            }
+            PowerModeChangeOutcome::FastAutoFallback => {
+                warn!("[k3-ufs] Power mode change complete: HS FastAuto fallback");
+            }
         }
         Ok(())
     }
@@ -2095,7 +2388,11 @@ fn probe(probe: ProbeFdt<'_>) -> Result<(), OnProbeError> {
     host.complete_dev_init()
         .map_err(|e| OnProbeError::other(format!("Device init failed: {}", e)))?;
 
-    // Step 3: Linux registers WLUNs and then calls scsi_scan_host(), which
+    // Step 3: Query link capabilities and enter the highest common HS mode before SCSI I/O.
+    host.negotiate_and_change_power_mode()
+        .map_err(|e| OnProbeError::other(format!("HS power mode change failed: {}", e)))?;
+
+    // Step 4: Linux registers WLUNs and then calls scsi_scan_host(), which
     // uses REPORT_LUNS and probes each regular LU. Do the same minimal scan
     // here and select the first LU that looks like a data disk.
     let (scsi_lun, num_blocks, block_size) = host
@@ -2115,4 +2412,130 @@ fn probe(probe: ProbeFdt<'_>) -> Result<(), OnProbeError> {
     info!("[k3-ufs] ============================================");
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    #[cfg(not(feature = "pci"))]
+    use axklib::{
+        AxError, AxResult, BoxedIrqHandler, ConcurrentBoxedIrqHandler, IrqCpuMask, IrqHandle,
+        IrqId, Klib, PhysAddr, VirtAddr, impl_trait,
+    };
+
+    use super::*;
+
+    #[cfg(not(feature = "pci"))]
+    struct KlibImpl;
+
+    #[cfg(not(feature = "pci"))]
+    impl_trait! {
+        impl Klib for KlibImpl {
+            fn mem_iomap(_addr: PhysAddr, _size: usize) -> AxResult<VirtAddr> {
+                Err(AxError::Unsupported)
+            }
+
+            fn mem_virt_to_phys(addr: VirtAddr) -> PhysAddr {
+                PhysAddr::from_usize(addr.as_usize())
+            }
+
+            fn mem_make_dma_coherent_uncached(_addr: VirtAddr, _size: usize) -> AxResult {
+                Err(AxError::Unsupported)
+            }
+
+            fn mem_restore_dma_cached(_addr: VirtAddr, _size: usize) -> AxResult {
+                Err(AxError::Unsupported)
+            }
+
+            fn dma_cache_clean(_addr: VirtAddr, _size: usize) {}
+
+            fn dma_cache_invalidate(_addr: VirtAddr, _size: usize) {}
+
+            fn dma_cache_clean_invalidate(_addr: VirtAddr, _size: usize) {}
+
+            fn dma_alloc_pages(
+                _dma_mask: u64,
+                _num_pages: usize,
+                _align: usize,
+            ) -> AxResult<VirtAddr> {
+                Err(AxError::Unsupported)
+            }
+
+            fn dma_dealloc_pages(_addr: VirtAddr, _num_pages: usize) {}
+
+            fn time_busy_wait(_dur: core::time::Duration) {}
+
+            fn time_monotonic_nanos() -> u64 {
+                0
+            }
+
+            fn time_try_init_epoch_offset(_epoch_time_nanos: u64) -> bool {
+                false
+            }
+
+            fn irq_set_enable(_irq: IrqId, _enabled: bool) -> AxResult {
+                Ok(())
+            }
+
+            fn irq_request_shared(
+                _irq: IrqId,
+                _handler: BoxedIrqHandler,
+            ) -> AxResult<IrqHandle> {
+                Err(AxError::Unsupported)
+            }
+
+            fn irq_request_shared_disabled(
+                _irq: IrqId,
+                _handler: BoxedIrqHandler,
+            ) -> AxResult<IrqHandle> {
+                Err(AxError::Unsupported)
+            }
+
+            fn irq_request_percpu(
+                _irq: IrqId,
+                _cpus: IrqCpuMask,
+                _handler: ConcurrentBoxedIrqHandler,
+            ) -> AxResult<IrqHandle> {
+                Err(AxError::Unsupported)
+            }
+
+            fn irq_free(_handle: IrqHandle) -> AxResult {
+                Err(AxError::Unsupported)
+            }
+
+            fn irq_enable(_handle: IrqHandle) -> AxResult {
+                Err(AxError::Unsupported)
+            }
+
+            fn irq_disable(_handle: IrqHandle) -> AxResult {
+                Err(AxError::Unsupported)
+            }
+        }
+    }
+
+    #[test]
+    fn negotiates_k3_hs_mode_from_the_common_link_capability() {
+        let host = PowerModeCapabilities {
+            lanes_rx: 2,
+            lanes_tx: 2,
+            hs_gear_rx: 3,
+            hs_gear_tx: 3,
+        };
+        let device = PowerModeCapabilities {
+            lanes_rx: 1,
+            lanes_tx: 2,
+            hs_gear_rx: 4,
+            hs_gear_tx: 2,
+        };
+
+        assert_eq!(
+            negotiate_power_mode(host, device),
+            Ok(PowerMode {
+                gear_rx: 2,
+                gear_tx: 2,
+                lanes_rx: 1,
+                lanes_tx: 2,
+                hs_series: PA_HS_MODE_B,
+            })
+        );
+    }
 }

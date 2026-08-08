@@ -301,6 +301,12 @@ impl K3GmacCore {
             regs::dma_chan_rx_end(CHANNEL),
             self.rx_ring_dma_addr(0) as u32,
         );
+
+        // Drain posted base-address writes so the DMA engine observes the
+        // programmed rings before start_dma (k3-ufs does the same around its
+        // UTRD base registers).
+        let _ = self.mmio.read(regs::dma_chan_tx_base_hi(CHANNEL));
+        let _ = self.mmio.read(regs::dma_chan_rx_base_hi(CHANNEL));
     }
 
     fn program_mac_address(&self) {
@@ -370,6 +376,8 @@ impl K3GmacCore {
             if desc::tx_owned(self.tx_desc(self.tx_clean)) {
                 break;
             }
+            // DMA cleared OWN: order later descriptor field reads (Linux dma_rmb()).
+            desc::dma_rmb();
             if desc::tx_has_error(self.tx_desc(self.tx_clean)) {
                 log::warn!(
                     "k3-gmac: TX descriptor {} completed with error",
@@ -388,6 +396,8 @@ impl K3GmacCore {
             if desc::rx_owned(self.rx_desc(self.rx_next)) {
                 break;
             }
+            // DMA cleared OWN: order descriptor and payload reads (Linux dma_rmb()).
+            desc::dma_rmb();
 
             let len = if desc::rx_ready(self.rx_desc(self.rx_next))
                 && !desc::rx_has_error(self.rx_desc(self.rx_next))

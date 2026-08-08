@@ -72,7 +72,19 @@ pub fn prepare_tx(desc: &mut dma_desc, bus_addr: u64, len: usize, checksum: bool
 }
 
 pub fn dma_wmb() {
-    core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
+    // Linux RISC-V: dma_wmb() = wmb() = fence ow,ow (arch/riscv/include/asm/barrier.h),
+    // same helper as k3-ufs before ringing the UFS doorbell.
+    unsafe {
+        core::arch::asm!("fence ow, ow", options(nostack));
+    }
+}
+
+pub fn dma_rmb() {
+    // Linux RISC-V: dma_rmb() = rmb() = fence ir,ir; orders CPU reads of
+    // device-owned descriptors/data after the ownership check.
+    unsafe {
+        core::arch::asm!("fence ir, ir", options(nostack));
+    }
 }
 
 pub fn tx_owned(desc: &dma_desc) -> bool {

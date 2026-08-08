@@ -104,16 +104,27 @@ impl Mmio {
     }
 
     pub fn read(&self, offset: u32) -> u32 {
-        unsafe {
+        let value = unsafe {
             self.base
                 .as_ptr()
                 .add(offset as usize)
                 .cast::<u32>()
                 .read_volatile()
+        };
+        // Linux: __io_ar() = fence i,ir (arch/riscv/include/asm/mmio.h),
+        // same as k3-ufs read32().
+        unsafe {
+            core::arch::asm!("fence i, ir", options(nostack));
         }
+        value
     }
 
     pub fn write(&self, offset: u32, value: u32) {
+        // Linux: __io_bw() = fence w,o (arch/riscv/include/asm/mmio.h),
+        // same as k3-ufs write32().
+        unsafe {
+            core::arch::asm!("fence w, o", options(nostack));
+        }
         unsafe {
             self.base
                 .as_ptr()
