@@ -143,6 +143,7 @@ pub fn bind_console_to(proc: &Process) -> AxResult<()> {
         && let Some(entry) = SERIAL_REGISTRY.entries.get(index)
     {
         entry.backend.ensure_started()?;
+        #[cfg(feature = "k3_com260kit")]
         entry.backend.runtime.claim_console_output()?;
         return entry.tty.bind_to(proc);
     }
