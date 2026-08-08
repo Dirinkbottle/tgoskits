@@ -17,6 +17,7 @@ hv = ["mmu", "someboot/hv", "dep:ax-cpu"]
 mmu = ["someboot/mmu"]
 thead-mae = ["someboot/thead-mae"]
 tls = ["someboot/tls"]
+zicbom = ["someboot/zicbom"]
 uspace = ["mmu", "someboot/uspace"]
 
 [lints.rust]

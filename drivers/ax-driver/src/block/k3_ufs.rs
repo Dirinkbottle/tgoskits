@@ -433,7 +433,7 @@ impl K3UfsHost {
                     axklib::time::busy_wait(core::time::Duration::from_micros(20));
 
                     self.write32(UFS_ATOP_BASE + (0xC1 << 2), 0x00);
-                    self.write32(UFS_ATOP_BASE + (0xC2 << 2), 0x00);
+                    self.write32(UFS_ATOP_BASE + (0xC2 << 2), 0x40);
                     axklib::time::busy_wait(core::time::Duration::from_micros(20));
 
                     self.write32(UFS_PHY_MNG_BASE + UFS_MPHY_BKDR_CTRL, 0x0);

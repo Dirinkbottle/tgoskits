@@ -103,7 +103,10 @@ pub fn dma_coherent_after_mapping_update() {
 #[cfg(any(
     test,
     all(axtest, feature = "axtest"),
-    all(target_arch = "riscv64", feature = "thead-mae")
+    all(
+        target_arch = "riscv64",
+        any(feature = "thead-mae", feature = "zicbom")
+    )
 ))]
 pub(crate) fn cache_line_range(
     addr: usize,

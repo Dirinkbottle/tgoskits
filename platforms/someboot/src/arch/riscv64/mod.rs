@@ -433,11 +433,15 @@ impl ArchTrait for Arch {
     }
 
     fn dcache_range(op: DCacheOp, addr: usize, size: usize) {
-        #[cfg(feature = "thead-mae")]
+        #[cfg(feature = "zicbom")]
+        {
+            zicbom_dcache_range(op, addr, size);
+        }
+        #[cfg(all(not(feature = "zicbom"), feature = "thead-mae"))]
         {
             thead_dcache_range(op, addr, size);
         }
-        #[cfg(not(feature = "thead-mae"))]
+        #[cfg(not(any(feature = "zicbom", feature = "thead-mae")))]
         {
             let _ = (op, addr, size);
             riscv_dma_fence();
@@ -447,6 +451,71 @@ impl ArchTrait for Arch {
     unsafe fn efi_enter_kernel(_system_table: *const ::core::ffi::c_void) -> bool {
         false
     }
+}
+
+#[cfg(feature = "zicbom")]
+// The only current consumer is SpacemiT K3, whose DT advertises
+// `riscv,cbom-block-size = <64>`.
+const ZICBOM_CACHE_LINE_SIZE: usize = 64;
+
+#[cfg(feature = "zicbom")]
+#[inline(always)]
+unsafe fn cbo_inval(vaddr: usize) {
+    unsafe {
+        core::arch::asm!(
+            ".insn i 15, 2, x0, {vaddr}, 0",
+            vaddr = in(reg) vaddr,
+            options(nostack)
+        );
+    }
+}
+
+#[cfg(feature = "zicbom")]
+#[inline(always)]
+unsafe fn cbo_clean(vaddr: usize) {
+    unsafe {
+        core::arch::asm!(
+            ".insn i 15, 2, x0, {vaddr}, 1",
+            vaddr = in(reg) vaddr,
+            options(nostack)
+        );
+    }
+}
+
+#[cfg(feature = "zicbom")]
+#[inline(always)]
+unsafe fn cbo_flush(vaddr: usize) {
+    unsafe {
+        core::arch::asm!(
+            ".insn i 15, 2, x0, {vaddr}, 2",
+            vaddr = in(reg) vaddr,
+            options(nostack)
+        );
+    }
+}
+
+#[cfg(feature = "zicbom")]
+fn zicbom_dcache_range(op: DCacheOp, vaddr: usize, size: usize) {
+    let Some((mut line, end)) = crate::mem::cache_line_range(vaddr, size, ZICBOM_CACHE_LINE_SIZE)
+    else {
+        return;
+    };
+
+    while line < end {
+        unsafe {
+            match op {
+                DCacheOp::Clean => cbo_clean(line),
+                DCacheOp::Invalidate => cbo_inval(line),
+                DCacheOp::CleanInvalidate => cbo_flush(line),
+            }
+        }
+        let Some(next) = line.checked_add(ZICBOM_CACHE_LINE_SIZE) else {
+            break;
+        };
+        line = next;
+    }
+
+    riscv_dma_fence();
 }
 
 #[cfg(feature = "thead-mae")]

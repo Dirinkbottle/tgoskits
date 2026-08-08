@@ -17,6 +17,7 @@ hv = []
 mmu = []
 thead-mae = []
 tls = []
+zicbom = []
 uspace = ["mmu"]
 
 [lints.rust]
