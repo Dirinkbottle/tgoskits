@@ -80,6 +80,7 @@ rk3588-pwm = [
 ]
 k230-kpu = ["ax-hal/xuantie-c9xx", "dep:axklib", "dep:k230-kpu"]
 k3_com260kit = ["dep:k3_aiUabi", "dep:k3_aiScheduler"]
+claim_serial = []
 vsock = ["ax-runtime/vsock"]
 dynamic_debug = ["ipi"]
 user_log = []
