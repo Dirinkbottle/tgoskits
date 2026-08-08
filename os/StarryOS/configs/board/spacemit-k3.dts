@@ -7948,7 +7948,7 @@
 	chosen {
 		u-boot,version = "2022.10";
 		linux,initrd-end = <0x02 0xfbd836b3>;
-		bootargs = "plymouth.prefer-fbcon plymouth.ignore-serial-consoles splash loglevel=8 mtdparts=d420c000.spi:128K@0(bootinfo),512K@128K(fsbl),64K@640K(env),1M@704K(esos),384K@1728K(opensbi),-@2112K(uboot) rootfstype=ext4 root=PARTUUID=9a52aa56-2680-4a83-a910-1ba8aae8cc8a bootfs=PARTUUID=627eb504-1e10-44c4-9595-a98c9839767d boot_mode=nor earlycon=sbi console=ttyS0,115200 random.trust_bootloader=1 unaligned_scalar_speed=fast unaligned_vector_speed=fast";
+		bootargs = "plymouth.prefer-fbcon plymouth.ignore-serial-consoles splash loglevel=8 mtdparts=d420c000.spi:128K@0(bootinfo),512K@128K(fsbl),64K@640K(env),1M@704K(esos),384K@1728K(opensbi),-@2112K(uboot) rootfstype=ext4 root=PARTLABEL=rootfs bootfs=PARTUUID=627eb504-1e10-44c4-9595-a98c9839767d boot_mode=nor earlycon=sbi console=ttyS0,115200 random.trust_bootloader=1 unaligned_scalar_speed=fast unaligned_vector_speed=fast";
 		boot-hartid = <0x00>;
 		linux,initrd-start = <0x02 0xf9663000>;
 		stdout-path = "serial0:115200";
