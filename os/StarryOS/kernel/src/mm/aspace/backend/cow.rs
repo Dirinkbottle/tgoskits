@@ -43,14 +43,14 @@ impl FrameRefCnt {
 #[cfg(any(feature = "k3_com260kit", test))]
 struct CowPinnedFrame {
     paddr: PhysAddr,
-    page_size: PageSize,
+    page_size: usize,
     refcnt: Arc<SpinNoIrq<FrameRefCnt>>,
 }
 
 #[cfg(any(feature = "k3_com260kit", test))]
 impl CowPinnedFrame {
     #[cfg(feature = "k3_com260kit")]
-    fn pin(paddr: PhysAddr, page_size: PageSize) -> AxResult<Self> {
+    fn pin(paddr: PhysAddr, page_size: usize) -> AxResult<Self> {
         let refcnt = FRAME_TABLE
             .lock()
             .get_frame_ref(paddr)
@@ -60,7 +60,7 @@ impl CowPinnedFrame {
 
     fn pin_from_refcnt(
         paddr: PhysAddr,
-        page_size: PageSize,
+        page_size: usize,
         refcnt: Arc<SpinNoIrq<FrameRefCnt>>,
     ) -> AxResult<Self> {
         {
@@ -762,8 +762,7 @@ mod tests {
         let paddr = PhysAddr::from_usize(0x1000);
         let refcnt = Arc::new(SpinNoIrq::new(FrameRefCnt { count: 1 }));
 
-        let pinned =
-            CowPinnedFrame::pin_from_refcnt(paddr, PageSize::Size4K, refcnt.clone()).unwrap();
+        let pinned = CowPinnedFrame::pin_from_refcnt(paddr, PAGE_SIZE_4K, refcnt.clone()).unwrap();
 
         assert_eq!(refcnt.lock().count, 2);
         drop(pinned);
@@ -775,7 +774,7 @@ mod tests {
         let paddr = PhysAddr::from_usize(0x2000);
         let refcnt = Arc::new(SpinNoIrq::new(FrameRefCnt { count: u8::MAX - 1 }));
 
-        assert!(CowPinnedFrame::pin_from_refcnt(paddr, PageSize::Size4K, refcnt.clone()).is_err());
+        assert!(CowPinnedFrame::pin_from_refcnt(paddr, PAGE_SIZE_4K, refcnt.clone()).is_err());
         assert_eq!(refcnt.lock().count, u8::MAX - 1);
     }
 }

@@ -2,12 +2,8 @@
 
 use alloc::{collections::btree_map::BTreeMap, string::String};
 
-use ax_memory_addr::{MemoryAddr, PhysAddr, VirtAddr, VirtAddrRange};
-use ax_runtime::hal::{
-    cpu::asm::user_copy,
-    paging::{MappingFlags, PageSize},
-    percpu::this_cpu_id,
-};
+use ax_memory_addr::{MemoryAddr, PAGE_SIZE_4K, PhysAddr, VirtAddr, VirtAddrRange};
+use ax_runtime::hal::{cpu::asm::user_copy, paging::MappingFlags, percpu::this_cpu_id};
 use ax_task::{AxCpuMask, TaskInner, current, default_task_stack_size, spawn_task};
 use k3_ai_scheduler::K3SchedulerOps;
 
@@ -127,8 +123,8 @@ impl K3SchedulerOps for K3AiRunner {
             return Err(());
         }
 
-        let page_offset = (range_start - area.start()) / PageSize::Size4K as usize;
-        let required_pages = range_len / PageSize::Size4K as usize;
+        let page_offset = (range_start - area.start()) / PAGE_SIZE_4K;
+        let required_pages = range_len / PAGE_SIZE_4K;
         let backend = area.backend().clone();
 
         let (shared_pages, page_offset) = match backend {
@@ -185,7 +181,7 @@ impl K3SchedulerOps for K3AiRunner {
                     .map_linear(
                         virt_start,
                         PhysAddr::from_usize(paddr.as_usize()),
-                        PageSize::Size4K as usize,
+                        PAGE_SIZE_4K,
                         MappingFlags::READ | MappingFlags::WRITE,
                     )
                     .is_err()
@@ -196,7 +192,7 @@ impl K3SchedulerOps for K3AiRunner {
                     }
                     return Err(());
                 }
-                virt_start += PageSize::Size4K as usize;
+                virt_start += PAGE_SIZE_4K;
             }
             (kernel_base, kernel_base + range_offset, range_len)
         };

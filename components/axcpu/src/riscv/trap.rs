@@ -186,15 +186,15 @@ fn handle_trap(tf: &mut KernelTrapFrame<'_>) {
                     if current_vs == VS::Off {
                         warn!(
                             "vector extension not enabled, enabling VS = Initial @ {:#x}",
-                            tf.sepc
+                            tf.raw.0.sepc
                         );
                         unsafe { sstatus::set_vs(VS::Initial) };
                         // fall through to update tf.sstatus below
                     } else {
-                        let bt = tf.backtrace();
+                        let bt = tf.raw.0.backtrace();
                         panic!(
                             "IllegalInstruction @ {:#x}, stval={:#x}:\n{:#x?}\n{}",
-                            tf.sepc,
+                            tf.raw.0.sepc,
                             stval::read(),
                             tf,
                             bt.kind("trap")
@@ -203,10 +203,10 @@ fn handle_trap(tf: &mut KernelTrapFrame<'_>) {
                 }
                 #[cfg(not(feature = "vector"))]
                 {
-                    let bt = tf.backtrace();
+                    let bt = tf.raw.0.backtrace();
                     panic!(
                         "IllegalInstruction @ {:#x}, stval={:#x}:\n{:#x?}\n{}",
-                        tf.sepc,
+                        tf.raw.0.sepc,
                         stval::read(),
                         tf,
                         bt.kind("trap")

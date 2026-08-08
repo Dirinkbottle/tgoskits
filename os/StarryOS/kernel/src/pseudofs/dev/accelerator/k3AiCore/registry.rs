@@ -6,6 +6,7 @@
 use alloc::{collections::btree_map::BTreeMap, sync::Arc};
 
 use ax_kspin::SpinNoIrq;
+use ax_log::warn;
 use ax_memory_addr::VirtAddr;
 use ax_task::current;
 
@@ -107,12 +108,16 @@ pub(super) fn sync_kernel_alias_to_current_aspace(
         let mut aspace = aspace_arc.lock();
         let kspace = ax_mm::kernel_aspace();
         let kspace = kspace.lock();
-        aspace
+        if aspace
             .page_table_mut()
-            .cursor()
-            .copy_from(kspace.page_table(), start, kernel_map_size);
+            .clone_missing_root_entries_from(kspace.page_table(), start, kernel_map_size)
+            .is_err()
+        {
+            warn!("k3_airunner: sync kernel alias failed pid={pid}");
+            return false;
+        }
     }
-    crate::mm::flush_tlb_range_sync(start, kernel_map_size);
+    let _ = crate::mm::flush_tlb_range_sync(start, kernel_map_size);
     info!(
         "k3_airunner: sync kernel alias done pid={}, kernel_va={:#x}, map_size={:#x}",
         pid, kernel_va, kernel_map_size
