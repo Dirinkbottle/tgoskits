@@ -473,6 +473,14 @@ impl HubDevice {
             "Port {} raw status: 0x{:04x}, change: 0x{:04x}",
             port_id, status_raw, change_raw
         );
+        error!(
+            "[usb-hub] slot={} downstream port {}: connected={}, enabled={}, connection_change={}",
+            self.data.dev.slot_id(),
+            port_id,
+            status_raw & 0x0001 != 0,
+            status_raw & 0x0002 != 0,
+            change_raw & 0x0001 != 0,
+        );
 
         Ok((
             self.parse_port_status(status_raw),

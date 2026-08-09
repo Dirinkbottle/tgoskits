@@ -17,6 +17,8 @@ use crate::{PciIrqRequirement, binding_info_from_pci};
 mod dwc;
 #[cfg(feature = "rockchip-ehci")]
 mod ehci;
+#[cfg(feature = "k3-usb")]
+mod k3com260kit;
 #[cfg(feature = "sg2002-dwc2")]
 mod sg2002_dwc2;
 #[cfg(feature = "xhci-mmio")]
