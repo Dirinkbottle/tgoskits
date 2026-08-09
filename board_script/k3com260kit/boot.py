@@ -18,7 +18,7 @@ from pathlib import Path
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_KERNEL = Path("target/riscv64gc-unknown-linux-musl/release/starryos.bin")
+DEFAULT_KERNEL = Path("target/riscv64gc-unknown-none-elf/release/starryos.bin")
 DEFAULT_DTB = Path("os/StarryOS/configs/board/spacemit-k3-com260-ifx.dtb")
 
 KERNEL_LOAD_ADDR = "0x140000000"

@@ -55,7 +55,9 @@ fn probe(probe: ProbeFdt<'_>) -> Result<(), OnProbeError> {
     let raw = PxaUart::new(mmio_base, clock_freq);
     let serial = erase_uart(raw);
     let base = serial.hardware.register_base;
-    let device_info = serial_device_info(&info, &base_reg);
+    let mut device_info = serial_device_info(&info, &base_reg);
+    // K3 currently has no APLIC binding in StarryOS; use runtime polling.
+    device_info.irq = None;
 
     info!("K3 PXA UART serial@{base:#x} registered successfully");
     plat_dev.register(PlatformSerialDevice::new(

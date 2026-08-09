@@ -3,6 +3,7 @@ features = [
   "ax-driver/serial",
   "ax-driver/k3-pxa-uart",
   "ax-driver/k3-ufs",
+  "ax-driver/k3-usb",
   "starry-kernel/vector",
 ]
 log = "Info"

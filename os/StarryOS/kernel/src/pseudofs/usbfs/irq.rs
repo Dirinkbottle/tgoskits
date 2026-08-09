@@ -235,7 +235,7 @@ fn usbfs_event_handler(slot_index: usize) {
         match slot.handler.handle() {
             crab_usb::Event::PortChange { port } => {
                 port_events += 1;
-                trace!(
+                error!(
                     "usbfs: IRQ {} bus {} host {:?}: port change on port {}",
                     irq_name, slot.bus_num, slot.device_id, port
                 );

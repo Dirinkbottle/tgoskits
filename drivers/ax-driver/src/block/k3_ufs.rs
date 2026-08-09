@@ -15,7 +15,7 @@ use rdif_block::{
 };
 use rdrive::{probe::OnProbeError, register::*};
 
-use crate::{block::ProbeFdtBlock, mmio::iomap};
+use crate::{block::PlatformDeviceBlock, mmio::iomap};
 
 /// K3 UFS vendor registers
 const UFS_SYS1CLK_1US: usize = 0xC0;
@@ -164,32 +164,6 @@ const DEVICE_FATAL_ERROR: u32 = 0x800;
 const UTP_ERROR: u32 = 0x1000;
 const CONTROLLER_FATAL_ERROR: u32 = 0x10000;
 
-/// Decodes the K3 UFS FDT interrupt specifier into a Linux-style global IRQ.
-///
-/// The interrupt parent decides the specifier width through `#interrupt-cells`.
-/// Linux's OF parser first reads that width from the parent before interpreting
-/// the cells. K3 boards currently use the common one-cell, two-cell, or GIC
-/// three-cell forms:
-/// - one cell: already a global IRQ number;
-/// - two cells: `<irq, flags>`;
-/// - three cells: GIC `<kind, irq, flags>`, where SPI starts at global IRQ 32
-///   and PPI starts at global IRQ 16.
-///
-/// 参考: /home/inkbottle/桌面/linux-5.4.29/drivers/of/irq.c:108-127
-/// 参考: /home/inkbottle/桌面/linux-5.4.29/Documentation/devicetree/booting-without-of.txt:1300-1313
-fn decode_fdt_irq(interrupts: &[rdrive::probe::fdt::InterruptRef]) -> Option<usize> {
-    let interrupt = interrupts.first()?;
-    match interrupt.specifier.as_slice() {
-        [irq] => Some(*irq as usize),
-        [irq, _flags] => Some(*irq as usize),
-        [kind, irq, _flags] => match *kind {
-            0 => Some(*irq as usize + 32),
-            1 => Some(*irq as usize + 16),
-            _ => Some(*irq as usize),
-        },
-        _ => None,
-    }
-}
 const SYSTEM_BUS_FATAL_ERROR: u32 = 0x20000;
 const CRYPTO_ENGINE_FATAL_ERROR: u32 = 0x40000;
 const UIC_COMMAND_COMPL: u32 = 1 << 10;
@@ -2294,7 +2268,7 @@ impl HardwareQueue for K3UfsQueue {
     }
 
     fn register_retry_after(&self) -> Option<Duration> {
-        Some(Self::SYNC_POLL_INTERVAL)
+        register_retry_after_for_pending(self.pending.len())
     }
 
     fn advance_register_retry(&mut self, sink: &mut dyn CompletionSink) -> Result<(), BlkError> {
@@ -2312,6 +2286,10 @@ impl HardwareQueue for K3UfsQueue {
         }
         Ok(())
     }
+}
+
+fn register_retry_after_for_pending(pending_len: usize) -> Option<Duration> {
+    (pending_len != 0).then_some(K3UfsQueue::SYNC_POLL_INTERVAL)
 }
 
 fn probe(probe: ProbeFdt<'_>) -> Result<(), OnProbeError> {
@@ -2332,11 +2310,6 @@ fn probe(probe: ProbeFdt<'_>) -> Result<(), OnProbeError> {
         "[k3-ufs] MMIO: base=0x{:x}, size=0x{:x}",
         base_reg.address, mmio_size
     );
-
-    let irq_num = decode_fdt_irq(&info.interrupts());
-    if let Some(irq) = irq_num {
-        info!("[k3-ufs] IRQ: {}", irq);
-    }
 
     let mmio_base = iomap(base_reg.address as usize, mmio_size)?;
 
@@ -2403,7 +2376,8 @@ fn probe(probe: ProbeFdt<'_>) -> Result<(), OnProbeError> {
     // controller is polled, so the controller exposes one queue that executes
     // SCSI commands synchronously from the runtime maintenance task.
     let controller = K3UfsController::new(host, num_blocks, block_size as usize);
-    probe.register_block(controller)?;
+    // Do not publish the FDT IRQ until StarryOS has an APLIC provider.
+    probe.into_platform_device().register_block(controller);
     info!("[k3-ufs] Block device registered");
     info!(
         "[k3-ufs] *** DEVICE READY: SCSI LUN 0x{:x}, {} blocks x {} bytes ***",
@@ -2423,6 +2397,11 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn idle_polled_queue_does_not_start_transition_timeout() {
+        assert_eq!(register_retry_after_for_pending(0), None);
+    }
 
     #[cfg(not(feature = "pci"))]
     struct KlibImpl;

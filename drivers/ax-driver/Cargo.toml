@@ -51,6 +51,7 @@ usb = ["dep:crab-usb"]
 rockchip-dwc-xhci = ["usb", "rockchip-soc", "rockchip-pm"]
 rockchip-ehci = ["usb", "rockchip-soc", "rockchip-pm"]
 sg2002-dwc2 = ["usb", "dep:sg200x-bsp"]
+k3-usb = ["usb"]
 xhci-mmio = ["usb"]
 xhci-pci = ["usb", "pci"]
 serial = [
