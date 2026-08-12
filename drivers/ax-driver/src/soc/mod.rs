@@ -14,6 +14,8 @@
 
 #[cfg(feature = "pinctrl")]
 mod fixed_regulator;
+#[cfg(feature = "k3-pinctrl")]
+pub(crate) mod k3;
 #[cfg(feature = "rockchip-soc")]
 pub(crate) mod rockchip;
 #[cfg(feature = "rk3588-cpufreq")]

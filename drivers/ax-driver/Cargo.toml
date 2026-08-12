@@ -33,6 +33,7 @@ virtio-input = ["input", "virtio", "pci"]
 virtio-socket = ["vsock", "virtio", "pci"]
 
 ls2k1000-gmac = ["net", "dep:ax-kspin"]
+k3-pinctrl = ["pinctrl"]
 ahci = ["block", "pci"]
 ls2k1000-ahci = ["block"]
 nvme = ["block", "pci", "dep:nvme-driver"]

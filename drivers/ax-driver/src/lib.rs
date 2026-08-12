@@ -83,6 +83,7 @@ pub mod rknpu;
 #[cfg(feature = "serial")]
 pub mod serial;
 #[cfg(any(
+    feature = "k3-pinctrl",
     feature = "rockchip-soc",
     feature = "rockchip-pm",
     feature = "starfive-soc"
