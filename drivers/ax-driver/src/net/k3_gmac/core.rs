@@ -1,14 +1,9 @@
 //! DWMAC5 核心逻辑：DMA 初始化、TX/RX 收发、中断处理。
-//!
-//! 修复点（相对旧实现 f7c4081be）：
-//! - `enable_mac` 不再写死千兆 + 强制全双工。拆为 `init_mac_config`（写 CORE_INIT，
-//!   不碰速率位）+ `apply_link_speed`（按协商/设备树静态速率写 PS|FES|DM）。
-//! - 速率/双工由 `K3GmacConfig::speed_mbps` + `full_duplex` 决定，首版静态配置。
 
 use alloc::collections::VecDeque;
 use core::ptr::NonNull;
 
-use dma_api::{CoherentArray, DeviceDma};
+use dma_api::{ContiguousArray, DeviceDma, DmaDirection, DmaOp};
 use rd_net::{DmaBuffer, Event, NetError};
 
 use super::{desc, desc::DmaDesc, mdio::Mdio, regs};
@@ -21,9 +16,15 @@ pub const QUEUE_SIZE: usize = 64;
 pub const BUFFER_SIZE: usize = 2048;
 /// 描述符环 DMA 对齐。
 pub const DMA_ALIGN: usize = 0x1000;
-/// 设备 DMA 掩码（64 位）。
+/// 设备 DMA 掩码：64 位。
+///
+/// K3 DWMAC 5.10a 的 hw_feature1 bits[15:14]=1 → addr64=40 位寻址。K3 全部
+/// DRAM 都在 4GB 以上（PA 从 0x1_0200_0000 起），必须启用 EAME（Enhanced
+/// Address Mode Enable）才能让 DMA 识别描述符 des1 的高 32 位地址。
+/// 见 init_dma_bus() 写 DMA_SYS_BUS_EAME。
 pub const DMA_MASK: u64 = u64::MAX;
 
+/// DMA 通道 0（单队列实现，仅使用 channel/queue 0）。
 const CHANNEL: u32 = 0;
 /// DMA 软复位轮询超时。K3 的 DWMAC5 DMA 复位实测可能需要数百毫秒
 /// （U-Boot eqos 驱动 swr_wait=500ms）。每次迭代约 1µs（50 次 spin_loop），
@@ -55,30 +56,32 @@ impl K3GmacConfig {
     }
 }
 
-#[derive(Clone, Copy)]
-struct SubmittedRx {
-    bus_addr: u64,
-    len: usize,
-}
-
 /// K3 GMAC 核心状态：持有 MMIO、TX/RX 描述符环与索引、缓冲追踪、中断状态。
 pub struct K3GmacCore {
     mmio: regs::Mmio,
-    tx_ring: CoherentArray<DmaDesc>,
-    rx_ring: CoherentArray<DmaDesc>,
+    tx_ring: ContiguousArray<DmaDesc>,
+    rx_ring: ContiguousArray<DmaDesc>,
     mac: [u8; 6],
     checksum_offload: bool,
     tx_fifo_depth: u32,
     rx_fifo_depth: u32,
     speed_mbps: u32,
     full_duplex: bool,
+    /// TX 环：下一个待填写的描述符索引（生产者游标）。
     tx_next: usize,
+    /// TX 环：下一个待回收的描述符索引（消费者游标）。
     tx_clean: usize,
+    /// RX 环：下一个待预填的描述符索引（生产者游标）。
     rx_next: usize,
+    /// RX 环：下一个待预填的描述符索引（与 rx_next 同步推进，保留语义对称）。
     rx_fill: usize,
+    /// TX in-flight 缓冲追踪：`Some(bus_addr)` 表示该槽位已提交 DMA、尚未回收。
     tx_buffers: [Option<u64>; QUEUE_SIZE],
-    rx_buffers: [Option<SubmittedRx>; QUEUE_SIZE],
+    /// RX in-flight 缓冲追踪：`Some(bus_addr)` 表示该槽位已预填 DMA、尚未回收。
+    rx_buffers: [Option<u64>; QUEUE_SIZE],
+    /// TX 已完成缓冲队列（由 reclaim_tx 推入，由上层 reclaim_tx_buffer 弹出）。
     tx_done: VecDeque<u64>,
+    /// RX 已完成缓冲队列：(bus_addr, len)，由 reclaim_rx 推入，由上层弹出。
     rx_done: VecDeque<(u64, usize)>,
     irq_enabled: bool,
 }
@@ -89,11 +92,22 @@ unsafe impl Send for K3GmacCore {}
 
 impl K3GmacCore {
     pub fn new(base: NonNull<u8>, dma: &DeviceDma, config: K3GmacConfig) -> Result<Self, NetError> {
+        // 用 ContiguousArray（不做 make_uncached/protect 页表重映射），对照 UFS 驱动。
+        // CoherentArray 会调 protect() 重映射页表为 UNCACHED，但 K3 RISC-V PTE 无 NC 位，
+        // protect() 可能让 TLB/IOMMU 状态不同步，DMA 引擎读不到描述符。
         let tx_ring = dma
-            .coherent_array_zero_with_align::<DmaDesc>(QUEUE_SIZE, DMA_ALIGN)
+            .contiguous_array_zero_with_align::<DmaDesc>(
+                QUEUE_SIZE,
+                DMA_ALIGN,
+                DmaDirection::Bidirectional,
+            )
             .map_err(NetError::from)?;
         let rx_ring = dma
-            .coherent_array_zero_with_align::<DmaDesc>(QUEUE_SIZE, DMA_ALIGN)
+            .contiguous_array_zero_with_align::<DmaDesc>(
+                QUEUE_SIZE,
+                DMA_ALIGN,
+                DmaDirection::Bidirectional,
+            )
             .map_err(NetError::from)?;
         let (tx_fifo_depth, rx_fifo_depth) = config.queue_fifo_depths();
 
@@ -192,12 +206,15 @@ impl K3GmacCore {
         desc::prepare_tx(self.tx_desc_mut(index), buffer.bus_addr, len, checksum);
         self.tx_buffers[index] = Some(buffer.bus_addr);
         self.tx_next = next(index);
-        desc::dma_wmb();
-        // 写尾指针触发 DMA 拉取新描述符
-        self.mmio.write(
-            regs::dma_chan_tx_end(CHANNEL),
-            self.tx_ring_dma_addr(self.tx_next) as u32,
-        );
+        // K3 非一致性：clean 描述符 cache line，让 DMA 看到 OWN 位和地址
+        self.flush_tx_desc(index);
+        // 写尾指针触发 DMA 拉取新描述符（doorbell）
+        let tail = self.tx_ring_dma_addr(self.tx_next) as u32;
+        self.mmio.write(regs::dma_chan_tx_end(CHANNEL), tail);
+        // 额外 doorbell：重写 ST 位（和 RX 的 SR doorbell 对称）。
+        // 部分 DWMAC 实现在 TBU 后需要 ST 重写才能恢复 fetch engine。
+        self.mmio
+            .update(regs::dma_chan_tx_control(CHANNEL), 0, regs::DMA_CONTROL_ST);
         Ok(())
     }
 
@@ -215,16 +232,17 @@ impl K3GmacCore {
         }
 
         desc::prepare_rx(self.rx_desc_mut(index), buffer.bus_addr);
-        self.rx_buffers[index] = Some(SubmittedRx {
-            bus_addr: buffer.bus_addr,
-            len: buffer.len,
-        });
+        self.rx_buffers[index] = Some(buffer.bus_addr);
         self.rx_fill = next(index);
-        desc::dma_wmb();
+        // K3 非一致性：clean 描述符 cache line，让 DMA 看到 OWN|BUF1V|IOC
+        self.flush_rx_desc(index);
         self.mmio.write(
             regs::dma_chan_rx_end(CHANNEL),
             self.rx_ring_dma_addr(self.rx_fill) as u32,
         );
+        // 重新置 SR（doorbell）：同 submit_tx 的 ST 重写。
+        self.mmio
+            .update(regs::dma_chan_rx_control(CHANNEL), 0, regs::DMA_CONTROL_SR);
         Ok(())
     }
 
@@ -236,22 +254,100 @@ impl K3GmacCore {
     // --- 硬件初始化 ---
 
     fn init_hardware(&mut self) -> Result<(), NetError> {
+        // DMA 软复位（必须）：对照 U-Boot eqos_start + Linux stmmac_hw_setup，
+        // 两者都在最开头做 DMA SWR（DMA_BUS_MODE bit0，写 1 后硬件自清）。
+        // 软复位不只清寄存器，更重启 DMA 内部描述符 fetch 状态机——
+        // 不做这步，U-Boot 残留状态会导致 TX DMA 引擎 cur_tx 不前进
+        //（即使 ST=1、tail ptr 正确，fetch engine 卡在非 idle 状态）。
+        // 失败时仅 log warn 继续执行（部分平台 SWR 自清较慢但后续仍可用）。
+        if let Err(_) = self.reset_dma() {
+            log::warn!("k3-gmac: DMA soft reset failed; continuing with U-Boot residual state");
+        }
         self.stop_dma();
-        // 尝试 DMA 软复位。K3 实测 SFT_RESET 位常卡在 1 不清零（U-Boot 初始化后
-        // 的残留态），但 DMA 引擎在 U-Boot 残留配置下已就绪，复位失败可继续。
-        // 见 reset_dma() 的超时 warn 日志。
-        let _ = self.reset_dma();
         self.program_mac_address();
         self.log_hw_features();
         self.init_dma_bus();
         self.init_mtl();
         self.init_rings();
-        self.start_dma();
-        // 先写 CORE_INIT（不含速率位），再按静态速率应用 PS|FES|DM 并使能 TE/RE
+        // 顺序对照 Linux stmmac_hw_setup：先配 MAC（core_init + 地址 + 速率 + TE/RE），
+        // 最后才 start_dma（ST/SR）。避免 DMA 在 MAC 未就绪时尝试收发。
         self.init_mac_config();
-        self.apply_link_speed(self.speed_mbps, self.full_duplex);
-        self.log_phy_probe();
+        let (speed, duplex) = self.init_phy_and_get_link();
+        self.apply_link_speed(speed, duplex);
+        self.start_dma();
+        self.log_post_init_snapshot();
         Ok(())
+    }
+
+    /// 执行完整 PHY bring-up（genphy 路径），返回协商到的 (speed, duplex)。
+    /// 协商成功用协商结果；PHY 探测失败/超时则回退到 K3GmacConfig 的静态速率。
+    fn init_phy_and_get_link(&self) -> (u32, bool) {
+        let mdio = Mdio::new(&self.mmio, regs::STMMAC_CSR_250_300M);
+        let phy_addr = mdio.find_phy();
+        let Some(addr) = phy_addr else {
+            log::warn!("k3-gmac: no PHY detected; using static speed config");
+            return (self.speed_mbps, self.full_duplex);
+        };
+        log::info!("k3-gmac: detected Clause 22 PHY at address {addr}");
+
+        match mdio.init_phy(addr, self.speed_mbps) {
+            Some(state) if state.up => (state.speed_mbps, state.full_duplex),
+            Some(state) => {
+                // PHY 探测到但 link 未 up（自协商超时或对端没插网线）
+                log::warn!(
+                    "k3-gmac: PHY{addr} probed but link DOWN (aneg_done={} speed={}Mbps); using \
+                     negotiated speed anyway",
+                    state.aneg_complete,
+                    state.speed_mbps
+                );
+                (state.speed_mbps, state.full_duplex)
+            }
+            None => {
+                log::warn!("k3-gmac: PHY{addr} init_phy failed; using static config");
+                (self.speed_mbps, self.full_duplex)
+            }
+        }
+    }
+
+    /// 启动后关键寄存器快照（debug 级别）：确认 MAC/DMA/MTL 实际写入值。
+    fn log_post_init_snapshot(&self) {
+        let gmac_config = self.mmio.read(regs::GMAC_CONFIG);
+        let pkt_filter = self.mmio.read(regs::GMAC_PACKET_FILTER);
+        let sys_bus = self.mmio.read(regs::DMA_SYS_BUS_MODE);
+        let tx_ctrl = self.mmio.read(regs::dma_chan_tx_control(CHANNEL));
+        let rx_ctrl = self.mmio.read(regs::dma_chan_rx_control(CHANNEL));
+        let dma_status = self.mmio.read(regs::dma_chan_status(CHANNEL));
+        let tx_base = self.mmio.read(regs::dma_chan_tx_base(CHANNEL));
+        let tx_base_hi = self.mmio.read(regs::dma_chan_tx_base_hi(CHANNEL));
+        let rx_base = self.mmio.read(regs::dma_chan_rx_base(CHANNEL));
+        let rx_base_hi = self.mmio.read(regs::dma_chan_rx_base_hi(CHANNEL));
+        let tx_ring_len = self.mmio.read(regs::dma_chan_tx_ring_len(CHANNEL));
+        let rx_ring_len = self.mmio.read(regs::dma_chan_rx_ring_len(CHANNEL));
+        let tx_end = self.mmio.read(regs::dma_chan_tx_end(CHANNEL));
+        let rx_end = self.mmio.read(regs::dma_chan_rx_end(CHANNEL));
+        // GMAC_CONFIG 位：RE=bit0, TE=bit1, DM=bit13, FES=bit14, PS=bit15
+        // DMA 控制：ST=bit0(TX), SR=bit0(RX), OSP=bit4
+        // SYS_BUS_MODE：EAME=bit11（>32 位寻址，K3 全部 DRAM 在 4GB 以上必须启用）
+        log::debug!(
+            "k3-gmac: post-init: GMAC_CONFIG={gmac_config:#010x} (RE={} TE={} DM={} FES={} PS={}) \
+             | PKT_FILTER={pkt_filter:#010x} | SYS_BUS_MODE={sys_bus:#010x} (EAME={}) | \
+             TX_CTRL={tx_ctrl:#010x} (ST={} OSP={}) RX_CTRL={rx_ctrl:#010x} (SR={} RBSZ={}) | \
+             DMA_STATUS={dma_status:#010x} | TX base={tx_base:#010x} hi={tx_base_hi:#x} \
+             len={tx_ring_len} end={tx_end:#010x} | RX base={rx_base:#010x} hi={rx_base_hi:#x} \
+             len={rx_ring_len} end={rx_end:#010x} | TX ring={:#x} RX ring={:#x}",
+            gmac_config & regs::GMAC_CONFIG_RE != 0,
+            gmac_config & regs::GMAC_CONFIG_TE != 0,
+            gmac_config & regs::GMAC_CONFIG_DM != 0,
+            gmac_config & regs::GMAC_CONFIG_FES != 0,
+            gmac_config & regs::GMAC_CONFIG_PS != 0,
+            sys_bus & regs::DMA_SYS_BUS_EAME != 0,
+            tx_ctrl & regs::DMA_CONTROL_ST != 0,
+            tx_ctrl & regs::DMA_CONTROL_OSP != 0,
+            rx_ctrl & regs::DMA_CONTROL_SR != 0,
+            (rx_ctrl & regs::DMA_RBSZ_MASK) >> regs::DMA_RBSZ_SHIFT,
+            self.tx_ring.dma_addr().as_u64(),
+            self.rx_ring.dma_addr().as_u64(),
+        );
     }
 
     fn reset_dma(&self) -> Result<(), NetError> {
@@ -261,7 +357,7 @@ impl K3GmacCore {
         // 总超时 ~RESET_TIMEOUT µs（匹配 Linux readl_poll_timeout 上限）。
         for i in 0..RESET_TIMEOUT {
             if (self.mmio.read(regs::DMA_BUS_MODE) & regs::DMA_BUS_MODE_SFT_RESET) == 0 {
-                log::debug!("k3-gmac: DMA reset completed after {} iterations", i + 1);
+                log::info!("k3-gmac: DMA soft reset completed after {} iterations", i + 1);
                 return Ok(());
             }
             // 每次迭代延时约 1µs（50 次 spin_loop ≈ 1µs @ ~20ns/iter）
@@ -269,41 +365,50 @@ impl K3GmacCore {
                 core::hint::spin_loop();
             }
         }
-        log::warn!(
-            "k3-gmac: DMA soft reset timed out (SFT_RESET stuck); continuing in U-Boot residual \
-             state"
-        );
-        Err(other("k3-gmac DMA reset timed out"))
+        Err(other("k3-gmac DMA soft reset timed out (SFT_RESET stuck)"))
     }
 
     fn init_dma_bus(&self) {
-        self.mmio.update(
+        // 用绝对写（writel）而非 read-modify-write，消除 U-Boot 残留位干扰。
+        // 对照 U-Boot eqos_start：所有 DMA 寄存器都用 writel 写完整值。
+        // DMA_SYS_BUS_MODE：EAME + BLEN4/8/16 + RD_OSR=2（与 U-Boot 完全一致）
+        self.mmio.write(
             regs::DMA_SYS_BUS_MODE,
-            0,
-            regs::DMA_SYS_BUS_FB | regs::DMA_SYS_BUS_MB | regs::DMA_SYS_BUS_AAL,
+            regs::DMA_SYS_BUS_EAME
+                | regs::DMA_AXI_BLEN16
+                | regs::DMA_AXI_BLEN8
+                | (2u32 << regs::DMA_AXI_RD_OSR_LMT_SHIFT),
         );
-        self.mmio
-            .write(regs::DMA_AXI_BUS_MODE, regs::DMA_AXI_BURST_LEN_DEFAULT);
+        // DMA_CHAN_CONTROL：PBLX8 + DSL=6（64 字节描述符步长）
+        let dsl = regs::DMA_CHAN_CONTROL_DSL_DEFAULT << regs::DMA_CHAN_CONTROL_DSL_SHIFT;
+        self.mmio.write(
+            regs::dma_chan_control(CHANNEL),
+            regs::DMA_CHAN_CONTROL_PBLX8 | dsl,
+        );
         self.mmio.write(
             regs::dma_chan_intr_ena(CHANNEL),
             regs::DMA_CHAN_INTR_DEFAULT_MASK,
         );
-        self.mmio
-            .update(regs::dma_chan_tx_control(CHANNEL), 0, regs::DMA_CONTROL_OSP);
-        self.mmio.update(
+        // TX_CONTROL：OSP + PBL=8（与 RX 一致，PBLX8 让有效突发=64 拍）
+        let pbl = 8u32 << regs::DMA_BUS_MODE_PBL_SHIFT;
+        self.mmio.write(
+            regs::dma_chan_tx_control(CHANNEL),
+            regs::DMA_CONTROL_OSP | pbl,
+        );
+        // RX_CONTROL：RBSZ=2048 + RXPBL=8
+        self.mmio.write(
             regs::dma_chan_rx_control(CHANNEL),
-            regs::DMA_RBSZ_MASK,
-            desc::rx_buf_size_bits(BUFFER_SIZE),
+            desc::rx_buf_size_bits(BUFFER_SIZE) | (8u32 << regs::DMA_BUS_MODE_PBL_SHIFT),
         );
     }
 
     fn init_mtl(&self) {
-        // TX 队列：Store-and-Forward + 队列使能 + FIFO 大小
+        // TX 队列：Store-and-Forward + 队列使能 + FIFO 大小。
+        // 用绝对写（清掉所有残留位，特别是 BIT0=FTQ=Flush TX Queue——
+        // 如果 FTQ 残留为 1，TX FIFO 被持续 flush，DMA 永远无法发包）。
         let txq_size = desc::mtl_fifo_words(self.tx_fifo_depth);
         let tx_op = regs::mtl_chan_tx_op_mode(CHANNEL);
-        let tx_value = (self.mmio.read(tx_op)
-            & !(regs::MTL_OP_MODE_TXQEN_MASK | regs::MTL_OP_MODE_TQS_MASK))
-            | regs::MTL_OP_MODE_TSF
+        let tx_value = regs::MTL_OP_MODE_TSF
             | regs::MTL_OP_MODE_TXQEN
             | (txq_size << regs::MTL_OP_MODE_TQS_SHIFT);
         self.mmio.write(tx_op, tx_value);
@@ -335,30 +440,29 @@ impl K3GmacCore {
             desc::clear(self.tx_desc_mut(index));
             desc::clear(self.rx_desc_mut(index));
         }
+        // K3 非一致性：清零整个描述符环后 flush，确保 DMA 看到全零的初始状态
+        let ring_bytes = QUEUE_SIZE * core::mem::size_of::<DmaDesc>();
+        axklib::dma::op().flush(self.tx_ring.as_ptr().cast(), ring_bytes);
+        axklib::dma::op().flush(self.rx_ring.as_ptr().cast(), ring_bytes);
 
-        // TX 环基址 + 长度 + 尾指针
+        // TX 环基址 + 长度。
+        // 不写初始 TX 尾指针——对照 U-Boot eqos_start：tail pointer 只在
+        // submit_tx 时写。写 base=cur 会让引擎处于 TBU 状态，部分实现
+        // 在 TBU→恢复时需要额外 doorbell（见 submit_tx 的 ST 重写）。
         let (tx_base, tx_base_hi) = desc::split_addr(self.tx_ring.dma_addr().as_u64());
         self.mmio
             .write(regs::dma_chan_tx_base_hi(CHANNEL), tx_base_hi);
         self.mmio.write(regs::dma_chan_tx_base(CHANNEL), tx_base);
         self.mmio
             .write(regs::dma_chan_tx_ring_len(CHANNEL), (QUEUE_SIZE - 1) as u32);
-        self.mmio.write(
-            regs::dma_chan_tx_end(CHANNEL),
-            self.tx_ring_dma_addr(0) as u32,
-        );
 
-        // RX 环基址 + 长度 + 尾指针
+        // RX 环基址 + 长度（尾指针在 start_dma 后由 prefill 推进）
         let (rx_base, rx_base_hi) = desc::split_addr(self.rx_ring.dma_addr().as_u64());
         self.mmio
             .write(regs::dma_chan_rx_base_hi(CHANNEL), rx_base_hi);
         self.mmio.write(regs::dma_chan_rx_base(CHANNEL), rx_base);
         self.mmio
             .write(regs::dma_chan_rx_ring_len(CHANNEL), (QUEUE_SIZE - 1) as u32);
-        self.mmio.write(
-            regs::dma_chan_rx_end(CHANNEL),
-            self.rx_ring_dma_addr(0) as u32,
-        );
     }
 
     fn program_mac_address(&self) {
@@ -372,7 +476,7 @@ impl K3GmacCore {
     }
 
     fn log_hw_features(&self) {
-        log::debug!(
+        log::info!(
             "k3-gmac: version={:#x} hw_feature0={:#x} hw_feature1={:#x} hw_feature2={:#x} \
              hw_feature3={:#x}",
             self.mmio.read(regs::GMAC_VERSION),
@@ -381,16 +485,6 @@ impl K3GmacCore {
             self.mmio.read(regs::GMAC_HW_FEATURE2),
             self.mmio.read(regs::GMAC_HW_FEATURE3)
         );
-    }
-
-    fn log_phy_probe(&self) {
-        // CSR 时钟分频：K3 的 stmmaceth 时钟在 250-300MHz 范围，对应 CR=5
-        // （来源：U-Boot eqos_spacemit_k3_config / Linux stmmac CR_250_300）
-        let mdio = Mdio::new(&self.mmio, regs::STMMAC_CSR_250_300M);
-        match mdio.find_phy() {
-            Some(addr) => log::info!("k3-gmac: detected Clause 22 PHY at address {addr}"),
-            None => log::warn!("k3-gmac: no Clause 22 PHY detected during probe"),
-        }
     }
 
     /// 写 GMAC_CONFIG 的核心初始化位（JD|PS|BE|DCRS|JE + IPC + 包过滤），
@@ -407,6 +501,10 @@ impl K3GmacCore {
             regs::GMAC_PACKET_FILTER,
             regs::GMAC_PACKET_FILTER_PR | regs::GMAC_PACKET_FILTER_PM,
         );
+        // MAC RX Queue 0 Enable (DCB 模式) ——对照 U-Boot eqos_start + Linux dwmac4_rx_queue_enable。
+        // 不写此寄存器则 MAC 不将收到的包路由到 DMA channel 0。
+        self.mmio
+            .update(regs::GMAC_RXQ_CTRL0, 0b11, regs::GMAC_RXQ0EN_DCB);
     }
 
     /// 按速率/双工写 PS|FES|DM，并使能 TE/RE。
@@ -457,8 +555,12 @@ impl K3GmacCore {
             .update(regs::dma_chan_tx_control(CHANNEL), 0, regs::DMA_CONTROL_ST);
     }
 
+    /// 回收已完成的 TX 描述符：DMA 清 OWN 后，将缓冲地址推入 `tx_done`。
+    /// 由 `handle_irq`（IRQ 上下文）和 `submit_tx`/`reclaim_tx_buffer`（数据面）调用。
     fn reclaim_tx(&mut self) {
         while let Some(bus_addr) = self.tx_buffers[self.tx_clean] {
+            // K3 非一致性：读 DMA 回写状态前 invalidate，丢弃 CPU 侧脏 cache
+            self.inval_tx_desc(self.tx_clean);
             if desc::tx_owned(self.tx_desc(self.tx_clean)) {
                 break;
             }
@@ -475,18 +577,21 @@ impl K3GmacCore {
         }
     }
 
+    /// 回收已完成的 RX 描述符：DMA 填入数据并清 OWN 后，将 (bus_addr, len) 推入 `rx_done`。
+    /// 由 `handle_irq`（IRQ 上下文）和 `reclaim_rx_buffer`（数据面）调用。
     fn reclaim_rx(&mut self) {
         while let Some(submitted) = self.rx_buffers[self.rx_next] {
+            // K3 非一致性：读 DMA 回写状态前 invalidate，丢弃 CPU 侧脏 cache
+            self.inval_rx_desc(self.rx_next);
             if desc::rx_owned(self.rx_desc(self.rx_next)) {
                 break;
             }
 
-            let len = if desc::rx_ready(self.rx_desc(self.rx_next))
-                && !desc::rx_has_error(self.rx_desc(self.rx_next))
-            {
-                desc::rx_len(self.rx_desc(self.rx_next)).min(submitted.len)
+            let has_err = desc::rx_has_error(self.rx_desc(self.rx_next));
+            let len = if desc::rx_ready(self.rx_desc(self.rx_next)) && !has_err {
+                desc::rx_len(self.rx_desc(self.rx_next)).min(BUFFER_SIZE)
             } else {
-                if desc::rx_has_error(self.rx_desc(self.rx_next)) {
+                if has_err {
                     log::warn!(
                         "k3-gmac: RX descriptor {} completed with error",
                         self.rx_next
@@ -497,12 +602,8 @@ impl K3GmacCore {
 
             desc::clear(self.rx_desc_mut(self.rx_next));
             self.rx_buffers[self.rx_next] = None;
-            if len > 0 {
-                self.rx_done.push_back((submitted.bus_addr, len));
-            } else {
-                // 出错时仍归还缓冲（长度 0），上层可重新投递
-                self.rx_done.push_back((submitted.bus_addr, 0));
-            }
+            // 无论成功/出错都归还缓冲（出错时 len=0），上层重新投递
+            self.rx_done.push_back((submitted, len));
             self.rx_next = next(self.rx_next);
         }
     }
@@ -534,6 +635,70 @@ impl K3GmacCore {
 
     fn rx_ring_dma_addr(&self, index: usize) -> u64 {
         self.rx_ring.dma_addr().as_u64() + desc::ring_offset(index)
+    }
+
+    // --- 缓存维护（K3 是 Zicbom 非一致性平台，"coherent" 分配实为可缓存内存）---
+    // 写描述符后 clean（push 到内存），让 DMA 能看到 OWN 位和地址；
+    // 读 DMA 回写的描述符前 invalidate（丢弃脏 cache），让 CPU 看到设备写入。
+
+    /// Flush（clean）单个 TX 描述符的 cache line，使 CPU 写入对 DMA 可见。
+    fn flush_tx_desc(&self, index: usize) {
+        // SAFETY: as_ptr 指向已分配的 coherent array；index < QUEUE_SIZE 保证偏移有效。
+        let ptr = unsafe {
+            NonNull::new_unchecked(
+                self.tx_ring
+                    .as_ptr()
+                    .as_ptr()
+                    .cast::<u8>()
+                    .add(index * core::mem::size_of::<DmaDesc>()),
+            )
+        };
+        axklib::dma::op().flush(ptr, core::mem::size_of::<DmaDesc>());
+    }
+
+    /// Flush 单个 RX 描述符的 cache line。
+    fn flush_rx_desc(&self, index: usize) {
+        // SAFETY: 同 flush_tx_desc。
+        let ptr = unsafe {
+            NonNull::new_unchecked(
+                self.rx_ring
+                    .as_ptr()
+                    .as_ptr()
+                    .cast::<u8>()
+                    .add(index * core::mem::size_of::<DmaDesc>()),
+            )
+        };
+        axklib::dma::op().flush(ptr, core::mem::size_of::<DmaDesc>());
+    }
+
+    /// Invalidate 单个 TX 描述符的 cache line，读 DMA 回写状态前调用。
+    fn inval_tx_desc(&self, index: usize) {
+        // SAFETY: 同 flush_tx_desc。
+        let ptr = unsafe {
+            NonNull::new_unchecked(
+                self.tx_ring
+                    .as_ptr()
+                    .as_ptr()
+                    .cast::<u8>()
+                    .add(index * core::mem::size_of::<DmaDesc>()),
+            )
+        };
+        axklib::dma::op().invalidate(ptr, core::mem::size_of::<DmaDesc>());
+    }
+
+    /// Invalidate 单个 RX 描述符的 cache line，读 DMA 回写状态前调用。
+    fn inval_rx_desc(&self, index: usize) {
+        // SAFETY: 同 flush_tx_desc。
+        let ptr = unsafe {
+            NonNull::new_unchecked(
+                self.rx_ring
+                    .as_ptr()
+                    .as_ptr()
+                    .cast::<u8>()
+                    .add(index * core::mem::size_of::<DmaDesc>()),
+            )
+        };
+        axklib::dma::op().invalidate(ptr, core::mem::size_of::<DmaDesc>());
     }
 }
 

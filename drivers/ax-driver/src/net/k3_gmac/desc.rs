@@ -6,13 +6,23 @@
 use super::regs;
 
 /// DWMAC4 DMA 描述符（4×u32，小端，`#[repr(C)]` 保证内存布局）。
+///
+/// K3 缓存行 64 字节。填充到 64 字节让每个描述符独占一个缓存行，
+/// 避免 flush/invalidate 一个描述符时破坏相邻描述符（对照 U-Boot
+/// desc_size = ALIGN(16, ARCH_DMA_MINALIGN) = 64）。
+/// DMA_CHAN_CONTROL.DSL=6（跳过 6×8=48 字节填充）让 DMA 按 64 字节步长读描述符。
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct DmaDesc {
-    pub des0: u32, // buffer1 物理地址低 32 位（或回写状态）
-    pub des1: u32, // buffer2 物理地址低 32 位
-    pub des2: u32, // buffer1/2 size + 控制
-    pub des3: u32, // OWN + FIRST/LAST/CIC/PACKET_SIZE（TX）或 OWN+BUF1V+IOC（RX）
+    pub des0: u32,   // buffer1 物理地址低 32 位（或回写状态）
+    pub des1: u32,   // buffer2 物理地址低 32 位
+    pub des2: u32,   // buffer1/2 size + 控制
+    pub des3: u32,   // OWN + FIRST/LAST/CIC/PACKET_SIZE（TX）或 OWN+BUF1V+IOC（RX）
+    _pad: [u32; 12], // 填充到 64 字节（缓存行对齐）
+}
+
+impl DmaDesc {
+    const PADDING: [u32; 12] = [0; 12];
 }
 
 // ---------------------------------------------------------------------------
@@ -41,12 +51,13 @@ const RDES3_BUFFER1_VALID_ADDR: u32 = 1 << 24; // bit24 BUF1V
 const RDES3_INT_ON_COMPLETION_EN: u32 = 1 << 30; // bit30 IOC
 const RDES3_PACKET_SIZE_MASK: u32 = 0x7fff; // bit14:0（回写时包长度）
 
-/// 清零描述符（所有 4 字段归零）。
+/// 清零描述符（所有字段归零，包括填充）。
 pub fn clear(desc: &mut DmaDesc) {
     desc.des0 = 0;
     desc.des1 = 0;
     desc.des2 = 0;
     desc.des3 = 0;
+    desc._pad = DmaDesc::PADDING;
 }
 
 /// 写入 buffer1 物理地址（64 位拆分为低/高 32 位）。
@@ -78,9 +89,10 @@ pub fn prepare_tx(desc: &mut DmaDesc, bus_addr: u64, len: usize, checksum: bool)
     desc.des3 = des3 | TDES3_OWN;
 }
 
-/// DMA 写屏障：保证描述符字段在置 OWN 位前已对设备可见。
-/// DWMAC4 的缓存一致性问题由 dma-api 后端（SVPBMT uncached + zicbom）处理，
-/// 这里用 Release fence 保证 CPU 侧写顺序。
+/// DMA 写顺序屏障：保证 des0/des1/des2 在 des3|OWN 之前写入（CPU 侧顺序）。
+///
+/// 注意：K3 是 Zicbom 非一致性平台，本 fence 不做 cache flush。
+/// 实际的 cache clean/invalidate 由 K3GmacCore::flush_*_desc / inval_*_desc 完成。
 pub fn dma_wmb() {
     core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
 }

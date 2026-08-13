@@ -128,17 +128,6 @@ impl GpioReset {
         // 设为 output：写 GSDR 对应 bit（K3 GPIO 用 set/clear 方向寄存器）
         gpio.write(bank_off + regs::K3_GPIO_GSDR, bit);
 
-        // 诊断：读回方向寄存器，确认 GPIO 写入生效（GPDR 应含 bit）
-        let gpdr_after = gpio.read(bank_off + regs::K3_GPIO_GPDR);
-        log::info!(
-            "k3-gmac: GPIO{}_{} GPDR after set-dir={:#010x} (bit={} expected={})",
-            self.bank,
-            self.pin,
-            gpdr_after,
-            (gpdr_after & bit) != 0,
-            true,
-        );
-
         // 1. 先 deassert（稳定到当前态）
         self.write_level(&gpio, bank_off, bit, false);
         delay_us(self.delays_us.0.max(2));
@@ -150,17 +139,6 @@ impl GpioReset {
         // 3. deassert（退出复位）
         self.write_level(&gpio, bank_off, bit, false);
         delay_us(self.delays_us.2);
-
-        // 诊断：读回最终电平（GPLR 应反映 deassert 后的输出）
-        let gplr_final = gpio.read(bank_off); // GPLR = bank_off + 0
-        log::info!(
-            "k3-gmac: GPIO{}_{} GPLR after reset={:#010x} (bit={} expected_high={})",
-            self.bank,
-            self.pin,
-            gplr_final,
-            (gplr_final & bit) != 0,
-            !self.active_low, // deassert 后 active_low 的 PHY 应为高
-        );
 
         log::info!(
             "k3-gmac: PHY reset via GPIO{}_{} (active_low={}) delays=({},{},{})us",

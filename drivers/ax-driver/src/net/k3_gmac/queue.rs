@@ -1,9 +1,8 @@
 //! rd-net 队列适配：`Interface` + `ITxQueue`/`IRxQueue` + IRQ handler。
 //!
-//! 修复点（相对旧实现 f7c4081be）：
-//! - 新增 `K3GmacIrqHandler` 并实现 `Interface::take_irq_handler`，返回 `Some`。
-//!   旧实现缺这个方法，导致设备退化成纯轮询（违反 rd_net 框架契约）。
-//! - 共享状态用 `SpinNoIrq`（数据面 lock 关中断，IRQ 上半部 try_lock 避免死锁）。
+//! 共享状态用 `SpinNoIrq`（数据面 lock 关中断，IRQ 上半部 try_lock 避免死锁）。
+//! `K3GmacIrqHandler` 实现 `Interface::take_irq_handler` 返回 `Some`，IRQ 作为
+//! net_poll_worker 的唤醒源；抢不到锁时返回 `Event::none()` 等下一次中断重试。
 
 use alloc::{boxed::Box, sync::Arc};
 
@@ -79,7 +78,7 @@ impl rd_net::Interface for K3GmacNet {
         self.inner.lock().handle_irq()
     }
 
-    /// 修复点：向框架注册 IRQ handler。
+    /// 向框架注册 IRQ handler。
     ///
     /// 返回 `Some`（持有共享状态的 Arc clone），由 ax-net 注册到平台 IRQ。
     /// handler 在硬中断上下文被调用，用 `try_lock` 抢锁，失败则返回空事件
@@ -106,6 +105,7 @@ impl rd_net::InterfaceIrqHandler for K3GmacIrqHandler {
     }
 }
 
+/// TX 队列：委托 `K3GmacCore::submit_tx`，每次操作 lock 共享状态。
 pub struct K3GmacTxQueue {
     inner: SharedCore,
 }
@@ -128,6 +128,7 @@ impl ITxQueue for K3GmacTxQueue {
     }
 }
 
+/// RX 队列：委托 `K3GmacCore::submit_rx`/`reclaim_rx_buffer`，每次操作 lock 共享状态。
 pub struct K3GmacRxQueue {
     inner: SharedCore,
 }

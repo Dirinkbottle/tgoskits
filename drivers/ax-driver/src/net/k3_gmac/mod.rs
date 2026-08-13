@@ -2,7 +2,7 @@
 //!
 //! 从设备树 probe ethernet@xxx 节点，经 syscon glue 配置 APMU（接口模式 +
 //! DLINE 调相）后初始化 DWMAC5 核心（DMA/MAC/MTL），注册为 rd_net 网卡。
-//! 首版单队列（queue0/channel0），速率按设备树 `max-speed` 静态配置。
+//! 单队列实现（queue0/channel0），速率按设备树 `max-speed` 静态配置。
 
 mod core;
 mod desc;
@@ -49,7 +49,7 @@ fn probe(probe: ProbeFdt<'_>) -> Result<(), OnProbeError> {
     let reg = info.node.regs().into_iter().next().ok_or_else(|| {
         OnProbeError::other(format!("k3-gmac: [{}] has no reg", info.node.name()))
     })?;
-    let size = reg.size.unwrap_or(0x2000) as usize;
+    let size = reg.size.unwrap_or(0x2000) as usize; // DWMAC5 寄存器窗口 8 KiB
 
     info!(
         "k3-gmac: probing {} at {:#x} size={:#x}",
