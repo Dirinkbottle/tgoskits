@@ -34,6 +34,7 @@ use rdrive::probe::fdt::child_nodes;
 
 use super::{
     K3_PIN_CONFIG_DRIVE_WITH_VOLTAGE, K3_PIN_CONFIG_INPUT_SCHMITT, K3_PIN_CONFIG_POWER_SOURCE,
+    K3_PIN_CONFIG_STRONG_PULL,
 };
 
 /// K3 pinctrl FDT 解析器。
@@ -105,8 +106,23 @@ fn append_k3_pins(node: NodeType<'_>, state: &mut PinState) -> Result<(), Pinctr
             MuxValue::new(mux),
         ));
 
-        if let Some(b) = bias {
-            state.push_config(ConfigSetting::pin(pin, PinConfig::Bias(b)));
+        match bias {
+            Some(K3Bias::Normal(b)) => {
+                state.push_config(ConfigSetting::pin(pin, PinConfig::Bias(b)));
+            }
+            // bias-pull-up = <1>：强上拉。走 vendor config（带 STRONG_PULL 位）。
+            // rdif 的 Bias::PullUp 无字段携带 arg，故单独成路径（对照上游
+            // pinctrl-k1.c PIN_CONFIG_BIAS_PULL_UP 的 if (arg==1) 分支）。
+            Some(K3Bias::StrongPullUp) => {
+                state.push_config(ConfigSetting::pin(
+                    pin,
+                    PinConfig::Vendor {
+                        param: K3_PIN_CONFIG_STRONG_PULL,
+                        value: 0,
+                    },
+                ));
+            }
+            None => {}
         }
 
         // drive-strength + power-source 合并：精确复刻 Linux generate+finalize 语义
@@ -151,14 +167,33 @@ fn append_k3_pins(node: NodeType<'_>, state: &mut PinState) -> Result<(), Pinctr
     Ok(())
 }
 
-/// 解析 bias-* 属性（存在性判断）。
-fn parse_bias(node: &fdt_edit::Node) -> Option<Bias> {
+/// bias 解析结果。
+///
+/// `bias-pull-up = <1>`（带 arg==1）走 `StrongPullUp`（设 PAD_STRONG_PULL），
+/// 其它 `bias-pull-up`（无值或 arg!=1）走普通 `Bias::PullUp`。对照上游
+/// pinctrl-k1.c `PIN_CONFIG_BIAS_PULL_UP` 的 `if (arg == 1) v |= PAD_STRONG_PULL`。
+enum K3Bias {
+    Normal(Bias),
+    StrongPullUp,
+}
+
+/// 解析 bias-* 属性。
+///
+/// DTS 约定（pinctrl-k1.yaml + generic pinconf）：`bias-pull-up` 可带一个 u32 arg，
+/// arg==1 表示强上拉（硬件置 `PAD_STRONG_PULL`）。无值或 arg!=1 为普通上拉。
+fn parse_bias(node: &fdt_edit::Node) -> Option<K3Bias> {
     if node.get_property("bias-disable").is_some() {
-        Some(Bias::Disabled)
-    } else if node.get_property("bias-pull-up").is_some() {
-        Some(Bias::PullUp)
+        Some(K3Bias::Normal(Bias::Disabled))
+    } else if let Some(prop) = node.get_property("bias-pull-up") {
+        // 带 arg==1 的 bias-pull-up = <1> → 强上拉；其它（无值 / arg!=1）→ 普通上拉。
+        let arg = prop.get_u32();
+        if arg == Some(1) {
+            Some(K3Bias::StrongPullUp)
+        } else {
+            Some(K3Bias::Normal(Bias::PullUp))
+        }
     } else if node.get_property("bias-pull-down").is_some() {
-        Some(Bias::PullDown)
+        Some(K3Bias::Normal(Bias::PullDown))
     } else {
         None
     }

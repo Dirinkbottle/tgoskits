@@ -38,7 +38,7 @@ pub use fdt_parser::K3FdtPinctrlParser;
 use regs::{
     APBC_ASFAR, APBC_ASFAR_AKEY, APBC_ASSAR, APBC_ASSAR_AKEY, IO_PWR_DOMAIN_V18EN, K3_DS_1V8,
     K3_DS_3V3, PAD_DRIVE_K3, PAD_DRIVE_K3_SHIFT, PAD_MUX, PAD_PULL_EN, PAD_PULLDOWN, PAD_PULLUP,
-    PAD_SCHMITT_K3, ds_to_val, pin_to_io_pd_offset, pin_to_offset,
+    PAD_SCHMITT_K3, PAD_STRONG_PULL, ds_to_val, pin_to_io_pd_offset, pin_to_offset,
 };
 
 /// Vendor config param：纯 IO 电源域设置（value = mV，1800/3300）。
@@ -55,6 +55,14 @@ pub(super) const K3_PIN_CONFIG_DRIVE_WITH_VOLTAGE: u32 = 2;
 
 /// Vendor config param：施密特触发器（value = 0/1）。
 pub(super) const K3_PIN_CONFIG_INPUT_SCHMITT: u32 = 3;
+
+/// Vendor config param：强上拉（value 未使用）。
+///
+/// 对应 DTS `bias-pull-up = <0x01>`。rdif 的 `Bias::PullUp` 无字段携带 arg，无法
+/// 区分普通/强上拉，故 parser 把带 arg==1 的 `bias-pull-up` 翻译成此 vendor config
+/// （对照上游 pinctrl-k1.c `PIN_CONFIG_BIAS_PULL_UP` 的 `if (arg == 1)` 分支）。
+/// apply 时设 `PULL_EN | PULLUP | STRONG_PULL`（强上拉在硬件上是普通上拉的超集）。
+pub(super) const K3_PIN_CONFIG_STRONG_PULL: u32 = 4;
 
 // ============================================================================
 // model_register!
@@ -313,6 +321,14 @@ impl RdifPinctrl for K3Pinctrl {
             }
             PinConfig::Vendor { param, value } if param == K3_PIN_CONFIG_INPUT_SCHMITT => {
                 self.set_config_value(pin, Self::schmitt_bits(value));
+                Ok(())
+            }
+            // 强上拉（bias-pull-up = <1>）：设 PULL_EN | PULLUP | STRONG_PULL。
+            // value 未使用（上游仅按 arg==1 触发，parser 已负责判定）。
+            PinConfig::Vendor { param, value: _ }
+                if param == K3_PIN_CONFIG_STRONG_PULL =>
+            {
+                self.set_config_value(pin, PAD_PULL_EN | PAD_PULLUP | PAD_STRONG_PULL);
                 Ok(())
             }
             _ => Err(PinctrlError::NotSupported),

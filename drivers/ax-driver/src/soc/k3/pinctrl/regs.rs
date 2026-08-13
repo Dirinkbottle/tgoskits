@@ -19,11 +19,12 @@
 /// 引脚复用功能选择（pinctrl-k1.c:41）。3 bits，Function 0-7。
 pub const PAD_MUX: u32 = 0b111; // GENMASK(2, 0)
 
-/// 强上拉使能（pinctrl-k1.c:42）。仅在 bias-pull-up arg==1 时置。
+/// 强上拉使能（pinctrl-k1.c:42）。仅在 `bias-pull-up = <1>` 时置（上游
+/// pinctrl-k1.c `PIN_CONFIG_BIAS_PULL_UP` 的 `if (arg == 1) v |= PAD_STRONG_PULL`）。
 ///
-/// 当前 `Bias::PullUp` 不携带 arg，无法区分普通/强上拉，故暂未使用。保留常量
-/// 供文档对照与未来扩展。
-#[allow(dead_code)]
+/// rdif 的 `Bias::PullUp` 无字段携带 arg，无法区分普通/强上拉，故 parser 把
+/// 带 arg 的 `bias-pull-up` 翻译成 `K3_PIN_CONFIG_STRONG_PULL` vendor config，
+/// 在 `apply_config` 里补设此位。
 pub const PAD_STRONG_PULL: u32 = 1 << 3; // BIT(3)
 
 /// 边沿检测上升沿（pinctrl-k1.c:43-45，EDGE_*）；pinctrl 驱动未在 config 路径用。
