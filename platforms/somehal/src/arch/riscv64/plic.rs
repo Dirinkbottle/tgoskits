@@ -1,7 +1,6 @@
 use alloc::{format, vec, vec::Vec};
 use core::{num::NonZeroU32, ptr::NonNull};
 
-use ax_riscv_imsic;
 use ax_riscv_plic::{PLICRegs, Plic, PlicIrqHandler};
 use kernutil::StaticCell;
 use rdif_intc::Interface;
@@ -94,10 +93,6 @@ pub fn irq_set_affinity(
 enum Completion {
     None,
     Plic(NonZeroU32),
-    /// IMSIC stopei 写回值。读 stopei 只返回 pending 中断 ID，不自动清除
-    /// pending 位（QEMU riscv_imsic_topei_rmw 的 read 侧）。必须再写 stopei
-    /// 才能清 pending、完成中断。
-    Imsic(u32),
 }
 
 pub struct ActiveIrq {
@@ -110,11 +105,14 @@ impl ActiveIrq {
         self.irq
     }
 
-    /// 供 AIA（IMSIC）使用：Drop 时写回 `stopei` 完成 pending 清除。
-    pub fn new_imsic(irq: rdrive::IrqId, stopei_val: u32) -> Self {
+    /// 供 AIA（IMSIC）使用：claim 后已在 `begin_external_irq` 中**立即写回
+    /// stopei 完成 EOI**，Drop 时无需（也不得）再写——handler 之后补写会
+    /// 清掉执行期间到达的同 EID 新 MSI（丢中断 + APLIC 电平源锁死，见
+    /// 调用方注释）。
+    pub fn new_imsic_completed(irq: rdrive::IrqId) -> Self {
         Self {
             irq,
-            completion: Completion::Imsic(stopei_val),
+            completion: Completion::None,
         }
     }
 }
@@ -123,7 +121,6 @@ impl Drop for ActiveIrq {
     fn drop(&mut self) {
         match self.completion {
             Completion::Plic(source) => complete_external_irq_source(source),
-            Completion::Imsic(val) => unsafe { ax_riscv_imsic::complete_stopei(val) },
             Completion::None => {}
         }
     }
