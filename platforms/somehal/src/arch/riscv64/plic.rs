@@ -105,10 +105,10 @@ impl ActiveIrq {
         self.irq
     }
 
-    /// 供 AIA（IMSIC）使用：claim 后已在 `begin_external_irq` 中**立即写回
-    /// stopei 完成 EOI**，Drop 时无需（也不得）再写——handler 之后补写会
-    /// 清掉执行期间到达的同 EID 新 MSI（丢中断 + APLIC 电平源锁死，见
-    /// 调用方注释）。
+    /// 供 AIA（IMSIC）使用：claim 与 EOI 已在 `begin_external_irq` 中
+    /// 合并为单条 `csrrw stopei, x0` 原子完成，Drop 时无需（也不得）再
+    /// 写——事后补写会清掉执行期间到达的同 EID 新 MSI（丢中断 + APLIC
+    /// 电平源锁死，见调用方注释）。
     pub fn new_imsic_completed(irq: rdrive::IrqId) -> Self {
         Self {
             irq,

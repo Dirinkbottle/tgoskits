@@ -181,27 +181,6 @@ unsafe fn sireg_write(val: usize) {
     }
 }
 
-/// 读 `stopei`：原子 claim 最高优先级 pending 中断，返回原始值。
-///
-/// 返回值高 16 位是 priority，低 16 位是 eiid；全 0 表示无 pending。
-///
-/// # Safety
-///
-/// 必须在本地 hart、S-mode、ssaia 扩展可用时调用。
-#[cfg(target_arch = "riscv64")]
-#[inline]
-pub unsafe fn stopei_read() -> u32 {
-    let val: usize;
-    unsafe {
-        core::arch::asm!(
-            "csrr {val}, {csr}",
-            val = out(reg) val,
-            csr = const csr::STOPEI,
-        )
-    }
-    val as u32
-}
-
 /// 解析 `stopei` 原始值 → `(eiid, priority)`；0 表示无 pending。
 #[inline]
 pub const fn parse_stopei(raw: u32) -> Option<(u32, u32)> {
@@ -274,41 +253,40 @@ pub unsafe fn disable_eid(eiid: u32) {
     }
 }
 
-/// 读 `stopei` claim 最高优先级 pending 中断。无 pending 返回 None。
+/// 单条 `csrrw stopei, x0`：原子地 claim 最高优先级 pending 中断并完成
+/// EOI（清 pending），返回 `(eiid, priority)`；无 pending 返回 None。
 ///
-/// # Safety
+/// stopei 的真实语义（**读非破坏、写才 complete**；QEMU
+/// `hw/intc/riscv_imsic.c` 的 `riscv_imsic_topei_rmw` 与 K3 X100 实测一致，
+/// "读即 deactivate" 的说法是误记）：
+/// - 读：返回当前最高优先级 pending 的 IID+优先级，不清 pending；
+/// - 写：写入值被忽略，清除**写入时刻**的最高优先级 pending。
 ///
-/// 同 [`init_local_file`]。
-#[cfg(target_arch = "riscv64")]
-pub unsafe fn claim() -> Option<(u32, u32)> {
-    parse_stopei(unsafe { stopei_read() })
-}
-
-/// 写 `stopei` 完成中断的 pending 清除（对应 QEMU riscv_imsic_topei_rmw 的 write 侧）。
+/// 因此读、写拆成两条指令是错误的：写清除的可能已不是刚读出的那个——
+/// 间隙到达的新 MSI 会被顺带吞掉（K3 板实测：EOI 推迟到 handler 后曾致
+/// mailbox 电平源锁死、中断线恒高永久死亡）。`csrrw` 把读和写合成一条
+/// 指令，读出的与被清的必然是同一个，间隙归零；之后到达的 MSI 留在
+/// pending 中，sret 恢复 SIE 后 SEIP 再次 trap 收割。
 ///
-/// 读 stopei 只返回 pending 中断的 ID，不自动清除 pending 位；必须再写 stopei
-/// （写任意 non-zero 值即可触发 QEMU 的清 pending 路径）才算"完成"该中断。
-/// 不写 stopei 则 pending 位永不释放 → IRQ 线保持 asserted → 反复 trap。
-///
-/// **QEMU 适配说明**：AIA 规范本身规定 stopei 读应原子完成 claim、priority-drop
-/// 与 activate（即读后 pending 自动清除）。但 QEMU 的 `riscv_imsic_topei_rmw`
-/// 实现把 read 和 write 分开：read 只返回值，write 才清 pending，偏离了规范。
-/// 因此本函数目前是 QEMU 行为适配；移植到严格遵循 AIA 规范的真硬件时，需复核
-/// 多写一次 stopei 是否被硬件忽略（规范未明确禁止重复 complete，但实现各异）。
+/// 对齐 Linux 主线：`csr_swap(CSR_TOPEI, 0)`（Linux 6.18
+/// `drivers/irqchip/irq-riscv-imsic-early.c` 的 `imsic_handle_irq`），
+/// 写 0 即可——值被忽略。
 ///
 /// # Safety
 ///
 /// 必须在本地 hart、S-mode、ssaia 扩展可用时调用。
-/// 只应在同一次中断处理流程中 claim 后调用。
 #[cfg(target_arch = "riscv64")]
-pub unsafe fn complete_stopei(val: u32) {
+#[inline]
+pub unsafe fn claim_and_complete() -> Option<(u32, u32)> {
+    let raw: usize;
     unsafe {
         core::arch::asm!(
-            "csrw {csr}, {val}",
+            "csrrw {val}, {csr}, zero",
+            val = out(reg) raw,
             csr = const csr::STOPEI,
-            val = in(reg) val as usize,
-        );
+        )
     }
+    parse_stopei(raw as u32)
 }
 
 /// 经 IMSIC 发 IPI：写目标 hart 中断文件页的 EID 0（IPI 专用 identity）。

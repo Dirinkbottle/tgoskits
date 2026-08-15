@@ -271,19 +271,19 @@ pub fn is_aia_active() -> bool {
 }
 
 pub fn begin_external_irq() -> Option<super::plic::ActiveIrq> {
-    let raw = unsafe { ax_riscv_imsic::stopei_read() };
-    let (eiid, _prio) = ax_riscv_imsic::parse_stopei(raw)?;
-
-    // EOI（写 stopei 清 pending）必须紧跟 claim、在 dispatch handler 之前
-    // 完成，不能推迟到 ActiveIrq::drop：stopei 写清除的是**当前最高优先级
-    // pending**（写入值被忽略），handler 执行期间到达的同 EID 新 MSI 会被
-    // drop 时的补写顺带清掉（丢中断）。对 APLIC MSI 模式的电平源是永久性
-    // 的——被吞中断的设备锁存无人清、中断线恒高，APLIC 只在输入 0→1 跃迁
-    // 时投一次 MSI，此后再无投递（K3 板上实锤：mailbox 快连门铃 count=2
-    // 之后永久静默，停靠等待的线程挂死；eth0 因设备线 write-to-clear 可
-    // 自愈而幸免）。EOI 前移后，handler 期间的新 MSI 保留在 eip 中，sret
-    // 恢复 SIE 后 SEIP 再次 trap，由下一次 dispatch 收割。
-    unsafe { ax_riscv_imsic::complete_stopei(raw) };
+    // claim 与 EOI 合并为单条 `csrrw stopei, x0`（读写原子），且必须在
+    // dispatch handler 之前完成，不能推迟到 ActiveIrq::drop：stopei 写清除
+    // 的是**写入时刻**的最高优先级 pending（写入值被忽略），若与读拆成
+    // 两条指令、或推迟到 handler 之后，间隙/期间到达的同 EID 新 MSI 会被
+    // 顺带清掉（丢中断）。对 APLIC MSI 模式的电平源是永久性的——被吞
+    // 中断的设备锁存无人清、中断线恒高，APLIC 只在输入 0→1 跃迁时投
+    // 一次 MSI，此后再无投递（K3 板上实锤：mailbox 快连门铃 count=2
+    // 之后永久静默，停靠等待的线程挂死；eth0 因设备线 write-to-clear
+    // 可自愈而幸免）。单条 csrrw 使读出的与被清的是同一个，handler
+    // 期间的新 MSI 保留在 eip 中，sret 恢复 SIE 后 SEIP 再次 trap，由
+    // 下一次 dispatch 收割——对齐 Linux 主线 csr_swap(CSR_TOPEI, 0)。
+    // 详见 ax_riscv_imsic::claim_and_complete。
+    let (eiid, _prio) = unsafe { ax_riscv_imsic::claim_and_complete() }?;
 
     Some(super::plic::ActiveIrq::new_imsic_completed((eiid as usize).into()))
 }
