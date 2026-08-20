@@ -18,7 +18,8 @@ macro_rules! model_register {
             pub mod some {
                 #[allow(unused_imports)]
                 use super::*;
-                use $crate::register::*;
+                #[allow(unused_imports)]
+                use $crate::register::{DriverRegister, ProbeKind, ProbeLevel, ProbePriority};
 
                 /// Static instance of driver registration information.
                 ///

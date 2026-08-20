@@ -1,7 +1,11 @@
 //! SpacemiT K3 UFS host controller driver - Phase 3: SCSI commands
 
-use alloc::{boxed::Box, collections::VecDeque, format, vec, vec::Vec};
-use core::{ptr::NonNull, time::Duration};
+use alloc::{boxed::Box, collections::VecDeque, format, sync::Arc, vec, vec::Vec};
+use core::{
+    ptr::NonNull,
+    sync::atomic::{AtomicU32, Ordering},
+    time::Duration,
+};
 
 use dma_api::{
     CompletedDma, ContiguousArray, DeviceDma, DmaDirection, DmaDomainId, DmaOp, PreparedDma,
@@ -9,13 +13,13 @@ use dma_api::{
 use log::{info, warn};
 use rdif_block::{
     BatchSubmitDisposition, BatchSubmitResult, BlkError, BlockController, CompletedRequest,
-    CompletionSink, ControllerEvent, ControllerState, ControllerUpdate, DeviceInfo, DriverGeneric,
-    HardwareQueue, OwnedRequest, OwnedRequestBatch, QueueInfo, QueueLimits, RequestFlags,
-    RequestId, RequestOp, SubmissionSink,
+    CompletionSink, ControlEvent, ControllerEvent, ControllerState, ControllerUpdate, DeviceInfo,
+    DriverGeneric, HardIrqHandler, HardwareQueue, IrqAck, IrqEndpoint, IrqQueueMask, OwnedRequest,
+    OwnedRequestBatch, QueueInfo, QueueLimits, RequestFlags, RequestId, RequestOp, SubmissionSink,
 };
 use rdrive::{probe::OnProbeError, register::*};
 
-use crate::{block::PlatformDeviceBlock, mmio::iomap};
+use crate::{block::ProbeFdtBlock, mmio::iomap};
 
 /// K3 UFS vendor registers
 const UFS_SYS1CLK_1US: usize = 0xC0;
@@ -146,7 +150,7 @@ fn dma_rmb() {
 /// Helper to build UIC MIB selector
 #[inline]
 const fn uic_arg_mib(attr: u32) -> u32 {
-    ((attr & 0xFFFF) << 16) | 0
+    (attr & 0xFFFF) << 16
 }
 
 #[inline]
@@ -178,6 +182,13 @@ const INT_FATAL_ERRORS: u32 = DEVICE_FATAL_ERROR
     | UTP_ERROR;
 const UFSHCD_ERROR_MASK: u32 = UIC_ERROR | INT_FATAL_ERRORS;
 const UFSHCD_ENABLE_INTRS: u32 = UTP_TRANSFER_REQ_COMPL | UTP_TASK_REQ_COMPL | UFSHCD_ERROR_MASK;
+
+const UFS_IRQ_SOURCE: usize = 0;
+
+fn acknowledged_interrupts(status: u32, enable: u32) -> Option<u32> {
+    let pending = status & enable & UFSHCD_ENABLE_INTRS;
+    (pending != 0).then_some(pending)
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct PowerModeCapabilities {
@@ -329,20 +340,6 @@ struct Utrd {
     prdto: u16,
 }
 
-/// UPIU header
-#[repr(C)]
-struct UpiuHeader {
-    trans_type: u8,
-    flags: u8,
-    lun: u8,
-    task_tag: u8,
-    cmd_set_type: u8,
-    reserved: [u8; 3],
-    total_ehs_len: u8,
-    reserved2: u8,
-    data_segment_len: u16,
-}
-
 /// Physical Region Description Table Entry
 #[repr(C, align(4))]
 struct Prdt {
@@ -350,37 +347,6 @@ struct Prdt {
     dbau: u32,
     reserved: u32,
     dbc: u32,
-}
-
-/// Command UPIU
-#[repr(C, align(4))]
-struct CommandUpiu {
-    header: UpiuHeader,
-    exp_data_len: u32,
-    cdb: [u8; 16],
-}
-
-/// Response UPIU
-#[repr(C, align(4))]
-struct ResponseUpiu {
-    header: UpiuHeader,
-    residual_len: u32,
-    reserved: [u32; 4],
-    sense_data_len: u16,
-    sense_data: [u8; 18],
-}
-
-/// Query UPIU structure (Linux: include/uapi/scsi/scsi_bsg_ufs.h struct utp_upiu_query)
-#[repr(C)]
-struct QueryUpiu {
-    opcode: u8,
-    idn: u8,
-    index: u8,
-    selector: u8,
-    reserved_osf: u16, // big-endian in protocol
-    length: u16,       // big-endian in protocol
-    value: u32,        // big-endian in protocol
-    reserved: [u32; 2],
 }
 
 /// UFS Command Descriptor (UCD) - matches Linux ALIGNED_UPIU_SIZE = 512
@@ -405,6 +371,7 @@ crate::model_register!(
 
 struct K3UfsHost {
     mmio_base: NonNull<u8>,
+    completion_events: Arc<AtomicU32>,
     clock_freq: u32,
     nutrs: usize,
     active_lun: u8,
@@ -419,33 +386,111 @@ struct K3UfsHost {
 // SAFETY: MMIO register access is thread-safe for this hardware
 unsafe impl Send for K3UfsHost {}
 
-impl K3UfsHost {
-    unsafe fn read32(&self, offset: usize) -> u32 {
-        let v =
-            unsafe { core::ptr::read_volatile(self.mmio_base.as_ptr().add(offset) as *const u32) };
-        // Linux: __io_ar() = fence i,ir (arch/riscv/include/asm/mmio.h)
-        #[cfg(target_arch = "riscv64")]
-        unsafe {
-            core::arch::asm!("fence i, ir", options(nostack));
-        }
-        #[cfg(not(target_arch = "riscv64"))]
-        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::Acquire);
-        v
+/// Reads one UFSHCI register through the mapped controller window.
+///
+/// # Safety
+///
+/// `mmio_base` must point at a live, valid UFSHCI MMIO mapping and `offset`
+/// must identify a naturally aligned 32-bit register within that mapping.
+unsafe fn read_mmio32(mmio_base: NonNull<u8>, offset: usize) -> u32 {
+    let value = unsafe { core::ptr::read_volatile(mmio_base.as_ptr().add(offset) as *const u32) };
+    // Linux: __io_ar() = fence i,ir (arch/riscv/include/asm/mmio.h)
+    #[cfg(target_arch = "riscv64")]
+    unsafe {
+        core::arch::asm!("fence i, ir", options(nostack));
     }
+    #[cfg(not(target_arch = "riscv64"))]
+    core::sync::atomic::compiler_fence(Ordering::Acquire);
+    value
+}
 
-    unsafe fn write32(&self, offset: usize, value: u32) {
-        // Linux: __io_bw() = fence w,o (arch/riscv/include/asm/mmio.h)
-        #[cfg(target_arch = "riscv64")]
-        unsafe {
-            core::arch::asm!("fence w, o", options(nostack));
-        }
-        #[cfg(not(target_arch = "riscv64"))]
-        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::Release);
-        unsafe {
-            core::ptr::write_volatile(self.mmio_base.as_ptr().add(offset) as *mut u32, value)
+/// Writes one UFSHCI register through the mapped controller window.
+///
+/// # Safety
+///
+/// `mmio_base` must point at a live, valid UFSHCI MMIO mapping and `offset`
+/// must identify a naturally aligned 32-bit register within that mapping.
+unsafe fn write_mmio32(mmio_base: NonNull<u8>, offset: usize, value: u32) {
+    // Linux: __io_bw() = fence w,o (arch/riscv/include/asm/mmio.h)
+    #[cfg(target_arch = "riscv64")]
+    unsafe {
+        core::arch::asm!("fence w, o", options(nostack));
+    }
+    #[cfg(not(target_arch = "riscv64"))]
+    core::sync::atomic::compiler_fence(Ordering::Release);
+    unsafe { core::ptr::write_volatile(mmio_base.as_ptr().add(offset) as *mut u32, value) };
+}
+
+/// A fixed UFSHCI hard-IRQ top half.
+struct K3UfsIrqHandler {
+    mmio_base: NonNull<u8>,
+    completion_events: Arc<AtomicU32>,
+    source_id: usize,
+}
+
+// SAFETY: The handler is registered only while the controller MMIO mapping is
+// alive. It owns no queue, allocator, registry, filesystem, or scheduler
+// state; `ack` performs only fixed MMIO accesses and an atomic event publish.
+unsafe impl Send for K3UfsIrqHandler {}
+
+impl HardIrqHandler for K3UfsIrqHandler {
+    fn ack(&mut self) -> IrqAck {
+        let (status, enable) = unsafe {
+            (
+                read_mmio32(self.mmio_base, REG_INTERRUPT_STATUS),
+                read_mmio32(self.mmio_base, REG_INTERRUPT_ENABLE),
+            )
         };
+        let Some(pending) = acknowledged_interrupts(status, enable) else {
+            return IrqAck::spurious(self.source_id);
+        };
+
+        // UFSHCI interrupt status is write-one-to-clear. Publish the event
+        // only after the device has been deasserted, so a level-triggered
+        // APLIC source cannot immediately re-enter on the same status.
+        unsafe { write_mmio32(self.mmio_base, REG_INTERRUPT_STATUS, pending) };
+        let completion = pending & UTP_TRANSFER_REQ_COMPL;
+        if completion != 0 {
+            self.completion_events
+                .fetch_or(completion, Ordering::AcqRel);
+        }
+
+        let queues = if completion != 0 {
+            IrqQueueMask::from_queue(0)
+        } else {
+            IrqQueueMask::none()
+        };
+        IrqAck::cleared(queues, ControlEvent::new(self.source_id, pending as u64))
+    }
+}
+
+impl K3UfsHost {
+    /// Reads a UFSHCI register.
+    ///
+    /// # Safety
+    ///
+    /// The host must own a live UFSHCI MMIO mapping and `offset` must identify
+    /// a naturally aligned 32-bit register within it.
+    unsafe fn read32(&self, offset: usize) -> u32 {
+        unsafe { read_mmio32(self.mmio_base, offset) }
     }
 
+    /// Writes a UFSHCI register.
+    ///
+    /// # Safety
+    ///
+    /// The host must own a live UFSHCI MMIO mapping and `offset` must identify
+    /// a naturally aligned 32-bit register within it.
+    unsafe fn write32(&self, offset: usize, value: u32) {
+        unsafe { write_mmio32(self.mmio_base, offset, value) }
+    }
+
+    /// Reads the completion status nibble from a transfer descriptor.
+    ///
+    /// # Safety
+    ///
+    /// `utrd` must point to a valid, initialized UTRD that is exclusively
+    /// accessed by the caller while the descriptor is being inspected.
     unsafe fn read_utrd_ocs(utrd: *const Utrd) -> u32 {
         unsafe { core::ptr::read_volatile(core::ptr::addr_of!((*utrd).dw2)) & 0x0F }
     }
@@ -1113,12 +1158,6 @@ impl K3UfsHost {
             let utrd_ptr = unsafe { (utrd_list.as_ptr().as_ptr() as *mut Utrd).add(slot) };
             let utrd = unsafe { &mut *utrd_ptr };
             let ucd_phys = ucd_buf.dma_addr().as_u64() + (slot * UCD_SLOT_SIZE) as u64;
-            let utrd_phys = utrd_list.dma_addr().as_u64() + (slot * 32) as u64;
-            let rsp_dma = ucd_phys + UCD_COMMAND_UPIU_SIZE as u64;
-            // info!(
-            //     "[k3-ufs] submit: slot={} utrd_dma=0x{:x} ucd_dma=0x{:x} rsp_dma=0x{:x} db_mask=0x{:x}",
-            //     slot, utrd_phys, ucd_phys, rsp_dma, slot_mask
-            // );
 
             utrd.dw0 = 0;
             utrd.dw1 = 0;
@@ -1150,6 +1189,9 @@ impl K3UfsHost {
 
         unsafe {
             self.write32(REG_INTERRUPT_STATUS, 0xFFFFFFFF);
+            // Drop an event left over from the previous command. The IRQ top
+            // half publishes completion only after clearing this status.
+            self.completion_events.store(0, Ordering::Release);
             // dma_wmb() = fence ow,ow (Linux: ufs_spacemit_setup_xfer_req before doorbell)
             dma_wmb();
             self.write32(REG_UTP_TRANSFER_REQ_DOOR_BELL, slot_mask);
@@ -1157,27 +1199,19 @@ impl K3UfsHost {
             let _ = self.read32(REG_UTP_TRANSFER_REQ_DOOR_BELL);
         }
 
-        // Poll for completion: Linux uses doorbell-clear as the sole signal.
-        // (Linux: completed_reqs = ~tr_doorbell & outstanding_reqs)
-        for i in 0..10000 {
+        // Wait for completion. Once the platform IRQ is registered, the
+        // acknowledged UFSHCI completion bit is the primary signal; the
+        // doorbell-clear check keeps early probe and a missed IRQ bounded.
+        for _ in 0..10000 {
             let db = unsafe { self.read32(REG_UTP_TRANSFER_REQ_DOOR_BELL) };
 
-            if i % 500 == 0 {
-                let is = unsafe { self.read32(REG_INTERRUPT_STATUS) };
-                let ocs = {
-                    let utrd_list = self.utrd_list.as_mut().ok_or("UTRD not initialized")?;
-                    utrd_list.complete_for_cpu(slot * 32, 32);
-                    let utrd_ptr =
-                        unsafe { (utrd_list.as_ptr().as_ptr() as *const Utrd).add(slot) };
-                    unsafe { Self::read_utrd_ocs(utrd_ptr) }
-                };
-                // info!("[k3-ufs] Poll {}: DB=0x{:x}, IS=0x{:x}, OCS=0x{:x}",
-                //       i, db, is, ocs);
-            }
-
-            if db & slot_mask == 0 {
+            let completion_irq =
+                self.completion_events.load(Ordering::Acquire) & UTP_TRANSFER_REQ_COMPL != 0;
+            if db & slot_mask == 0 || completion_irq {
                 // SpacemiT K3: dma_rmb() before reading UTRD OCS and response UPIU.
-                // (Linux: __ufshcd_transfer_req_compl → dma_rmb() under CONFIG_SCSI_UFS_SPACEMIT_K3)
+                // The IRQ path normally supplies this completion signal; the
+                // doorbell check remains a safe fallback during early probe,
+                // before the runtime has registered the platform IRQ.
                 dma_rmb();
                 let (ocs, response) = {
                     let utrd_list = self.utrd_list.as_mut().ok_or("UTRD not initialized")?;
@@ -1194,8 +1228,8 @@ impl K3UfsHost {
                     if ocs == 0 {
                         unsafe {
                             let rsp = (*ucd_ptr).response_upiu.as_ptr();
-                            for j in 0..512 {
-                                response[j] = core::ptr::read_volatile(rsp.add(j));
+                            for (j, byte) in response.iter_mut().enumerate() {
+                                *byte = core::ptr::read_volatile(rsp.add(j));
                             }
                         }
                     }
@@ -1501,19 +1535,19 @@ impl K3UfsHost {
                 None
             };
 
-            if let Some((key, asc, ascq)) = sense {
-                if key == SCSI_SENSE_UNIT_ATTENTION || key == SCSI_SENSE_NOT_READY {
-                    warn!(
-                        "[k3-ufs] TEST_UNIT_READY retry {} due to sense key=0x{:02x}, \
-                         asc=0x{:02x}, ascq=0x{:02x}",
-                        retry + 1,
-                        key,
-                        asc,
-                        ascq
-                    );
-                    axklib::time::busy_wait(core::time::Duration::from_millis(100));
-                    continue;
-                }
+            if let Some((key, asc, ascq)) = sense
+                && (key == SCSI_SENSE_UNIT_ATTENTION || key == SCSI_SENSE_NOT_READY)
+            {
+                warn!(
+                    "[k3-ufs] TEST_UNIT_READY retry {} due to sense key=0x{:02x}, asc=0x{:02x}, \
+                     ascq=0x{:02x}",
+                    retry + 1,
+                    key,
+                    asc,
+                    ascq
+                );
+                axklib::time::busy_wait(core::time::Duration::from_millis(100));
+                continue;
             }
 
             return Err("TEST_UNIT_READY failed");
@@ -1609,13 +1643,14 @@ impl K3UfsHost {
             core::slice::from_raw_parts(data_buf.as_ptr().as_ptr(), SCSI_REPORT_LUNS_ALLOC_LEN)
         };
         let list_len = u32::from_be_bytes([data[0], data[1], data[2], data[3]]) as usize;
-        if list_len == 0 || list_len + 8 > SCSI_REPORT_LUNS_ALLOC_LEN || list_len % 8 != 0 {
+        if list_len == 0 || list_len + 8 > SCSI_REPORT_LUNS_ALLOC_LEN || !list_len.is_multiple_of(8)
+        {
             warn!("[k3-ufs] REPORT_LUNS invalid list length {}", list_len);
             return Err("Invalid REPORT_LUNS data");
         }
 
         let mut luns = Vec::new();
-        for entry in data[8..8 + list_len].chunks_exact(8) {
+        for entry in data[8..8 + list_len].as_chunks::<8>().0 {
             let scsi_lun = Self::scsilun_to_int(entry);
             let upiu_lun = Self::scsi_to_upiu_lun(scsi_lun);
             info!(
@@ -2004,15 +2039,13 @@ impl K3UfsHost {
     }
 }
 
-/// rdif-block controller for the polled synchronous K3 UFS host.
+/// rdif-block controller for the interrupt-assisted synchronous K3 UFS host.
 ///
-/// The K3 UFS controller completes every command by polling UTP registers and
-/// has no interrupt-driven completion source, so the controller exposes one
-/// queue that performs SCSI commands synchronously from the hctx maintenance
-/// task. The runtime polls the queue through
-/// [`HardwareQueue::advance_register_retry`] every
-/// [`K3UfsQueue::SYNC_POLL_INTERVAL`]; requests are accepted in bounded
-/// batches and completed from the same task context.
+/// The controller exposes the UFSHCI completion interrupt through the
+/// platform block IRQ binding. The queue still executes one SCSI command at a
+/// time in hctx task context, but command completion normally comes from the
+/// acknowledged IRQ; the doorbell remains a bounded fallback for commands
+/// issued before the runtime IRQ registration is active.
 struct K3UfsController {
     host: Option<K3UfsHost>,
     info: DeviceInfo,
@@ -2037,12 +2070,21 @@ impl K3UfsController {
             return Err(BlkError::NotSupported);
         }
         let host = self.host.take().ok_or(BlkError::InvalidRequest)?;
+        let irq_endpoint = IrqEndpoint::new(
+            UFS_IRQ_SOURCE,
+            IrqQueueMask::from_queue(0).bits(),
+            Box::new(K3UfsIrqHandler {
+                mmio_base: host.mmio_base,
+                completion_events: Arc::clone(&host.completion_events),
+                source_id: UFS_IRQ_SOURCE,
+            }),
+        );
         self.started = true;
         let queue: Box<dyn HardwareQueue> = Box::new(K3UfsQueue::new(host, self.info));
         Ok(ControllerUpdate::with_resources(
             ControllerState::Ready,
             vec![queue],
-            Vec::new(),
+            vec![irq_endpoint],
         ))
     }
 
@@ -2077,7 +2119,12 @@ impl BlockController for K3UfsController {
             {
                 self.current_update()
             }
-            ControllerEvent::Irq(event) if self.started && !self.stopped && event.bits() != 0 => {
+            ControllerEvent::Irq(event)
+                if self.started
+                    && !self.stopped
+                    && event.source_id() == UFS_IRQ_SOURCE
+                    && event.bits() != 0 =>
+            {
                 self.current_update()
             }
             ControllerEvent::QuiesceIrqs if self.stopped => {
@@ -2092,7 +2139,7 @@ impl BlockController for K3UfsController {
     }
 }
 
-/// One synchronous I/O queue bound to the polled K3 UFS host.
+/// One synchronous I/O queue bound to the interrupt-assisted K3 UFS host.
 ///
 /// Requests accepted by [`HardwareQueue::submit_batch_owned`] are staged
 /// internally and executed when the runtime polls
@@ -2108,7 +2155,7 @@ struct K3UfsQueue {
 }
 
 impl K3UfsQueue {
-    /// Poll interval for synchronous SCSI command execution.
+    /// Retry interval used to start staged synchronous SCSI commands.
     const SYNC_POLL_INTERVAL: Duration = Duration::from_millis(1);
 
     fn new(host: K3UfsHost, device: DeviceInfo) -> Self {
@@ -2262,8 +2309,13 @@ impl HardwareQueue for K3UfsQueue {
     }
 
     fn drain_completions(&mut self, _sink: &mut dyn CompletionSink) -> Result<(), BlkError> {
-        // No interrupt-driven completion source; terminal results are produced
-        // by advance_register_retry from the same maintenance task.
+        // `submit_upiu` consumes the completion event while it waits in hctx
+        // task context. An IRQ can still arrive after that command returns;
+        // discard only the already acknowledged bit so it cannot be mistaken
+        // for the next command's completion.
+        self.host
+            .completion_events
+            .fetch_and(!UTP_TRANSFER_REQ_COMPL, Ordering::AcqRel);
         Ok(())
     }
 
@@ -2314,9 +2366,11 @@ fn probe(probe: ProbeFdt<'_>) -> Result<(), OnProbeError> {
     let mmio_base = iomap(base_reg.address as usize, mmio_size)?;
 
     let dma = axklib::dma::device_with_mask(0xFFFFFFFFFFFFFFFF);
+    let completion_events = Arc::new(AtomicU32::new(0));
 
     let mut host = K3UfsHost {
         mmio_base,
+        completion_events,
         clock_freq: 491_520_000,
         nutrs: 0,
         active_lun: 0,
@@ -2372,13 +2426,15 @@ fn probe(probe: ProbeFdt<'_>) -> Result<(), OnProbeError> {
         .select_data_lun()
         .map_err(|e| OnProbeError::other(format!("LUN scan failed: {}", e)))?;
 
-    // Register block device through the IRQ-driven block runtime. The K3 UFS
-    // controller is polled, so the controller exposes one queue that executes
-    // SCSI commands synchronously from the runtime maintenance task.
+    // Keep the FDT interrupt binding. The block runtime resolves the APLIC
+    // source through somehal and registers the controller's UFSHCI endpoint
+    // after the queue has been created.
     let controller = K3UfsController::new(host, num_blocks, block_size as usize);
-    // Do not publish the FDT IRQ until StarryOS has an APLIC provider.
-    probe.into_platform_device().register_block(controller);
-    info!("[k3-ufs] Block device registered");
+    let registration = probe.register_block(controller)?;
+    info!(
+        "[k3-ufs] Block device registered with platform IRQ binding: {:?}",
+        registration
+    );
     info!(
         "[k3-ufs] *** DEVICE READY: SCSI LUN 0x{:x}, {} blocks x {} bytes ***",
         scsi_lun, num_blocks, block_size
@@ -2403,6 +2459,18 @@ mod tests {
         assert_eq!(register_retry_after_for_pending(0), None);
     }
 
+    #[test]
+    fn ufs_irq_acknowledges_only_enabled_controller_status() {
+        assert_eq!(
+            acknowledged_interrupts(UTP_TRANSFER_REQ_COMPL, UFSHCD_ENABLE_INTRS),
+            Some(UTP_TRANSFER_REQ_COMPL)
+        );
+        assert_eq!(
+            acknowledged_interrupts(UTP_TRANSFER_REQ_COMPL, UFSHCD_ERROR_MASK),
+            None
+        );
+    }
+
     #[cfg(not(feature = "pci"))]
     struct KlibImpl;
 
@@ -2417,8 +2485,11 @@ mod tests {
                 PhysAddr::from_usize(addr.as_usize())
             }
 
-            fn mem_make_dma_coherent_uncached(_addr: VirtAddr, _size: usize) -> AxResult {
-                Err(AxError::Unsupported)
+            fn mem_make_dma_coherent_uncached(
+                _addr: VirtAddr,
+                _size: usize,
+            ) -> axklib::DmaCoherentMappingOutcome {
+                axklib::DmaCoherentMappingOutcome::NotStarted(AxError::Unsupported)
             }
 
             fn mem_restore_dma_cached(_addr: VirtAddr, _size: usize) -> AxResult {
