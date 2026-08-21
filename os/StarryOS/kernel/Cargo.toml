@@ -78,7 +78,7 @@ rk3588-pwm = [
     "ax-driver/rk3588-pwm",
     "dep:rdif-pwm",
 ]
-k230-kpu = ["ax-hal/xuantie-c9xx", "dep:axklib", "dep:k230-kpu"]
+k230-kpu = ["ax-hal/xuantie-c9xx", "dep:k230-kpu"]
 k3_com260kit = ["dep:k3_aiUabi", "dep:k3_aiScheduler"]
 claim_serial = []
 vsock = ["ax-runtime/vsock"]
@@ -150,7 +150,6 @@ ax-task = { workspace = true, features = [
     "axtest",
 ] }
 mmio-api.workspace = true
-ax-dma = { workspace = true, optional = true }
 rockchip-rga = { workspace = true, optional = true }
 sg2002-tpu = { workspace = true, optional = true }
 k230-kpu = { workspace = true, optional = true }

@@ -25,6 +25,10 @@ use super::{
 };
 use crate::mm::paging_error_to_ax_error;
 
+/// Maximum frame reference count. Incrementing a frame at or above this
+/// threshold is refused to keep `count` from saturating `u8::MAX`.
+const MAX_FRAME_REF: u8 = u8::MAX - 1;
+
 struct FrameRefCnt {
     count: u8,
 }
@@ -660,6 +664,7 @@ impl BackendOps for CowBackend {
                         warn!("frame reference count overflow");
                         return Err(AxError::BadAddress);
                     }
+                    frame.count += 1;
                     old_pt
                         .protect_page(vaddr, cow_flags)
                         .map_err(paging_error_to_ax_error)?;

@@ -13,6 +13,8 @@ mod irq_bound;
 mod cvsd;
 #[cfg(feature = "k230-sdhci")]
 pub mod k230_sdhci;
+#[cfg(feature = "k3-sdhci")]
+pub mod k3_sdhci;
 #[cfg(feature = "k3-ufs")]
 pub mod k3_ufs;
 #[cfg(feature = "nvme")]

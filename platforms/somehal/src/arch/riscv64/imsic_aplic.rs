@@ -285,7 +285,9 @@ pub fn begin_external_irq() -> Option<super::plic::ActiveIrq> {
     // 详见 ax_riscv_imsic::claim_and_complete。
     let (eiid, _prio) = unsafe { ax_riscv_imsic::claim_and_complete() }?;
 
-    Some(super::plic::ActiveIrq::new_imsic_completed((eiid as usize).into()))
+    Some(super::plic::ActiveIrq::new_imsic_completed(
+        (eiid as usize).into(),
+    ))
 }
 
 pub fn secondary_init_intc() {

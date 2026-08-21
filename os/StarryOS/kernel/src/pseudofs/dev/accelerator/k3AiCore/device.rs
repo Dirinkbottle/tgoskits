@@ -119,45 +119,45 @@ impl K3AiRunner {
             // 一致则直接返回成功，不做重复的 kernel alias 映射，避免泄漏。
             // 参数不一致则拒绝。
             let table = CHANNEL_MEMORY_TABLE.lock();
-            if let Some(table) = table.as_ref() {
-                if let Some(existing) = table.get(&pid) {
-                    if existing.user_va == user_va
-                        && existing.size_bytes == size_bytes
-                        && existing.channel_count == build_param.channel_count
-                    {
-                        // 参数完全一致，幂等返回。
-                        info!(
-                            "k3_airunner: BUILD_CHANNEL pid={} already registered, idempotent \
-                             return, user_va={:#x}, size={:#x}, channels={}",
-                            pid, user_va, size_bytes, build_param.channel_count
-                        );
-                        build_param.owner_pid = pid;
-                        return Ok(0);
-                    }
-                    // 参数不一致，打印差异后拒绝。
-                    if existing.user_va != user_va {
-                        error!(
-                            "k3_airunner: BUILD_CHANNEL pid={} user_va mismatch: existing={:#x}, \
-                             new={:#x}",
-                            pid, existing.user_va, user_va
-                        );
-                    }
-                    if existing.size_bytes != size_bytes {
-                        error!(
-                            "k3_airunner: BUILD_CHANNEL pid={} size_bytes mismatch: \
-                             existing={:#x}, new={:#x}",
-                            pid, existing.size_bytes, size_bytes
-                        );
-                    }
-                    if existing.channel_count != build_param.channel_count {
-                        error!(
-                            "k3_airunner: BUILD_CHANNEL pid={} channel_count mismatch: \
-                             existing={}, new={}",
-                            pid, existing.channel_count, build_param.channel_count
-                        );
-                    }
-                    return Err(VfsError::AlreadyExists);
+            if let Some(table) = table.as_ref()
+                && let Some(existing) = table.get(&pid)
+            {
+                if existing.user_va == user_va
+                    && existing.size_bytes == size_bytes
+                    && existing.channel_count == build_param.channel_count
+                {
+                    // 参数完全一致，幂等返回。
+                    info!(
+                        "k3_airunner: BUILD_CHANNEL pid={} already registered, idempotent return, \
+                         user_va={:#x}, size={:#x}, channels={}",
+                        pid, user_va, size_bytes, build_param.channel_count
+                    );
+                    build_param.owner_pid = pid;
+                    return Ok(0);
                 }
+                // 参数不一致，打印差异后拒绝。
+                if existing.user_va != user_va {
+                    error!(
+                        "k3_airunner: BUILD_CHANNEL pid={} user_va mismatch: existing={:#x}, \
+                         new={:#x}",
+                        pid, existing.user_va, user_va
+                    );
+                }
+                if existing.size_bytes != size_bytes {
+                    error!(
+                        "k3_airunner: BUILD_CHANNEL pid={} size_bytes mismatch: existing={:#x}, \
+                         new={:#x}",
+                        pid, existing.size_bytes, size_bytes
+                    );
+                }
+                if existing.channel_count != build_param.channel_count {
+                    error!(
+                        "k3_airunner: BUILD_CHANNEL pid={} channel_count mismatch: existing={}, \
+                         new={}",
+                        pid, existing.channel_count, build_param.channel_count
+                    );
+                }
+                return Err(VfsError::AlreadyExists);
             }
         }
 

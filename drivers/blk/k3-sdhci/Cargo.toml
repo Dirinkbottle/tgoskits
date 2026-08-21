@@ -9,7 +9,17 @@ keywords = ["spacemit", "k3", "sdhci", "embedded", "no_std"]
 categories = ["embedded", "no-std", "hardware-support"]
 
 [dependencies]
+sdhci-host = { path = "../sdhci-host" }
+sdmmc-protocol = { workspace = true, default-features = false }
 log.workspace = true
+dma-api.workspace = true
 mmio-api.workspace = true
 bitflags = "2"
-thiserror.workspace = true
+
+# Platform integration dependencies
+rdrive = { workspace = true, optional = true }
+axklib = { workspace = true, optional = true }
+
+[features]
+default = []
+platform = ["rdrive", "axklib"]

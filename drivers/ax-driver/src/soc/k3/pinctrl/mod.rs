@@ -325,9 +325,7 @@ impl RdifPinctrl for K3Pinctrl {
             }
             // 强上拉（bias-pull-up = <1>）：设 PULL_EN | PULLUP | STRONG_PULL。
             // value 未使用（上游仅按 arg==1 触发，parser 已负责判定）。
-            PinConfig::Vendor { param, value: _ }
-                if param == K3_PIN_CONFIG_STRONG_PULL =>
-            {
+            PinConfig::Vendor { param, value: _ } if param == K3_PIN_CONFIG_STRONG_PULL => {
                 self.set_config_value(pin, PAD_PULL_EN | PAD_PULLUP | PAD_STRONG_PULL);
                 Ok(())
             }

@@ -16,43 +16,33 @@ Rust implementation of the Linux `sdhci-of-k1.c` driver for SpacemiT K3 and K1 R
 
 ## Architecture
 
-Follows the tgoskits four-layer driver model:
-1. **Driver Core** (this crate) - register definitions, PHY state machine and RX tuning
-2. **Capability Boundary** - MMIO access through `mmio_api::MmioRaw` (raw mapped window)
-3. **OS Glue** - FDT probe, `mmio-api` ioremap, IRQ and block registration (implemented by the consumer, e.g. `ax-driver` or a board layer)
+Follows tgoskits four-layer driver model:
+1. **Driver Core** (this crate) - register definitions and state machines
+2. **Capability Boundary** - `mmio_api::MmioOp`, `dma_api::DmaOp`
+3. **OS Glue** - FDT probe, IRQ registration (in platform layer)
 4. **Runtime** - blocking/async wrappers
-
-This crate is OS-independent: it only requires an already-mapped `MmioRaw` window and never calls `ioremap`/`MmioOp`/`DmaOp` itself.
 
 ## Usage
 
-The MMIO window must be mapped by the OS glue layer before the host is created:
-
 ```rust
-use k3_sdhci::{K3SdhciHost, SdMode, Timing};
-use mmio_api::MmioAddr;
+use k3_sdhci::{K3SdhciHost, Timing};
+use mmio_api::MmioOp;
 
-// In OS glue: ioremap the physical register window (size covers 0x178).
-let mmio = unsafe { mmio_api::ioremap_raw(MmioAddr::from(0x0D42_0000u64), 0x200) }
-    .expect("failed to map K3 SDHCI registers");
-let mut host = K3SdhciHost::new(mmio);
+// Create host with MMIO accessor
+let mut host = K3SdhciHost::new(mmio, base_addr);
 
-// Initialize for eMMC (pass SdMode::Sd for removable SD cards)
-host.reset(SdMode::Emmc);
+// Initialize for eMMC
+host.reset(true);
 
 // Set timing mode
 host.set_timing(Timing::MmcHs200);
 
 // Execute tuning
 host.execute_tuning(Timing::MmcHs200, |delay| {
-    // Test function: send tuning block and check result
+    // Test function: send tuning command and check result
     send_tuning_block() == Ok(())
 })?;
 ```
-
-For bare-metal or test setups without a registered `MmioOp`, construct the
-window directly with `MmioRaw::new(phys, virt, size)` instead of
-`ioremap_raw`.
 
 ## Register Map
 

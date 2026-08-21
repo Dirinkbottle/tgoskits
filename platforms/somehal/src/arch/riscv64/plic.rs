@@ -92,7 +92,23 @@ pub fn irq_set_affinity(
 
 enum Completion {
     None,
-    Plic(NonZeroU32),
+    Plic(PlicClaim),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct PlicClaim {
+    context: usize,
+    source: NonZeroU32,
+}
+
+impl PlicClaim {
+    const fn new(context: usize, source: NonZeroU32) -> Self {
+        Self { context, source }
+    }
+
+    pub(super) const fn into_parts(self) -> (usize, NonZeroU32) {
+        (self.context, self.source)
+    }
 }
 
 pub struct ActiveIrq {
@@ -103,6 +119,17 @@ pub struct ActiveIrq {
 impl ActiveIrq {
     pub fn id(&self) -> rdrive::IrqId {
         self.irq
+    }
+
+    pub(super) fn take_plic_claim(&mut self) -> Option<PlicClaim> {
+        let completion = core::mem::replace(&mut self.completion, Completion::None);
+        match completion {
+            Completion::Plic(claim) => Some(claim),
+            other => {
+                self.completion = other;
+                None
+            }
+        }
     }
 
     /// 供 AIA（IMSIC）使用：claim 与 EOI 已在 `begin_external_irq` 中
@@ -119,8 +146,8 @@ impl ActiveIrq {
 
 impl Drop for ActiveIrq {
     fn drop(&mut self) {
-        match self.completion {
-            Completion::Plic(source) => complete_external_irq_source(source),
+        match core::mem::replace(&mut self.completion, Completion::None) {
+            Completion::Plic(claim) => complete_external_irq_claim(claim),
             Completion::None => {}
         }
     }
@@ -154,16 +181,17 @@ pub fn begin_irq(raw: usize) -> Option<ActiveIrq> {
 }
 
 fn begin_external_irq() -> Option<ActiveIrq> {
-    let source = claim_external_irq_source()?;
+    let claim = claim_external_irq()?;
+    let (_, source) = claim.into_parts();
     Some(ActiveIrq {
         irq: (source.get() as usize).into(),
-        completion: Completion::Plic(source),
+        completion: Completion::Plic(claim),
     })
 }
 
-fn complete_external_irq_source(source: NonZeroU32) {
+fn complete_external_irq_claim(claim: PlicClaim) {
     if let Some(handler) = get_irq_handler() {
-        handler.complete_current(source);
+        handler.complete_claim(claim);
     } else {
         warn!("RISC-V PLIC IRQ handler is not registered when completing external IRQ");
     }
@@ -176,14 +204,18 @@ pub fn secondary_init_intc(cpu_idx: usize) {
     enable_local_interrupts();
 }
 
-pub fn send_ipi_to_cpu(cpu_id: usize) {
-    let Some(hart_id) = someboot::smp::cpu_idx_to_id(cpu_id) else {
-        warn!("failed to resolve hart id for logical CPU {cpu_id}");
-        return;
-    };
+pub fn send_ipi_to_cpu(cpu_id: usize) -> Result<(), crate::irq::IrqError> {
+    let hart_id = someboot::smp::cpu_idx_to_id(cpu_id).ok_or(crate::irq::IrqError::InvalidCpu)?;
+    // The SBI IPI is a doorbell for earlier shared-memory publication. Keep
+    // that publication ordered before firmware makes the interrupt visible.
+    unsafe {
+        core::arch::asm!("fence rw, rw", options(nostack, preserves_flags));
+    }
     let res = sbi_rt::send_ipi(HartMask::from_mask_base(1, hart_id));
-    if !res.is_ok() {
-        warn!("send_ipi to hart {hart_id} failed: {res:?}");
+    if res.is_ok() {
+        Ok(())
+    } else {
+        Err(crate::irq::IrqError::Controller)
     }
 }
 
@@ -289,7 +321,7 @@ fn enable_local_interrupts() {
     }
 }
 
-fn claim_external_irq_source() -> Option<NonZeroU32> {
+fn claim_external_irq() -> Option<PlicClaim> {
     let Some(handler) = get_irq_handler() else {
         warn!("RISC-V PLIC IRQ handler is not registered for external IRQ");
         return None;
@@ -370,7 +402,7 @@ impl RiscvPlicIrqHandler {
         trace!("PLIC context {context} reset");
     }
 
-    fn claim_current(&self) -> Option<NonZeroU32> {
+    fn claim_current(&self) -> Option<PlicClaim> {
         let Some(context) = self.current_context() else {
             warn_missing_current_context();
             return None;
@@ -379,16 +411,21 @@ impl RiscvPlicIrqHandler {
             debug!("Spurious external IRQ");
             return None;
         };
-        Some(source)
+        Some(PlicClaim::new(context, source))
     }
 
-    fn complete_current(&self, source: NonZeroU32) {
-        let Some(context) = self.current_context() else {
-            warn_missing_current_context();
-            return;
-        };
-        self.inner.complete(context, source);
+    fn complete_claim(&self, claim: PlicClaim) {
+        self.inner.complete(claim.context, claim.source);
     }
+}
+
+pub(super) fn complete_deferred_claim(context: usize, source: NonZeroU32) -> bool {
+    let Some(handler) = get_irq_handler() else {
+        warn!("RISC-V PLIC IRQ handler is not registered when completing a deferred claim");
+        return false;
+    };
+    handler.complete_claim(PlicClaim::new(context, source));
+    true
 }
 
 impl RiscvPlic {
@@ -534,5 +571,24 @@ impl Interface for RiscvPlic {
         } else {
             self.disable_source(source)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detached_plic_claim_keeps_the_claiming_context() {
+        let source = NonZeroU32::new(7).unwrap();
+        let mut active = ActiveIrq {
+            irq: 7usize.into(),
+            completion: Completion::Plic(PlicClaim::new(3, source)),
+        };
+
+        let claim = active.take_plic_claim().map(PlicClaim::into_parts);
+
+        assert_eq!(claim, Some((3, source)));
+        assert!(matches!(active.completion, Completion::None));
     }
 }

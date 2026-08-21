@@ -260,7 +260,7 @@ impl K3GmacCore {
         // 不做这步，U-Boot 残留状态会导致 TX DMA 引擎 cur_tx 不前进
         //（即使 ST=1、tail ptr 正确，fetch engine 卡在非 idle 状态）。
         // 失败时仅 log warn 继续执行（部分平台 SWR 自清较慢但后续仍可用）。
-        if let Err(_) = self.reset_dma() {
+        if self.reset_dma().is_err() {
             log::warn!("k3-gmac: DMA soft reset failed; continuing with U-Boot residual state");
         }
         self.stop_dma();
@@ -357,7 +357,10 @@ impl K3GmacCore {
         // 总超时 ~RESET_TIMEOUT µs（匹配 Linux readl_poll_timeout 上限）。
         for i in 0..RESET_TIMEOUT {
             if (self.mmio.read(regs::DMA_BUS_MODE) & regs::DMA_BUS_MODE_SFT_RESET) == 0 {
-                log::info!("k3-gmac: DMA soft reset completed after {} iterations", i + 1);
+                log::info!(
+                    "k3-gmac: DMA soft reset completed after {} iterations",
+                    i + 1
+                );
                 return Ok(());
             }
             // 每次迭代延时约 1µs（50 次 spin_loop ≈ 1µs @ ~20ns/iter）
