@@ -57,7 +57,7 @@ impl Drop for DeviceInfo {
 
 impl DeviceInfoOp for DeviceInfo {
     fn id(&self) -> usize {
-        0
+        self.raw as usize
     }
 
     fn backend_name(&self) -> &str {
@@ -282,6 +282,10 @@ impl DeviceOp for Device {
             Ok(())
         }
         .boxed()
+    }
+
+    fn disconnect(&mut self) -> futures::future::BoxFuture<'_, Result<()>> {
+        async { Ok(()) }.boxed()
     }
 
     fn endpoint(

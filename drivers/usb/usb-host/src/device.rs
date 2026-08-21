@@ -28,6 +28,14 @@ pub enum ProbedDevice {
     Hub(HubDeviceInfo),
 }
 
+/// Connection-state changes discovered during one host topology scan.
+pub struct ProbeChanges {
+    /// Newly enumerated devices and hubs.
+    pub connected: Vec<ProbedDevice>,
+    /// Monotonic logical IDs removed from the topology.
+    pub disconnected: Vec<usize>,
+}
+
 impl ProbedDevice {
     pub fn id(&self) -> usize {
         match self {
@@ -331,6 +339,11 @@ impl Device {
         params: crate::backend::ty::HubParams,
     ) -> Result<(), USBError> {
         self.inner.update_hub(params).await
+    }
+
+    /// Releases host-controller resources after physical removal.
+    pub async fn disconnect(&mut self) -> Result<(), USBError> {
+        self.inner.disconnect().await
     }
 
     pub async fn current_configuration_descriptor(

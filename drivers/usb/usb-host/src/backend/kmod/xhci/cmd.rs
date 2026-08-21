@@ -44,9 +44,11 @@ impl CommandRing {
         &mut self,
         trb: command::Allowed,
     ) -> Result<CommandCompletion, TransferError> {
+        trace!("[xhci-cmd] submit begin: {trb:?}");
         let fur = {
             let mut inner = self.0.lock();
             let trb_addr = inner.ring.enque_command(trb);
+            trace!("[xhci-cmd] TRB queued: addr={:#x}", trb_addr.raw());
             let fur = inner.ring.take_finished_future(trb_addr);
             wmb();
             inner
@@ -54,14 +56,27 @@ impl CommandRing {
                 .write()
                 .doorbell
                 .write_volatile_at(0, doorbell::Register::default());
+            trace!(
+                "[xhci-cmd] command doorbell rung: trb={:#x}",
+                trb_addr.raw()
+            );
             fur
         };
 
         let res = fur.await;
+        trace!(
+            "[xhci-cmd] completion received: trb={:#x}, slot={}, code={:?}",
+            res.command_trb_pointer(),
+            res.slot_id(),
+            res.completion_code()
+        );
 
         match res.completion_code() {
             Ok(code) => code.to_result()?,
-            Err(e) => Err(TransferError::Other(anyhow!("Command failed: {e:?}")))?,
+            Err(e) => {
+                trace!("[xhci-cmd] completion code decode failed: {e:?}");
+                Err(TransferError::Other(anyhow!("Command failed: {e:?}")))?
+            }
         }
 
         Ok(res)

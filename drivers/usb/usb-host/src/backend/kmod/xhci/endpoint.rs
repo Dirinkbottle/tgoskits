@@ -112,6 +112,7 @@ pub struct Endpoint {
     interval: u8,
     iso_start_asap: bool,
     next_iso_frame_id: u16,
+    enumeration_logging: bool,
 }
 
 unsafe impl Send for Endpoint {}
@@ -148,7 +149,12 @@ impl Endpoint {
             interval: 1,
             iso_start_asap: true,
             next_iso_frame_id: 0,
+            enumeration_logging: true,
         })
+    }
+
+    pub fn finish_enumeration_logging(&mut self) {
+        self.enumeration_logging = false;
     }
 
     pub fn configure_periodic(
@@ -209,8 +215,10 @@ impl Endpoint {
         match event.completion_code() {
             Ok(code) => {
                 if let Err(e) = code.to_result() {
-                    warn!(
-                        "xhci: transfer error dci={} kind={} code={:?} remaining={}",
+                    trace!(
+                        "[xhci-enum] transfer completion failed: slot={} ep={} kind={} code={:?} \
+                         remaining={}",
+                        self.slot_id.as_u8(),
                         self.dci.raw(),
                         kind_name,
                         code,
@@ -220,8 +228,10 @@ impl Endpoint {
                 }
             }
             Err(e) => {
-                warn!(
-                    "xhci: transfer error dci={} kind={} unknown_code={} remaining={}",
+                trace!(
+                    "[xhci-enum] transfer completion failed: slot={} ep={} kind={} \
+                     unknown_code={} remaining={}",
+                    self.slot_id.as_u8(),
                     self.dci.raw(),
                     kind_name,
                     e,
@@ -366,13 +376,44 @@ impl Endpoint {
             match event.completion_code() {
                 Ok(code) if code.to_result().is_ok() => {
                     if matches!(stage, ControlStage::Status) {
-                        return Some(
-                            self.complete_request(request_id, event_trb, event)
-                                .map(|transfer| transfer_to_completion(id, transfer)),
-                        );
+                        return Some(self.complete_request(request_id, event_trb, event).map(
+                            |transfer| {
+                                let completion = transfer_to_completion(id, transfer);
+                                if self.enumeration_logging {
+                                    trace!(
+                                        "[xhci-enum] control transfer complete: slot={} ep={} \
+                                         request_id={} stage={stage:?} trb={:#x} actual={}",
+                                        self.slot_id.as_u8(),
+                                        self.dci.raw(),
+                                        id.raw(),
+                                        event_trb.0.raw(),
+                                        completion.actual_length,
+                                    );
+                                } else {
+                                    trace!(
+                                        "xhci: control transfer complete slot={} request_id={} \
+                                         actual={}",
+                                        self.slot_id.as_u8(),
+                                        id.raw(),
+                                        completion.actual_length,
+                                    );
+                                }
+                                completion
+                            },
+                        ));
                     }
                 }
                 _ => {
+                    trace!(
+                        "[xhci-enum] control transfer completion failed: slot={} ep={} \
+                         request_id={} stage={stage:?} trb={:#x} code={:?} remaining={}",
+                        self.slot_id.as_u8(),
+                        self.dci.raw(),
+                        id.raw(),
+                        event_trb.0.raw(),
+                        event.completion_code(),
+                        remaining,
+                    );
                     return Some(
                         self.complete_request(request_id, event_trb, event)
                             .map(|transfer| transfer_to_completion(id, transfer)),
@@ -729,6 +770,32 @@ impl EndpointOp for Endpoint {
                 {
                     self.trb_to_request.insert(trb, request_id);
                 }
+                if self.enumeration_logging {
+                    trace!(
+                        "[xhci-enum] control transfer queued: slot={} ep={} request_id={} \
+                         request={:?} value={:#06x} index={:#06x} direction={:?} bytes={} \
+                         setup_trb={:#x} data_trb={:?} status_trb={:#x}",
+                        self.slot_id.as_u8(),
+                        self.dci.raw(),
+                        request_id.0,
+                        t.request,
+                        t.value,
+                        t.index,
+                        transfer.direction,
+                        data_len,
+                        setup_trb.0.raw(),
+                        data_trb.map(|trb| trb.0.raw()),
+                        status_trb.0.raw(),
+                    );
+                } else {
+                    trace!(
+                        "xhci: control transfer queued slot={} request_id={} request={:?} bytes={}",
+                        self.slot_id.as_u8(),
+                        request_id.0,
+                        t.request,
+                        data_len,
+                    );
+                }
                 SubmittedTdKind::Control(ControlTd {
                     setup_trb,
                     data_trb,
@@ -775,6 +842,27 @@ impl EndpointOp for Endpoint {
         );
         mb();
         self.doorbell();
+        if matches!(
+            self.inflight
+                .get(&request_id)
+                .map(|submitted| &submitted.kind),
+            Some(SubmittedTdKind::Control(_))
+        ) {
+            if self.enumeration_logging {
+                trace!(
+                    "[xhci-enum] control transfer doorbell rung: slot={} ep={} request_id={}",
+                    self.slot_id.as_u8(),
+                    self.dci.raw(),
+                    request_id.0,
+                );
+            } else {
+                trace!(
+                    "xhci: control transfer doorbell rung slot={} request_id={}",
+                    self.slot_id.as_u8(),
+                    request_id.0,
+                );
+            }
+        }
 
         Ok(Self::public_request_id(request_id))
     }

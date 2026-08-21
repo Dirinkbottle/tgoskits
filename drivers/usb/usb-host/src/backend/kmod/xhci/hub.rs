@@ -12,7 +12,7 @@ use futures::{FutureExt, future::BoxFuture, task::AtomicWaker};
 use usb_if::{err::USBError, host::hub::Speed};
 
 use super::reg::{MemMapper, PortStatusRegisters, XhciRegisters};
-use crate::backend::kmod::hub::{HubInfo, HubOp, PortChangeInfo, PortState};
+use crate::backend::kmod::hub::{HubInfo, HubOp, PortChangeInfo, PortEvent, PortState};
 
 pub struct PortChangeWaker {
     ports: Arc<UnsafeCell<Vec<Port>>>,
@@ -76,7 +76,7 @@ impl XhciRootHub {
 }
 
 impl HubOp for XhciRootHub {
-    fn changed_ports(&mut self) -> BoxFuture<'_, Result<Vec<PortChangeInfo>, USBError>> {
+    fn changed_ports(&mut self) -> BoxFuture<'_, Result<Vec<PortEvent>, USBError>> {
         self._changed_ports().boxed()
     }
 
@@ -128,9 +128,61 @@ impl XhciRootHub {
         }
     }
 
-    async fn _changed_ports(&mut self) -> Result<Vec<PortChangeInfo>, USBError> {
+    async fn _changed_ports(&mut self) -> Result<Vec<PortEvent>, USBError> {
+        let mut events = self.handle_disconnected();
         self.handle_uninit().await?;
-        self.handle_reseted().await
+        events.extend(
+            self.handle_reseted()
+                .await?
+                .into_iter()
+                .map(PortEvent::Connected),
+        );
+        self.acknowledge_port_changes();
+        Ok(events)
+    }
+
+    fn acknowledge_port_changes(&mut self) {
+        for index in 0..self.portsc.len() {
+            let status = self.portsc.read_volatile_at(index);
+            if status.port_reset() || status.warm_port_reset() {
+                continue;
+            }
+            let has_change = status.connect_status_change()
+                || status.port_enabled_disabled_change()
+                || status.warm_port_reset_change()
+                || status.over_current_change()
+                || status.port_reset_change()
+                || status.port_link_state_change()
+                || status.port_config_error_change();
+            if !has_change {
+                continue;
+            }
+            self.portsc.update_volatile_at(index, |portsc| {
+                // PORTSC change bits are RW1C and retain their read value in
+                // this update, so the write acknowledges every reported
+                // change. Do not disable an enabled port while acknowledging
+                // them. Reset-in-progress ports are skipped above because the
+                // xHCI register API intentionally exposes reset as write-one.
+                portsc.set_0_port_enabled_disabled();
+            });
+        }
+    }
+
+    fn handle_disconnected(&mut self) -> Vec<PortEvent> {
+        let statuses = (0..self.portsc.len())
+            .map(|index| self.portsc.read_volatile_at(index).current_connect_status())
+            .collect::<Vec<_>>();
+        let mut events = Vec::new();
+        for (index, connected) in statuses.into_iter().enumerate() {
+            let port_id = index as u8 + 1;
+            if let Some(event) = self.ports_mut()[index]
+                .state
+                .take_disconnect_event(connected, port_id)
+            {
+                events.push(event);
+            }
+        }
+        events
     }
 
     async fn handle_uninit(&mut self) -> Result<(), USBError> {
@@ -147,7 +199,12 @@ impl XhciRootHub {
 
             let port = self.portsc.read_volatile_at(i);
 
+            if !port.current_connect_status() {
+                continue;
+            }
+
             if port.port_reset() {
+                self.ports_mut()[i].state = PortState::Reseted;
                 continue;
             }
 
@@ -158,6 +215,15 @@ impl XhciRootHub {
                 port.current_connect_status()
             );
 
+            if port.port_enabled_disabled() {
+                self.ports_mut()[i].state = PortState::Reseted;
+                continue;
+            }
+
+            self.portsc.update_volatile_at(i, |portsc| {
+                portsc.set_0_port_enabled_disabled();
+                portsc.set_port_reset();
+            });
             self.ports_mut()[i].state = PortState::Reseted;
         }
 
@@ -177,7 +243,15 @@ impl XhciRootHub {
         for &id in &reseted {
             let i = (id - 1) as usize;
             let portsc = self.portsc.read_volatile_at(i);
-            if !portsc.current_connect_status() || !portsc.port_enabled_disabled() {
+            if !portsc.current_connect_status() {
+                self.ports_mut()[i].state = PortState::Uninit;
+                continue;
+            }
+            if portsc.port_reset() {
+                continue;
+            }
+            if !portsc.port_enabled_disabled() {
+                self.ports_mut()[i].state = PortState::Uninit;
                 continue;
             }
             let speed_raw = portsc.port_speed();
@@ -190,8 +264,6 @@ impl XhciRootHub {
                 root_port_id: id,
                 port_id: id,
                 port_speed: speed,
-                // Root Hub 不需要 TT
-                tt_port_on_hub: None,
             });
         }
 

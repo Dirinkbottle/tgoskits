@@ -22,7 +22,7 @@ use usb_if::{
 };
 
 use super::{
-    hub::{HubInfo, HubOp, PortChangeInfo, PortState},
+    hub::{HubInfo, HubOp, PortChangeInfo, PortEvent, PortState},
     kcore::CoreOp,
     osal::{Kernel, KernelOp},
 };
@@ -841,12 +841,15 @@ impl Dwc2RootHub {
         Ok(info)
     }
 
-    async fn changed_ports_inner(&mut self) -> Result<Vec<PortChangeInfo>> {
+    async fn changed_ports_inner(&mut self) -> Result<Vec<PortEvent>> {
+        let mut status = self.regs.hprt_status();
+        if let Some(event) = self.port.take_disconnect_event(status.connected(), 1) {
+            return Ok(vec![event]);
+        }
         if matches!(self.port, PortState::Probed) {
             return Ok(Vec::new());
         }
 
-        let mut status = self.regs.hprt_status();
         self.log_port_status("scan", status);
         if !status.connected() {
             return Ok(Vec::new());
@@ -861,12 +864,11 @@ impl Dwc2RootHub {
 
         if status.connected() && status.enabled() {
             self.port = PortState::Probed;
-            Ok(vec![PortChangeInfo {
+            Ok(vec![PortEvent::Connected(PortChangeInfo {
                 root_port_id: 1,
                 port_id: 1,
                 port_speed: status.speed(),
-                tt_port_on_hub: None,
-            }])
+            })])
         } else {
             Ok(Vec::new())
         }
@@ -902,7 +904,7 @@ impl HubOp for Dwc2RootHub {
         self.init_port(info).boxed()
     }
 
-    fn changed_ports<'a>(&'a mut self) -> BoxFuture<'a, Result<Vec<PortChangeInfo>>> {
+    fn changed_ports<'a>(&'a mut self) -> BoxFuture<'a, Result<Vec<PortEvent>>> {
         self.changed_ports_inner().boxed()
     }
 
@@ -1775,6 +1777,11 @@ impl DeviceOp for Dwc2Device {
 
     fn set_configuration<'a>(&'a mut self, configuration_value: u8) -> BoxFuture<'a, Result<()>> {
         self.set_configuration_inner(configuration_value).boxed()
+    }
+
+    fn disconnect(&mut self) -> BoxFuture<'_, Result<()>> {
+        self.eps.clear();
+        async { Ok(()) }.boxed()
     }
 
     fn endpoint(&mut self, desc: &EndpointDescriptor) -> Result<Endpoint> {

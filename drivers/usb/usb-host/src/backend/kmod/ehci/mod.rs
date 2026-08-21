@@ -22,7 +22,7 @@ use usb_if::{
 };
 
 use super::{
-    hub::{HubInfo, HubOp, PortChangeInfo, PortState},
+    hub::{HubInfo, HubOp, PortChangeInfo, PortEvent, PortState},
     kcore::CoreOp,
     osal::{Kernel, KernelOp},
 };
@@ -708,16 +708,21 @@ impl EhciRootHub {
         Ok(info)
     }
 
-    async fn changed_ports_inner(&mut self) -> Result<Vec<PortChangeInfo>> {
+    async fn changed_ports_inner(&mut self) -> Result<Vec<PortEvent>> {
         let mut out = Vec::new();
 
         for port_id in 1..=self.regs.ports() {
             let idx = port_id as usize - 1;
+            let status = self.regs.port_read(port_id);
+            if let Some(event) = self.ports[idx].take_disconnect_event(status.connected(), port_id)
+            {
+                out.push(event);
+                continue;
+            }
             if matches!(self.ports[idx], PortState::Probed) {
                 continue;
             }
 
-            let status = self.regs.port_read(port_id);
             if !status.connected() {
                 continue;
             }
@@ -730,12 +735,11 @@ impl EhciRootHub {
             let status = self.regs.port_read(port_id);
             if status.is_high_speed_device_ready() {
                 self.ports[idx] = PortState::Probed;
-                out.push(PortChangeInfo {
+                out.push(PortEvent::Connected(PortChangeInfo {
                     root_port_id: port_id,
                     port_id,
                     port_speed: Speed::High,
-                    tt_port_on_hub: None,
-                });
+                }));
             } else if status.connected() && !status.enabled() {
                 warn!(
                     "ehci: port {} has non-high-speed device ({:?}); handing to companion is not \
@@ -766,7 +770,7 @@ impl HubOp for EhciRootHub {
         self.init_ports(info).boxed()
     }
 
-    fn changed_ports<'a>(&'a mut self) -> BoxFuture<'a, Result<Vec<PortChangeInfo>>> {
+    fn changed_ports<'a>(&'a mut self) -> BoxFuture<'a, Result<Vec<PortEvent>>> {
         self.changed_ports_inner().boxed()
     }
 
@@ -1015,6 +1019,11 @@ impl DeviceOp for EhciDevice {
 
     fn set_configuration<'a>(&'a mut self, configuration_value: u8) -> BoxFuture<'a, Result<()>> {
         self.set_configuration_inner(configuration_value).boxed()
+    }
+
+    fn disconnect(&mut self) -> BoxFuture<'_, Result<()>> {
+        self.eps.clear();
+        async { Ok(()) }.boxed()
     }
 
     fn endpoint(&mut self, desc: &EndpointDescriptor) -> Result<Endpoint> {

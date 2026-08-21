@@ -31,6 +31,7 @@ vector = []
 tls = ["cpu-local/tls"]
 uspace = ["exception-table"]
 arm-el2 = []
+svpbmt = []
 xuantie-c9xx = []
 
 [dependencies]

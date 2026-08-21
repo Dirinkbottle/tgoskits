@@ -16,7 +16,7 @@ use usb_if::{
     transfer::{Recipient, Request, RequestType},
 };
 
-use super::HubOp;
+use super::{HubOp, PortEvent};
 use crate::{
     Device,
     backend::kmod::hub::{HubInfo, PortChangeInfo},
@@ -85,8 +85,12 @@ impl HubOp for HubDevice {
         self.configure(info).boxed()
     }
 
-    fn changed_ports<'a>(&'a mut self) -> BoxFuture<'a, Result<Vec<PortChangeInfo>, USBError>> {
+    fn changed_ports<'a>(&'a mut self) -> BoxFuture<'a, Result<Vec<PortEvent>, USBError>> {
         self.changed_ports().boxed()
+    }
+
+    fn disconnect(&mut self) -> BoxFuture<'_, Result<(), USBError>> {
+        self.data.dev.disconnect().boxed()
     }
 }
 
@@ -154,7 +158,7 @@ impl HubDevice {
         })
     }
 
-    pub async fn changed_ports(&mut self) -> Result<Vec<PortChangeInfo>, USBError> {
+    pub async fn changed_ports(&mut self) -> Result<Vec<PortEvent>, USBError> {
         let mut changed_ports = vec![];
 
         // 收集所有端口号，避免借用冲突
@@ -172,6 +176,14 @@ impl HubDevice {
                     .await?;
             }
 
+            if let Some(event) = self.data.ports[port_idx as usize]
+                .state
+                .take_disconnect_event(status.connected, port_id)
+            {
+                changed_ports.push(event);
+                continue;
+            }
+
             if status.connected && self.data.ports[port_idx as usize].state == PortState::Uninit {
                 info!(
                     "Port {} connection changed: connected={}, enabled={}",
@@ -183,7 +195,7 @@ impl HubDevice {
 
                 self.data.ports[port_idx as usize].state = PortState::Probed;
 
-                changed_ports.push(validation_result);
+                changed_ports.push(PortEvent::Connected(validation_result));
             }
 
             if change.enabled_changed {
@@ -473,7 +485,7 @@ impl HubDevice {
             "Port {} raw status: 0x{:04x}, change: 0x{:04x}",
             port_id, status_raw, change_raw
         );
-        error!(
+        trace!(
             "[usb-hub] slot={} downstream port {}: connected={}, enabled={}, connection_change={}",
             self.data.dev.slot_id(),
             port_id,
@@ -735,17 +747,10 @@ impl HubDevice {
             port_speed, hub_speed, port.tt_required
         );
 
-        let tt_port_on_hub = if port.tt_required {
-            Some(port_id)
-        } else {
-            None
-        };
-
         Ok(PortChangeInfo {
             root_port_id: self.root_port_id(),
             port_id,
             port_speed,
-            tt_port_on_hub,
         })
     }
 

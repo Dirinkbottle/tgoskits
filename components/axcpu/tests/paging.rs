@@ -49,6 +49,21 @@ fn non_present_riscv_huge_leaf_retains_its_structure() {
     assert_eq!(pte.paddr(false), paddr);
 }
 
+#[cfg(feature = "svpbmt")]
+#[test]
+fn riscv_svpbmt_preserves_leaf_memory_types() {
+    let paddr = PhysAddr::from_usize(0x4000_0000);
+    let permissions = MappingFlags::READ | MappingFlags::WRITE;
+
+    let uncached = Rv64Pte::new_page(paddr, permissions | MappingFlags::UNCACHED, false);
+    assert_eq!((uncached.raw_for_test() >> 61) & 0b11, 0b01);
+    assert_eq!(uncached.config(false), permissions | MappingFlags::UNCACHED);
+
+    let device = Rv64Pte::new_page(paddr, permissions | MappingFlags::DEVICE, false);
+    assert_eq!((device.raw_for_test() >> 61) & 0b11, 0b10);
+    assert_eq!(device.config(false), permissions | MappingFlags::DEVICE);
+}
+
 #[test]
 fn non_present_loongarch_base_leaf_is_not_a_table() {
     let paddr = PhysAddr::from_usize(0x2345_6000);

@@ -1,5 +1,5 @@
 #[cfg(any(kmod, umod))]
-use alloc::boxed::Box;
+use alloc::{boxed::Box, vec::Vec};
 use core::{any::Any, fmt::Debug};
 
 use futures::future::BoxFuture;
@@ -37,6 +37,12 @@ pub enum ProbedDeviceInfoOp {
     Hub(Box<dyn DeviceInfoOp>),
 }
 
+#[cfg(any(kmod, umod))]
+pub struct ProbeChangesOp {
+    pub connected: Vec<ProbedDeviceInfoOp>,
+    pub disconnected: Vec<usize>,
+}
+
 /// USB 设备特征（高层抽象）
 pub(crate) trait DeviceOp: Send + Any + 'static {
     fn id(&self) -> usize;
@@ -58,6 +64,9 @@ pub(crate) trait DeviceOp: Send + Any + 'static {
         &'a mut self,
         configuration_value: u8,
     ) -> BoxFuture<'a, Result<(), USBError>>;
+
+    /// Releases host-controller resources after physical removal.
+    fn disconnect(&mut self) -> BoxFuture<'_, Result<(), USBError>>;
 
     fn endpoint(&mut self, desc: &EndpointDescriptor) -> Result<ep::Endpoint, USBError>;
 

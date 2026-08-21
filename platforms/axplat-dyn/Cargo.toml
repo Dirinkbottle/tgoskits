@@ -19,6 +19,7 @@ fp-simd = ["ax-cpu/fp-simd"]
 tls = ["somehal/tls", "ax-cpu/tls", "cpu-local/tls"]
 uspace = ["somehal/uspace"]
 hv = ["somehal/hv"]
+svpbmt = ["somehal/svpbmt", "ax-cpu/svpbmt"]
 thead-mae = ["somehal/thead-mae", "ax-cpu/xuantie-c9xx"]
 zicbom = ["somehal/zicbom"]
 

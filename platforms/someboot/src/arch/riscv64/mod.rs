@@ -39,6 +39,13 @@ const PTE_A: usize = 1 << 6;
 const PTE_D: usize = 1 << 7;
 const PTE_PPN_MASK: usize = (1 << 44) - 1;
 
+#[cfg(all(not(feature = "thead-mae"), feature = "svpbmt"))]
+const PTE_PBMT_NC: usize = 1 << 61;
+#[cfg(all(not(feature = "thead-mae"), feature = "svpbmt"))]
+const PTE_PBMT_IO: usize = 1 << 62;
+#[cfg(all(not(feature = "thead-mae"), feature = "svpbmt"))]
+const PTE_PBMT_MASK: usize = PTE_PBMT_NC | PTE_PBMT_IO;
+
 #[cfg(feature = "thead-mae")]
 const PTE_THEAD_SEC: usize = 1 << 59;
 #[cfg(feature = "thead-mae")]
@@ -63,7 +70,7 @@ static KERNEL_PAGE_TABLE_ADDR: AtomicUsize = AtomicUsize::new(0);
 static TIMEBASE_FREQ: AtomicUsize = AtomicUsize::new(0);
 
 #[cfg(feature = "thead-mae")]
-fn thead_mae_pte_bits(mem_attr: MemAttributes) -> usize {
+fn pte_memory_type_bits(mem_attr: MemAttributes) -> usize {
     match mem_attr {
         MemAttributes::Device => PTE_THEAD_IO,
         MemAttributes::Uncached => PTE_THEAD_NOCACHE,
@@ -71,13 +78,22 @@ fn thead_mae_pte_bits(mem_attr: MemAttributes) -> usize {
     }
 }
 
-#[cfg(not(feature = "thead-mae"))]
-fn thead_mae_pte_bits(_mem_attr: MemAttributes) -> usize {
+#[cfg(all(not(feature = "thead-mae"), feature = "svpbmt"))]
+fn pte_memory_type_bits(mem_attr: MemAttributes) -> usize {
+    match mem_attr {
+        MemAttributes::Device => PTE_PBMT_IO,
+        MemAttributes::Uncached => PTE_PBMT_NC,
+        MemAttributes::Normal | MemAttributes::PerCpu => 0,
+    }
+}
+
+#[cfg(not(any(feature = "thead-mae", feature = "svpbmt")))]
+fn pte_memory_type_bits(_mem_attr: MemAttributes) -> usize {
     0
 }
 
 #[cfg(feature = "thead-mae")]
-fn thead_mae_mem_attr(bits: usize) -> MemAttributes {
+fn pte_memory_type(bits: usize) -> MemAttributes {
     match bits & PTE_THEAD_MT_MASK {
         PTE_THEAD_IO => MemAttributes::Device,
         PTE_THEAD_NOCACHE => MemAttributes::Uncached,
@@ -85,8 +101,17 @@ fn thead_mae_mem_attr(bits: usize) -> MemAttributes {
     }
 }
 
-#[cfg(not(feature = "thead-mae"))]
-fn thead_mae_mem_attr(_bits: usize) -> MemAttributes {
+#[cfg(all(not(feature = "thead-mae"), feature = "svpbmt"))]
+fn pte_memory_type(bits: usize) -> MemAttributes {
+    match bits & PTE_PBMT_MASK {
+        PTE_PBMT_IO => MemAttributes::Device,
+        PTE_PBMT_NC => MemAttributes::Uncached,
+        _ => MemAttributes::Normal,
+    }
+}
+
+#[cfg(not(any(feature = "thead-mae", feature = "svpbmt")))]
+fn pte_memory_type(_bits: usize) -> MemAttributes {
     MemAttributes::Normal
 }
 
@@ -118,7 +143,7 @@ impl PageTableEntry for Entry {
         if config.writable || config.dirty {
             bits |= PTE_D;
         }
-        bits |= thead_mae_pte_bits(config.mem_attr);
+        bits |= pte_memory_type_bits(config.mem_attr);
 
         bits |= ((paddr.as_usize() >> 12) & PTE_PPN_MASK) << SV39_PPN_SHIFT;
         Self(bits)
@@ -148,7 +173,7 @@ impl PageTableEntry for Entry {
             lower,
             dirty,
             global,
-            mem_attr: thead_mae_mem_attr(bits),
+            mem_attr: pte_memory_type(bits),
         }
     }
 

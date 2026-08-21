@@ -194,8 +194,23 @@ impl Xhci {
     }
 
     async fn new_device(&mut self, info: DeviceAddressInfo) -> Result<Box<dyn DeviceOp>> {
-        let mut device = Device::new(self).await?;
-        device.init(self, &info).await?;
+        trace!(
+            "[xhci-enum] create device begin: root_port={}, port={}, speed={:?}",
+            info.root_port_id, info.port_id, info.port_speed
+        );
+        let mut device = Device::new(self).await.map_err(|error| {
+            trace!("[xhci-enum] create device failed during EnableSlot/context setup: {error:?}");
+            error
+        })?;
+        trace!("[xhci-enum] create device slot ready: slot={}", device.id());
+        device.init(self, &info).await.map_err(|error| {
+            trace!(
+                "[xhci-enum] initialize addressed device failed: slot={}, error={error:?}",
+                device.id()
+            );
+            error
+        })?;
+        trace!("[xhci-enum] create device complete: slot={}", device.id());
 
         Ok(Box::new(device))
     }
@@ -501,12 +516,17 @@ impl Xhci {
         &mut self,
     ) -> core::result::Result<SlotId, TransferError> {
         // enable slot
+        trace!("[xhci-enum] EnableSlot begin");
         let result = self
             .cmd_request(command::Allowed::EnableSlot(command::EnableSlot::default()))
-            .await?;
+            .await
+            .map_err(|error| {
+                trace!("[xhci-enum] EnableSlot failed: {error:?}");
+                error
+            })?;
 
         let slot_id = result.slot_id();
-        trace!("assigned slot id: {slot_id}");
+        trace!("[xhci-enum] EnableSlot complete: slot={slot_id}");
         Ok(slot_id.into())
     }
 }
@@ -582,7 +602,7 @@ impl EventHandler {
                     command_events += 1;
                     let addr = c.command_trb_pointer();
                     trace!(
-                        "xhci: event command ptr={:#x} slot={} code={:?}",
+                        "[xhci-cmd] event received: trb={:#x}, slot={}, code={:?}",
                         addr,
                         c.slot_id(),
                         c.completion_code()

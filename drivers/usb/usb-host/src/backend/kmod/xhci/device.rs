@@ -53,14 +53,20 @@ pub struct Device {
 impl Device {
     pub(crate) async fn new(host: &mut Xhci) -> Result<Self> {
         let slot_id = host.device_slot_assignment().await?;
-        debug!("Slot {slot_id} assigned");
+        trace!("[xhci-enum] slot {slot_id}: allocate device context begin");
         let is_64 = host.is_64bit_ctx();
-        debug!(
-            "Creating new context for slot {slot_id}, {}",
-            if is_64 { "64-bit" } else { "32-bit" }
-        );
         let dma = host.kernel.clone();
-        let ctx = host.dev_mut()?.new_ctx(slot_id, is_64, &dma)?;
+        let ctx = host
+            .dev_mut()
+            .and_then(|devices| devices.new_ctx(slot_id, is_64, &dma))
+            .map_err(|error| {
+                trace!("[xhci-enum] slot {slot_id}: allocate device context failed: {error:?}");
+                error
+            })?;
+        trace!(
+            "[xhci-enum] slot {slot_id}: allocate device context complete, context_bits={}",
+            if is_64 { 64 } else { 32 }
+        );
         let bell = host.new_slot_bell(slot_id);
         let bell = Arc::new(Mutex::new(bell));
         // let port_speed = host.port_speed(port);
@@ -93,6 +99,10 @@ impl Device {
         )?;
         self.transfer_result_handler
             .register_queue(self.id.as_u8(), dci.as_u8(), ep.ring());
+        if dci == Dci::CTRL {
+            self.transfer_result_handler
+                .set_enumeration_logging(self.id.as_u8(), true);
+        }
 
         Ok(ep)
     }
@@ -110,27 +120,65 @@ impl Device {
         self.port_speed = info.port_speed;
         // let speed = info.port_speed.to_xhci_portsc_value();
 
-        let ep = self.new_ep(Dci::CTRL)?;
+        let slot_id = self.id.as_u8();
+        trace!("[xhci-enum] slot {slot_id}: create EP0 begin");
+        let ep = self.new_ep(Dci::CTRL).map_err(|error| {
+            trace!("[xhci-enum] slot {slot_id}: create EP0 failed: {error:?}");
+            error
+        })?;
         self.ctrl_ep = Some(Endpoint::new(EndpointInfo::control(), ep));
-        self.address(host, info).await?;
+        trace!("[xhci-enum] slot {slot_id}: create EP0 complete");
+        trace!("[xhci-enum] slot {slot_id}: AddressDevice begin");
+        self.address(host, info).await.map_err(|error| {
+            trace!("[xhci-enum] slot {slot_id}: AddressDevice failed: {error:?}");
+            error
+        })?;
+        trace!("[xhci-enum] slot {slot_id}: AddressDevice complete");
         // self.dump_device_out();
-        let base = self.get_device_descriptor_base().await?;
-        debug!("Device Descriptor Base: {:#x?}", base);
 
-        self.setup_max_packet(base).await?;
+        trace!("[xhci-enum] slot {slot_id}: GET_DESCRIPTOR base begin");
+        let base = log_enumeration_step(
+            slot_id,
+            "GET_DESCRIPTOR base",
+            self.get_device_descriptor_base().await,
+        )?;
+        trace!("[xhci-enum] slot {slot_id}: device descriptor base={base:#x?}");
+
+        trace!("[xhci-enum] slot {slot_id}: configure EP0 max packet begin");
+        log_enumeration_step(
+            slot_id,
+            "configure EP0 max packet",
+            self.setup_max_packet(base).await,
+        )?;
 
         // 读取当前配置（应该返回 0，表示未配置）
-        let current_config = self.get_configuration().await?;
-        debug!("Current configuration value: {}", current_config);
+        trace!("[xhci-enum] slot {slot_id}: GET_CONFIGURATION begin");
+        let current_config =
+            log_enumeration_step(slot_id, "GET_CONFIGURATION", self.get_configuration().await)?;
+        trace!("[xhci-enum] slot {slot_id}: current configuration={current_config}");
 
-        self.read_descriptor().await?;
+        trace!("[xhci-enum] slot {slot_id}: GET_DESCRIPTOR device begin");
+        log_enumeration_step(
+            slot_id,
+            "GET_DESCRIPTOR device",
+            self.read_descriptor().await,
+        )?;
 
         // 读取所有配置描述符
         for i in 0..self.desc.num_configurations {
+            trace!("[xhci-enum] slot {slot_id}: GET_DESCRIPTOR configuration {i} begin");
             let config_desc = self
                 .control_endpoint_mut()
                 .get_configuration_descriptor(i)
-                .await?;
+                .await
+                .map_err(|error| {
+                    trace!(
+                        "[xhci-enum] slot {slot_id}: GET_DESCRIPTOR configuration {i} failed: \
+                         {error:?}"
+                    );
+                    error
+                })?;
+            trace!("[xhci-enum] slot {slot_id}: GET_DESCRIPTOR configuration {i} complete");
             self.config_desc.push(config_desc);
         }
 
@@ -138,11 +186,19 @@ impl Device {
         // 参考 USB 2.0 规范第 9.1.1 节和 u-boot 的 usb_set_configure_device
         if !self.config_desc.is_empty() {
             let config_value = self.config_desc[0].configuration_value;
-            debug!("Setting device configuration to {}", config_value);
-            self._set_configuration(config_value).await?;
+            trace!("[xhci-enum] slot {slot_id}: SET_CONFIGURATION {config_value} begin");
+            log_enumeration_step(
+                slot_id,
+                "SET_CONFIGURATION",
+                self._set_configuration(config_value).await,
+            )?;
         }
 
-        debug!("device descriptor ok");
+        trace!("[xhci-enum] slot {slot_id}: device descriptor ok");
+        self.control_endpoint_mut()
+            .with_raw_mut::<XhciEndpoint, _>(XhciEndpoint::finish_enumeration_logging);
+        self.transfer_result_handler
+            .set_enumeration_logging(slot_id, false);
         Ok(())
     }
 
@@ -719,6 +775,42 @@ impl Device {
         self.evaluate().await?;
         Ok(())
     }
+
+    async fn disconnect_inner(&mut self) -> Result<()> {
+        let slot_id = self.id.as_u8();
+        trace!("[xhci-hotplug] slot {slot_id}: DisableSlot begin");
+        self.cmd
+            .cmd_request(command::Allowed::DisableSlot(
+                *command::DisableSlot::default().set_slot_id(self.id.into()),
+            ))
+            .await
+            .map_err(|error| {
+                trace!("[xhci-hotplug] slot {slot_id}: DisableSlot failed: {error:?}");
+                error
+            })?;
+
+        // Disable Slot is the hardware ownership boundary. Remove IRQ routing
+        // before endpoint rings are dropped with this device object.
+        self.transfer_result_handler.unregister_slot(slot_id);
+        self.eps.clear();
+        self.ep_interfaces.clear();
+        self.ctrl_ep = None;
+        trace!("[xhci-hotplug] slot {slot_id}: DisableSlot complete");
+        Ok(())
+    }
+}
+
+fn log_enumeration_step<T>(slot_id: u8, step: &str, result: Result<T>) -> Result<T> {
+    match result {
+        Ok(value) => {
+            trace!("[xhci-enum] slot {slot_id}: {step} complete");
+            Ok(value)
+        }
+        Err(error) => {
+            trace!("[xhci-enum] slot {slot_id}: {step} failed: {error:?}");
+            Err(error)
+        }
+    }
 }
 
 impl DeviceOp for Device {
@@ -752,6 +844,10 @@ impl DeviceOp for Device {
 
     fn set_configuration<'a>(&'a mut self, configuration_value: u8) -> BoxFuture<'a, Result<()>> {
         self._set_configuration(configuration_value).boxed()
+    }
+
+    fn disconnect(&mut self) -> BoxFuture<'_, Result<()>> {
+        self.disconnect_inner().boxed()
     }
 
     fn configuration_descriptors(&self) -> &[ConfigurationDescriptor] {

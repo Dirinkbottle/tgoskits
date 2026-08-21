@@ -3,6 +3,7 @@ use core::{
     future::poll_fn,
     sync::atomic::{AtomicU64, Ordering},
     task::{Context, Poll},
+    time::Duration,
 };
 
 use ax_errno::{AxError, AxResult, LinuxError};
@@ -11,7 +12,7 @@ use ax_runtime::hal::irq::IrqId;
 use ax_sync::Mutex as BlockingMutex;
 use ax_task::IrqNotify;
 use crab_usb::{
-    Device, DeviceInfo, Endpoint, ProbedDevice,
+    Device, DeviceInfo, Endpoint, ProbeChanges, ProbedDevice,
     usb_if::{
         endpoint::{RequestId, TransferCompletion, TransferRequest},
         err::{TransferError, USBError},
@@ -40,6 +41,7 @@ const USB_REQ_GET_DESCRIPTOR: u8 = 0x06;
 const USB_REQ_GET_CONFIGURATION: u8 = 0x08;
 const USB_DT_DEVICE: u16 = 0x01;
 const USB_DT_CONFIG: u16 = 0x02;
+const USBFS_TOPOLOGY_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 pub(super) struct UsbHostState {
     pub(super) device_id: RDriveDeviceId,
@@ -423,6 +425,12 @@ impl UsbFsManager {
         !self.state.lock().hosts.is_empty()
     }
 
+    fn request_topology_poll(&self) {
+        for host in &mut self.state.lock().hosts {
+            host.needs_probe = true;
+        }
+    }
+
     pub(super) fn refresh_dirty_hosts(&self) {
         let pending_hosts = {
             let mut state = self.state.lock();
@@ -467,7 +475,7 @@ impl UsbFsManager {
                 }
             };
 
-            let devices = match ax_task::future::block_on(guard.host_mut().probe_devices()) {
+            let devices = match ax_task::future::block_on(guard.host_mut().probe_changes()) {
                 Ok(devices) => devices,
                 Err(err) => {
                     warn!("usbfs: refresh probe failed on bus {bus_num}: {err:?}");
@@ -608,12 +616,11 @@ impl UsbFsManager {
         }
     }
 
-    fn apply_probe_results(
-        &self,
-        device_id: RDriveDeviceId,
-        bus_num: u8,
-        devices: Vec<ProbedDevice>,
-    ) {
+    fn apply_probe_results(&self, device_id: RDriveDeviceId, bus_num: u8, changes: ProbeChanges) {
+        let ProbeChanges {
+            connected: devices,
+            disconnected,
+        } = changes;
         let mut state = self.state.lock();
         let Some(host_index) = state
             .hosts
@@ -627,9 +634,18 @@ impl UsbFsManager {
             let host_state = &mut state.hosts[host_index];
             let mut updates = Vec::new();
             for device in devices {
+                let logical_id = device.id();
+                let descriptor = device.descriptor();
+                let vendor_id = descriptor.vendor_id;
+                let product_id = descriptor.product_id;
+                let class = descriptor.class;
+                let kind = match &device {
+                    ProbedDevice::Device(_) => "device",
+                    ProbedDevice::Hub(_) => "hub",
+                };
                 let stable_id = UsbStableId {
                     host_device_id: device_id,
-                    device_id: device.id(),
+                    device_id: logical_id,
                 };
                 let snapshot = snapshot_probed_device(
                     bus_num,
@@ -639,12 +655,60 @@ impl UsbFsManager {
                 );
                 let unopened_info = device.into_device_info();
                 let openable = unopened_info.is_some();
-                updates.push((stable_id, snapshot, unopened_info, openable));
+                updates.push((
+                    stable_id,
+                    snapshot,
+                    unopened_info,
+                    openable,
+                    kind,
+                    vendor_id,
+                    product_id,
+                    class,
+                ));
             }
             updates
         };
 
-        for (stable_id, snapshot, unopened_info, openable) in updates {
+        let mut hotplug_logs = Vec::new();
+        let disconnected_devices = disconnected
+            .into_iter()
+            .filter_map(|logical_id| {
+                let stable_id = UsbStableId {
+                    host_device_id: device_id,
+                    device_id: logical_id,
+                };
+                let record = state.devices.get_mut(&stable_id)?;
+                if !record.present {
+                    return None;
+                }
+                let kind = if record.openable { "device" } else { "hub" };
+                if let Some((vendor_id, product_id, class)) =
+                    snapshot_device_identity(&record.snapshot)
+                {
+                    hotplug_logs.push((
+                        "disconnected",
+                        kind,
+                        logical_id,
+                        record.snapshot.bus_num,
+                        record.snapshot.device_num,
+                        vendor_id,
+                        product_id,
+                        class,
+                    ));
+                }
+                record.present = false;
+                record.unopened_info = None;
+                record.live_device.clone()
+            })
+            .collect::<Vec<_>>();
+
+        for (stable_id, snapshot, unopened_info, openable, kind, vendor_id, product_id, class) in
+            updates
+        {
+            let is_new_connection = state
+                .devices
+                .get(&stable_id)
+                .is_none_or(|record| !record.present);
             let record = state
                 .devices
                 .entry(stable_id)
@@ -664,6 +728,33 @@ impl UsbFsManager {
             record.present = true;
             record.openable = openable;
             record.unopened_info = unopened_info;
+            if is_new_connection {
+                hotplug_logs.push((
+                    "connected",
+                    kind,
+                    stable_id.device_id,
+                    record.snapshot.bus_num,
+                    record.snapshot.device_num,
+                    vendor_id,
+                    product_id,
+                    class,
+                ));
+            }
+        }
+        drop(state);
+
+        for (state, kind, logical_id, bus, device, vendor_id, product_id, class) in hotplug_logs {
+            error!(
+                "[usb-hotplug] bus={bus} device={device} logical_id={logical_id} state={state} \
+                 kind={kind} vid={vendor_id:04x} pid={product_id:04x} class={class:#04x}"
+            );
+        }
+
+        for live_device in disconnected_devices {
+            let mut device = live_device.device.lock();
+            if let Err(err) = ax_task::future::block_on(device.disconnect()) {
+                warn!("usbfs: failed to release disconnected USB device: {err:?}");
+            }
         }
     }
 
@@ -750,7 +841,7 @@ impl UsbFsManager {
             .map_err(|_| AxError::NoSuchDevice)?;
         let mut guard = host.lock().map_err(|_| AxError::ResourceBusy)?;
         let devices =
-            ax_task::future::block_on(guard.host_mut().probe_devices()).map_err(map_usb_error)?;
+            ax_task::future::block_on(guard.host_mut().probe_changes()).map_err(map_usb_error)?;
         drop(guard);
         self.apply_probe_results(host_device_id, bus_num, devices);
         Ok(())
@@ -1188,10 +1279,23 @@ fn snapshot_config_blob(snapshot: &UsbDeviceSnapshot, index: usize) -> Option<&[
     None
 }
 
+fn snapshot_device_identity(snapshot: &UsbDeviceSnapshot) -> Option<(u16, u16, u8)> {
+    let descriptor = snapshot.descriptor_blob.get(..12)?;
+    let vendor_id = u16::from_le_bytes([descriptor[8], descriptor[9]]);
+    let product_id = u16::from_le_bytes([descriptor[10], descriptor[11]]);
+    Some((vendor_id, product_id, descriptor[4]))
+}
+
 pub(super) fn usbfs_refresh_task(manager: Arc<UsbFsManager>) {
     loop {
-        manager.irq_notify.wait();
-        manager.usb_activity.event.notify(usize::MAX);
+        let timed_out = manager
+            .irq_notify
+            .wait_timeout(USBFS_TOPOLOGY_POLL_INTERVAL);
+        if timed_out {
+            manager.request_topology_poll();
+        } else {
+            manager.usb_activity.event.notify(usize::MAX);
+        }
         manager.refresh_dirty_hosts();
     }
 }
@@ -1262,7 +1366,7 @@ pub(super) fn initialize_hosts(manager: &UsbFsManager) -> usize {
             irq::bootstrap_irq(host_irq);
         }
 
-        let devices = match ax_task::future::block_on(guard.host_mut().probe_devices()) {
+        let devices = match ax_task::future::block_on(guard.host_mut().probe_changes()) {
             Ok(devices) => devices,
             Err(err) => {
                 warn!("usbfs: initial probe failed on bus {bus_num}: {err:?}");
@@ -1479,5 +1583,19 @@ mod tests {
 
         assert_eq!(result, Err("control request failed"));
         assert!(!reset_called.get());
+    }
+
+    #[test]
+    fn snapshot_identity_reads_device_descriptor_fields() {
+        let snapshot = UsbDeviceSnapshot {
+            bus_num: 1,
+            device_num: 2,
+            descriptor_blob: vec![18, 1, 0, 2, 9, 0, 1, 64, 0x34, 0x12, 0x78, 0x56],
+        };
+
+        assert_eq!(
+            snapshot_device_identity(&snapshot),
+            Some((0x1234, 0x5678, 9))
+        );
     }
 }

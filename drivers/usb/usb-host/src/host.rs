@@ -6,7 +6,7 @@ use alloc::vec::Vec;
 pub use super::backend::kmod::*;
 #[cfg(umod)]
 pub use super::backend::umod::*;
-pub use crate::device::{Device, DeviceInfo, HubDeviceInfo, ProbedDevice};
+pub use crate::device::{Device, DeviceInfo, HubDeviceInfo, ProbeChanges, ProbedDevice};
 use crate::{
     backend::{BackendOp, ty::*},
     err::Result,
@@ -31,16 +31,25 @@ impl USBHost {
 
     #[cfg(any(kmod, umod))]
     pub async fn probe_devices(&mut self) -> Result<Vec<ProbedDevice>> {
-        let device_infos = self.backend.device_list().await?;
-        let mut devices = Vec::new();
-        for dev in device_infos {
+        Ok(self.probe_changes().await?.connected)
+    }
+
+    #[cfg(any(kmod, umod))]
+    /// Returns connection and disconnection transitions since the last scan.
+    pub async fn probe_changes(&mut self) -> Result<ProbeChanges> {
+        let changes = self.backend.device_list().await?;
+        let mut connected = Vec::new();
+        for dev in changes.connected {
             let dev_info = match dev {
                 ProbedDeviceInfoOp::Device(inner) => ProbedDevice::Device(DeviceInfo { inner }),
                 ProbedDeviceInfoOp::Hub(inner) => ProbedDevice::Hub(HubDeviceInfo { inner }),
             };
-            devices.push(dev_info);
+            connected.push(dev_info);
         }
-        Ok(devices)
+        Ok(ProbeChanges {
+            connected,
+            disconnected: changes.disconnected,
+        })
     }
 
     #[cfg(kmod)]
@@ -88,7 +97,7 @@ impl EventHandler {
 
 #[cfg(test)]
 mod tests {
-    use alloc::sync::Arc;
+    use alloc::{sync::Arc, vec};
     use core::{
         future::Future,
         pin::Pin,
@@ -103,7 +112,7 @@ mod tests {
     use super::*;
     use crate::backend::{
         BackendOp,
-        ty::{DeviceOp, ProbedDeviceInfoOp},
+        ty::{DeviceOp, ProbeChangesOp},
     };
 
     #[derive(Default)]
@@ -115,6 +124,7 @@ mod tests {
 
     struct TestBackend {
         calls: Arc<IrqCalls>,
+        disconnected: Vec<usize>,
     }
 
     impl BackendOp for TestBackend {
@@ -126,8 +136,15 @@ mod tests {
         #[cfg(any(kmod, umod))]
         fn device_list<'a>(
             &'a mut self,
-        ) -> futures::future::BoxFuture<'a, crate::err::Result<Vec<ProbedDeviceInfoOp>>> {
-            async { Ok(Vec::new()) }.boxed()
+        ) -> futures::future::BoxFuture<'a, crate::err::Result<ProbeChangesOp>> {
+            let disconnected = core::mem::take(&mut self.disconnected);
+            async {
+                Ok(ProbeChangesOp {
+                    connected: Vec::new(),
+                    disconnected,
+                })
+            }
+            .boxed()
         }
 
         fn open_device<'a>(
@@ -191,6 +208,7 @@ mod tests {
         let mut host = USBHost {
             backend: Box::new(TestBackend {
                 calls: calls.clone(),
+                disconnected: Vec::new(),
             }),
             initialized: false,
         };
@@ -208,6 +226,7 @@ mod tests {
         let mut host = USBHost {
             backend: Box::new(TestBackend {
                 calls: calls.clone(),
+                disconnected: Vec::new(),
             }),
             initialized: false,
         };
@@ -216,5 +235,21 @@ mod tests {
         block_on_ready(host.init()).unwrap();
 
         assert_eq!(calls.init.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn host_preserves_disconnected_device_ids() {
+        let mut host = USBHost {
+            backend: Box::new(TestBackend {
+                calls: Arc::new(IrqCalls::default()),
+                disconnected: vec![7, 9],
+            }),
+            initialized: true,
+        };
+
+        let changes = block_on_ready(host.probe_changes()).unwrap();
+
+        assert!(changes.connected.is_empty());
+        assert_eq!(changes.disconnected, vec![7, 9]);
     }
 }

@@ -1,4 +1,7 @@
-use alloc::{collections::BTreeMap, sync::Arc};
+use alloc::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+};
 
 use xhci::ring::trb::event::{CompletionCode, TransferEvent};
 
@@ -16,7 +19,13 @@ pub struct TransQueueId {
 
 #[derive(Clone)]
 pub struct TransferResultHandler {
-    inner: Arc<IrqLock<BTreeMap<TransQueueId, Finished<TransferEvent>>>>,
+    inner: Arc<IrqLock<TransferRoutes>>,
+}
+
+#[derive(Default)]
+struct TransferRoutes {
+    queues: BTreeMap<TransQueueId, Finished<TransferEvent>>,
+    enumerating_slots: BTreeSet<u8>,
 }
 
 unsafe impl Send for TransferResultHandler {}
@@ -24,14 +33,31 @@ unsafe impl Send for TransferResultHandler {}
 impl TransferResultHandler {
     pub fn new(reg: XhciRegistersShared) -> Self {
         Self {
-            inner: Arc::new(IrqLock::new(BTreeMap::new(), reg)),
+            inner: Arc::new(IrqLock::new(TransferRoutes::default(), reg)),
         }
     }
 
     pub fn register_queue(&mut self, slot_id: u8, ep_id: u8, ring: &SendRing<TransferEvent>) {
         let id = TransQueueId { slot_id, ep_id };
         let handle = ring.finished_handle();
-        self.inner.lock().insert(id, handle);
+        self.inner.lock().queues.insert(id, handle);
+    }
+
+    pub fn set_enumeration_logging(&self, slot_id: u8, enabled: bool) {
+        let mut routes = self.inner.lock();
+        if enabled {
+            routes.enumerating_slots.insert(slot_id);
+        } else {
+            routes.enumerating_slots.remove(&slot_id);
+        }
+    }
+
+    pub fn unregister_slot(&self, slot_id: u8) {
+        let mut routes = self.inner.lock();
+        routes
+            .queues
+            .retain(|queue_id, _| queue_id.slot_id != slot_id);
+        routes.enumerating_slots.remove(&slot_id);
     }
 
     /// Marks a queue completion from the xHCI interrupt path.
@@ -56,15 +82,28 @@ impl TransferResultHandler {
         }
 
         let queue_id = TransQueueId { slot_id, ep_id };
-        if let Some(q) = unsafe { self.inner.force_use().get(&queue_id) } {
-            trace!(
-                "xhci: dispatch transfer event slot={} ep={} ptr={:#x} code={:?} len={}",
-                slot_id,
-                ep_id,
-                ptr.raw(),
-                res.completion_code(),
-                res.trb_transfer_length()
-            );
+        let routes = unsafe { self.inner.force_use() };
+        if let Some(q) = routes.queues.get(&queue_id) {
+            if ep_id == 1 && routes.enumerating_slots.contains(&slot_id) {
+                trace!(
+                    "[xhci-enum] control transfer event: slot={} ep={} trb={:#x} code={:?} \
+                     remaining={}",
+                    slot_id,
+                    ep_id,
+                    ptr.raw(),
+                    res.completion_code(),
+                    res.trb_transfer_length()
+                );
+            } else {
+                trace!(
+                    "xhci: dispatch transfer event slot={} ep={} ptr={:#x} code={:?} len={}",
+                    slot_id,
+                    ep_id,
+                    ptr.raw(),
+                    res.completion_code(),
+                    res.trb_transfer_length()
+                );
+            }
             q.set_finished(ptr, res);
         } else {
             warn!(

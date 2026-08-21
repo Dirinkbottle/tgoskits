@@ -6,13 +6,40 @@ use core::{any::Any, fmt::Debug};
 // 重新导出常用类型
 pub use device::{HubDevice, PortState};
 use futures::future::BoxFuture;
-use id_arena::Id;
 use usb_if::{err::USBError, host::hub::Speed};
+
+/// Monotonic identity of a hub in the USB topology.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct HubId(usize);
+
+impl HubId {
+    pub(crate) const fn new(raw: usize) -> Self {
+        Self(raw)
+    }
+}
 
 pub trait HubOp: Send + 'static + Any {
     fn init<'a>(&'a mut self, info: HubInfo) -> BoxFuture<'a, Result<HubInfo, USBError>>;
-    fn changed_ports<'a>(&'a mut self) -> BoxFuture<'a, Result<Vec<PortChangeInfo>, USBError>>;
+    fn changed_ports<'a>(&'a mut self) -> BoxFuture<'a, Result<Vec<PortEvent>, USBError>>;
+
+    /// Releases the device backing an external hub.
+    ///
+    /// Root hubs use the default because they are part of the host controller
+    /// and do not own a device slot.
+    fn disconnect(&mut self) -> BoxFuture<'_, Result<(), USBError>> {
+        Box::pin(async { Ok(()) })
+    }
+
     fn slot_id(&self) -> u8;
+}
+
+/// A connection-state transition reported by a hub port.
+#[derive(Debug, Clone)]
+pub enum PortEvent {
+    /// A device became ready for addressing.
+    Connected(PortChangeInfo),
+    /// The previously enumerated device left this port.
+    Disconnected { port_id: u8 },
 }
 
 #[derive(Debug, Clone)]
@@ -20,8 +47,6 @@ pub struct PortChangeInfo {
     pub root_port_id: u8,
     pub port_id: u8,
     pub port_speed: Speed,
-    /// 设备在 Hub 上的端口号（如果需要 Transaction Translator）
-    pub tt_port_on_hub: Option<u8>,
 }
 
 pub struct Hub {
@@ -31,9 +56,9 @@ pub struct Hub {
 impl Hub {
     pub fn new(
         backend: Box<dyn HubOp>,
-        infos: &BTreeMap<Id<Hub>, HubInfo>,
+        infos: &BTreeMap<HubId, HubInfo>,
         port_id: u8,
-        parent: Option<Id<Hub>>,
+        parent: Option<HubId>,
     ) -> Self {
         let slot_id;
         let mut hub_depth = 0;
@@ -74,7 +99,7 @@ impl Hub {
 #[derive(Debug, Clone)]
 pub struct HubInfo {
     /// 若为 None, 则表示 Root Hub
-    pub parent: Option<Id<Hub>>,
+    pub parent: Option<HubId>,
     pub slot_id: u8,
     pub hub_depth: isize,
     pub speed: Speed,
@@ -86,4 +111,38 @@ pub struct HubInfo {
 pub struct UsbTt {
     pub multi: bool,
     pub think_time_ns: usize,
+}
+
+impl PortState {
+    pub(crate) fn take_disconnect_event(
+        &mut self,
+        connected: bool,
+        port_id: u8,
+    ) -> Option<PortEvent> {
+        if connected || !matches!(self, Self::Probed) {
+            return None;
+        }
+
+        *self = Self::Uninit;
+        Some(PortEvent::Disconnected { port_id })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn probed_port_disconnects_and_becomes_reenumerable() {
+        let mut state = PortState::Probed;
+
+        let event = state.take_disconnect_event(false, 5);
+
+        assert!(matches!(
+            event,
+            Some(PortEvent::Disconnected { port_id: 5 })
+        ));
+        assert_eq!(state, PortState::Uninit);
+        assert!(state.take_disconnect_event(false, 5).is_none());
+    }
 }
