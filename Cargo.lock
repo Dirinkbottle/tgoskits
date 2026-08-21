@@ -828,6 +828,7 @@ dependencies = [
  "fxmac_rs",
  "heapless",
  "irq-framework",
+ "k3-sdhci",
  "log",
  "mmio-api",
  "nvme-driver",
