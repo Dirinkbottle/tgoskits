@@ -11,6 +11,9 @@ cfg_if::cfg_if! {
     } else if #[cfg(target_arch = "riscv64")] {
         #[path = "riscv64.rs"]
         pub mod arch;
+    } else if #[cfg(target_arch = "riscv64")] {
+        #[path = "riscv64.rs"]
+        pub mod arch;
     } else{
         #[path = "nop.rs"]
         pub mod arch;
