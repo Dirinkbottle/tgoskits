@@ -6,6 +6,7 @@ use usb_if::{
     transfer::Direction,
 };
 
+pub mod cdc_acm;
 pub mod ch34x;
 pub mod cp210x;
 
@@ -43,7 +44,8 @@ pub struct UsbDeviceId {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct UsbSerialPort {
-    pub interface: u8,
+    pub control_interface: u8,
+    pub data_interface: u8,
     pub bulk_in: u8,
     pub bulk_out: u8,
 }
@@ -52,6 +54,7 @@ pub struct UsbSerialPort {
 pub enum UsbSerialChip {
     Cp210x,
     Ch34x,
+    CdcAcm,
 }
 
 impl UsbSerialChip {
@@ -59,6 +62,7 @@ impl UsbSerialChip {
         match self {
             Self::Cp210x => "cp210x",
             Self::Ch34x => "ch34x",
+            Self::CdcAcm => "cdc-acm",
         }
     }
 
@@ -71,6 +75,7 @@ impl UsbSerialChip {
         match self {
             Self::Cp210x => cp210x::init(control, port, baud),
             Self::Ch34x => ch34x::init(control, port, baud),
+            Self::CdcAcm => cdc_acm::init(control, port, baud),
         }
     }
 
@@ -83,6 +88,7 @@ impl UsbSerialChip {
         match self {
             Self::Cp210x => cp210x::set_baud(control, port, baud),
             Self::Ch34x => ch34x::set_baud(control, port, baud),
+            Self::CdcAcm => cdc_acm::set_line_coding(control, port, baud),
         }
     }
 }
@@ -104,6 +110,13 @@ pub fn probe_supported_port(descriptor_blob: &[u8]) -> Option<UsbSerialPortMatch
 
     if let Some(port) = ch34x::probe(descriptor_blob).map(|port| UsbSerialPortMatch {
         chip: UsbSerialChip::Ch34x,
+        port,
+    }) {
+        return Some(port);
+    }
+
+    if let Some(port) = cdc_acm::probe(descriptor_blob).map(|port| UsbSerialPortMatch {
+        chip: UsbSerialChip::CdcAcm,
         port,
     }) {
         return Some(port);
@@ -159,7 +172,8 @@ fn bulk_pair_from_interface(interface: &InterfaceDescriptor) -> Option<UsbSerial
     }
 
     Some(UsbSerialPort {
-        interface: interface.interface_number,
+        control_interface: interface.interface_number,
+        data_interface: interface.interface_number,
         bulk_in: bulk_in?,
         bulk_out: bulk_out?,
     })
@@ -248,7 +262,8 @@ mod tests {
         assert_eq!(
             bulk_pair_for_interface(&blob, |interface| interface.class == 0xff),
             Some(UsbSerialPort {
-                interface: 3,
+                control_interface: 3,
+                data_interface: 3,
                 bulk_in: 0x81,
                 bulk_out: 0x02,
             })
@@ -284,7 +299,8 @@ mod tests {
             Some(UsbSerialPortMatch {
                 chip: UsbSerialChip::Cp210x,
                 port: UsbSerialPort {
-                    interface: 3,
+                    control_interface: 3,
+                    data_interface: 3,
                     bulk_in: 0x82,
                     bulk_out: 0x01,
                 }
@@ -305,7 +321,8 @@ mod tests {
             Some(UsbSerialPortMatch {
                 chip: UsbSerialChip::Ch34x,
                 port: UsbSerialPort {
-                    interface: 0,
+                    control_interface: 0,
+                    data_interface: 0,
                     bulk_in: 0x82,
                     bulk_out: 0x02,
                 }

@@ -5,7 +5,7 @@ args = [
   "4096M",
   "-nographic",
   "-cpu",
-  "rv64,v=true,zfh=true,zvfh=true",
+  "rv64,v=true,zfh=true,zvfh=true,svpbmt=true",
   "-s",
   "-device",
   "nvme,drive=disk0,serial=tgoskits,max_ioqpairs=64,msix_qsize=65",
@@ -15,6 +15,16 @@ args = [
   "virtio-net-pci,netdev=net0",
   "-netdev",
   "user,id=net0",
+  "-device",
+  "qemu-xhci,id=xhci,msi=off,msix=off",
+  "-device",
+  "usb-kbd,bus=xhci.0",
+  "-device",
+  "usb-host,id=host-usb-test,bus=xhci.0,vendorid=0x058f,productid=0x6387",
+  "-device",
+  "usb-host,id=host-usb-test2,bus=xhci.0,vendorid=0x1a86,productid=0x7523",
+  "-device",
+  "usb-host,id=host-usb-test3,bus=xhci.0,vendorid=0x303a,productid=0x1001",
 ]
 uefi = false
 to_bin = true

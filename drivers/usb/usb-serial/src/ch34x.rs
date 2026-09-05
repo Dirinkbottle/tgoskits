@@ -310,7 +310,8 @@ mod tests {
             requests: RefCell::new(Vec::new()),
         };
         let port = UsbSerialPort {
-            interface: 0,
+            control_interface: 0,
+            data_interface: 0,
             bulk_in: 0x82,
             bulk_out: 0x02,
         };
