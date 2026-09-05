@@ -39,7 +39,7 @@ pub use self::{
     pts::PtsDir,
     pty::PtyDriver,
     serial::{arm_console_irq, bind_console_to, console_device, serial_tty_entries},
-    usb_serial::usb_serial_tty,
+    usb_serial::{cdc_acm_tty, usb_serial_tty},
 };
 use crate::{
     pseudofs::{Device, DeviceOps},
@@ -73,8 +73,13 @@ pub(crate) fn terminal_device(term: &(dyn Any + Send + Sync)) -> Option<Terminal
     } else if let Some(bound) =
         term.downcast_ref::<BoundTty<usb_serial::UsbSerialReader, usb_serial::UsbSerialWriter>>()
     {
+        let name = if bound.tty.is_cdc_acm() {
+            "ttyACM"
+        } else {
+            "ttyUSB"
+        };
         Some(TerminalDevice::Path(format!(
-            "/dev/ttyUSB{}",
+            "/dev/{name}{}",
             bound.tty.usb_serial_number()
         )))
     } else {

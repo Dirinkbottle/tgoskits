@@ -11,6 +11,12 @@ pub(super) struct UsbSerialPortInfo {
     port: UsbSerialPort,
 }
 
+#[derive(Clone, Copy)]
+pub(super) enum UsbSerialPortKind {
+    VendorSerial,
+    CdcAcm,
+}
+
 impl UsbSerialPortInfo {
     fn new(snapshot: &UsbDeviceSnapshotInfo, chip: UsbSerialChip, port: UsbSerialPort) -> Self {
         Self {
@@ -25,8 +31,12 @@ impl UsbSerialPortInfo {
         self.chip.name()
     }
 
-    pub(super) fn interface(&self) -> u8 {
-        self.port.interface
+    pub(super) fn control_interface(&self) -> u8 {
+        self.port.control_interface
+    }
+
+    pub(super) fn data_interface(&self) -> u8 {
+        self.port.data_interface
     }
 
     pub(super) fn bulk_in(&self) -> u8 {
@@ -62,13 +72,32 @@ impl ControlTransfer for StarryControl<'_> {
         self.0
             .control_transfer(request_type, request, value, index, data)
     }
+
+    fn control_in(
+        &self,
+        request_type: u8,
+        request: u8,
+        value: u16,
+        index: u16,
+        data: &mut [u8],
+    ) -> Result<usize, Self::Error> {
+        self.0
+            .control_transfer(request_type, request, value, index, data)
+    }
 }
 
-pub(super) fn find_usb_serial_port(index: usize) -> Option<UsbSerialPortInfo> {
+pub(super) fn find_usb_serial_port(
+    index: usize,
+    kind: UsbSerialPortKind,
+) -> Option<UsbSerialPortInfo> {
     usbfs::usb_device_snapshots()
         .into_iter()
         .filter_map(|snapshot| {
             let matched = probe_supported_port(&snapshot.descriptor_blob)?;
+            let is_cdc_acm = matched.chip == UsbSerialChip::CdcAcm;
+            if matches!(kind, UsbSerialPortKind::CdcAcm) != is_cdc_acm {
+                return None;
+            }
             Some(UsbSerialPortInfo::new(
                 &snapshot,
                 matched.chip,

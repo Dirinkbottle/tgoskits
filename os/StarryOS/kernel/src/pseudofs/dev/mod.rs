@@ -531,6 +531,20 @@ fn builder(fs: Arc<SimpleFs>) -> DirMaker {
         }
     });
 
+    // General cdc_acm serial device
+    root.add_dynamic("ttyACM0", {
+        let fs = fs.clone();
+        move || {
+            Device::new(
+                fs.clone(),
+                NodeType::CharacterDevice,
+                DeviceId::new(166, 0),
+                tty::cdc_acm_tty(0).expect("ttyACM0 slot must exist"),
+            )
+            .into()
+        }
+    });
+
     root.add(
         "ptmx",
         Device::new(
