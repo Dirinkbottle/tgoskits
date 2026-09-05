@@ -1,11 +1,11 @@
 //! `K3SchedulerOps` 运行时回调实现：worker 线程、用户内存拷贝、tensor 映射。
 
-use alloc::{collections::btree_map::BTreeMap, string::String};
+use alloc::{boxed::Box, collections::btree_map::BTreeMap, string::String};
 
 use ax_memory_addr::{MemoryAddr, PAGE_SIZE_4K, PhysAddr, VirtAddr, VirtAddrRange};
 use ax_runtime::hal::{cpu::asm::user_copy, paging::MappingFlags, percpu::this_cpu_id};
-use ax_task::{AxCpuMask, TaskInner, current, default_task_stack_size, spawn_task};
-use k3_ai_scheduler::K3SchedulerOps;
+use ax_task::{AxCpuMask, TaskInner, WaitQueue, current, default_task_stack_size, spawn_task};
+use k3_ai_scheduler::{K3SchedulerOps, K3SchedulerWaitQueue, K3WaitQueue};
 
 use super::{
     registry::{
@@ -18,7 +18,32 @@ use crate::{
     task::AsThread,
 };
 
+/// StarryOS `WaitQueue` 的 K3 scheduler 适配层。
+struct StarryK3WaitQueue(WaitQueue);
+
+impl K3SchedulerWaitQueue for StarryK3WaitQueue {
+    fn wait(&self) {
+        self.0.wait();
+    }
+
+    fn wait_until(&self, condition: &dyn Fn() -> bool) {
+        self.0.wait_until(condition);
+    }
+
+    fn notify_one(&self) {
+        self.0.notify_one(true);
+    }
+
+    fn notify_all(&self) {
+        self.0.notify_all(true);
+    }
+}
+
 impl K3SchedulerOps for K3AiRunner {
+    fn new_wait_queue(&self) -> K3WaitQueue {
+        Box::new(StarryK3WaitQueue(WaitQueue::new()))
+    }
+
     fn current_core_id(&self) -> u32 {
         this_cpu_id() as u32
     }
