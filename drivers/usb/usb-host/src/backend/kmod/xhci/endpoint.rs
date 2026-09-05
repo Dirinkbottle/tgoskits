@@ -669,9 +669,6 @@ impl EndpointOp for Endpoint {
 
         let mut data_bus_addr = 0;
         if transfer.buffer_len() > 0 {
-            if matches!(transfer.direction, Direction::Out) {
-                transfer.prepare_for_device_all();
-            }
             data_bus_addr = transfer.dma_addr();
             let buffer_end = data_bus_addr + transfer.buffer_len() as u64;
             if data_bus_addr > self.kernel.dma_mask() || buffer_end > self.kernel.dma_mask() {

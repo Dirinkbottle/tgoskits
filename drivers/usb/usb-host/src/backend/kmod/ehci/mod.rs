@@ -1268,9 +1268,6 @@ impl crate::backend::ty::ep::EndpointOp for EhciEndpoint {
         }
 
         let transfer = Transfer::from_request(&self.kernel, request.clone())?;
-        if transfer.buffer_len() > 0 && matches!(transfer.direction, Direction::Out) {
-            transfer.prepare_for_device_all();
-        }
         let mut submitted = self
             .build_qtds(&transfer, &request)
             .map_err(usb_to_transfer_error)?;

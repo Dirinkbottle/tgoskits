@@ -1,15 +1,15 @@
 #![no_std]
 
 extern crate alloc;
-
 use usb_if::{
     descriptor::{ConfigurationDescriptor, DeviceDescriptor, EndpointType, InterfaceDescriptor},
     transfer::Direction,
 };
 
+pub mod ch34x;
 pub mod cp210x;
 
-/// OS-side capability for class/vendor control OUT transfers.
+/// OS-side capability for class/vendor control transfers.
 ///
 /// The reusable USB serial code owns descriptor matching and chip command
 /// layout; the integrating kernel owns how transfers are submitted.
@@ -17,6 +17,15 @@ pub trait ControlTransfer {
     type Error;
 
     fn control_out(
+        &self,
+        request_type: u8,
+        request: u8,
+        value: u16,
+        index: u16,
+        data: &mut [u8],
+    ) -> Result<usize, Self::Error>;
+    /// Submits a control IN transfer; `request_type` carries the USB direction.
+    fn control_in(
         &self,
         request_type: u8,
         request: u8,
@@ -42,12 +51,14 @@ pub struct UsbSerialPort {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UsbSerialChip {
     Cp210x,
+    Ch34x,
 }
 
 impl UsbSerialChip {
     pub fn name(self) -> &'static str {
         match self {
             Self::Cp210x => "cp210x",
+            Self::Ch34x => "ch34x",
         }
     }
 
@@ -59,6 +70,7 @@ impl UsbSerialChip {
     ) -> Result<(), T::Error> {
         match self {
             Self::Cp210x => cp210x::init(control, port, baud),
+            Self::Ch34x => ch34x::init(control, port, baud),
         }
     }
 
@@ -70,6 +82,7 @@ impl UsbSerialChip {
     ) -> Result<(), T::Error> {
         match self {
             Self::Cp210x => cp210x::set_baud(control, port, baud),
+            Self::Ch34x => ch34x::set_baud(control, port, baud),
         }
     }
 }
@@ -82,10 +95,21 @@ pub struct UsbSerialPortMatch {
 
 /// Probe the built-in USB serial chip families against a raw descriptor blob.
 pub fn probe_supported_port(descriptor_blob: &[u8]) -> Option<UsbSerialPortMatch> {
-    cp210x::probe(descriptor_blob).map(|port| UsbSerialPortMatch {
+    if let Some(port) = cp210x::probe(descriptor_blob).map(|port| UsbSerialPortMatch {
         chip: UsbSerialChip::Cp210x,
         port,
-    })
+    }) {
+        return Some(port);
+    }
+
+    if let Some(port) = ch34x::probe(descriptor_blob).map(|port| UsbSerialPortMatch {
+        chip: UsbSerialChip::Ch34x,
+        port,
+    }) {
+        return Some(port);
+    }
+
+    None
 }
 
 pub fn device_id_from_descriptor_blob(blob: &[u8]) -> Option<UsbDeviceId> {
@@ -263,6 +287,27 @@ mod tests {
                     interface: 3,
                     bulk_in: 0x82,
                     bulk_out: 0x01,
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn probe_supported_port_identifies_ch34x() {
+        let accepted = interface(0, 0, 0xff, 0x01, 0x02);
+        let config = config(&[&accepted, &endpoint(0x82, 0x02), &endpoint(0x02, 0x02)]);
+        let mut blob = descriptor_blob(&[config]);
+        blob[8..10].copy_from_slice(&0x1a86u16.to_le_bytes());
+        blob[10..12].copy_from_slice(&0x7523u16.to_le_bytes());
+
+        assert_eq!(
+            probe_supported_port(&blob),
+            Some(UsbSerialPortMatch {
+                chip: UsbSerialChip::Ch34x,
+                port: UsbSerialPort {
+                    interface: 0,
+                    bulk_in: 0x82,
+                    bulk_out: 0x02,
                 }
             })
         );

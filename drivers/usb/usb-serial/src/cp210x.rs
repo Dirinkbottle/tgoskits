@@ -133,6 +133,19 @@ mod tests {
                 .push((request_type, request, value, index, data.to_vec()));
             Ok(data.len())
         }
+        fn control_in(
+            &self,
+            request_type: u8,
+            request: u8,
+            value: u16,
+            index: u16,
+            data: &mut [u8],
+        ) -> Result<usize, Self::Error> {
+            self.requests
+                .borrow_mut()
+                .push((request_type, request, value, index, data.to_vec()));
+            Ok(data.len())
+        }
     }
 
     fn cp210x_blob(interface: [u8; 9]) -> Vec<u8> {

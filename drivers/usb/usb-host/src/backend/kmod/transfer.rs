@@ -25,7 +25,7 @@ impl Transfer {
         let mapping = if let Some((ptr, len)) = buff.filter(|(_, len)| *len > 0) {
             let slice = unsafe { core::slice::from_raw_parts_mut(ptr.as_ptr(), len) };
             Some(
-                dma.map_streaming_slice(slice, ALIGN, dma_direction)
+                dma.map_streaming_slice_for_device(slice, ALIGN, dma_direction)
                     .map_err(|err| TransferError::Other(anyhow!("DMA mapping failed: {err}")))?,
             )
         } else {
@@ -71,10 +71,101 @@ impl Transfer {
             mapping.complete_for_cpu_all();
         }
     }
+}
 
-    pub fn prepare_for_device_all(&self) {
-        if let Some(ref mapping) = self.mapping {
-            mapping.prepare_for_device_all();
+#[cfg(test)]
+mod tests {
+    use core::{
+        alloc::Layout,
+        num::NonZeroUsize,
+        sync::atomic::{AtomicUsize, Ordering},
+        time::Duration,
+    };
+
+    use dma_api::{DmaAllocHandle, DmaConstraints, DmaError, DmaMapHandle, DmaOp};
+
+    use super::*;
+    use crate::backend::kmod::osal::KernelOp;
+
+    static TEST_KERNEL: TestKernel = TestKernel {
+        prepare_count: AtomicUsize::new(0),
+    };
+
+    struct TestKernel {
+        prepare_count: AtomicUsize,
+    }
+
+    impl DmaOp for TestKernel {
+        fn page_size(&self) -> usize {
+            4096
         }
+
+        unsafe fn alloc_contiguous(
+            &self,
+            _constraints: DmaConstraints,
+            _layout: Layout,
+        ) -> Option<DmaAllocHandle> {
+            None
+        }
+
+        unsafe fn dealloc_contiguous(&self, _handle: DmaAllocHandle) {}
+
+        unsafe fn alloc_coherent(
+            &self,
+            _constraints: DmaConstraints,
+            _layout: Layout,
+        ) -> Option<DmaAllocHandle> {
+            None
+        }
+
+        unsafe fn dealloc_coherent(&self, _handle: DmaAllocHandle) -> Result<(), DmaError> {
+            Ok(())
+        }
+
+        unsafe fn map_streaming(
+            &self,
+            constraints: DmaConstraints,
+            addr: NonNull<u8>,
+            size: NonZeroUsize,
+            _direction: DmaDirection,
+        ) -> Result<DmaMapHandle, DmaError> {
+            let layout = Layout::from_size_align(size.get(), constraints.align)?;
+            Ok(unsafe { DmaMapHandle::new(addr, 0x1000.into(), layout, None) })
+        }
+
+        unsafe fn unmap_streaming(&self, _handle: DmaMapHandle) {}
+
+        fn sync_map_for_device(
+            &self,
+            _handle: &DmaMapHandle,
+            _offset: usize,
+            _size: usize,
+            direction: DmaDirection,
+        ) {
+            assert_eq!(direction, DmaDirection::FromDevice);
+            self.prepare_count.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    impl KernelOp for TestKernel {
+        fn delay(&self, _duration: Duration) {}
+    }
+
+    #[test]
+    fn in_transfer_prepares_streaming_dma_before_submission() {
+        TEST_KERNEL.prepare_count.store(0, Ordering::SeqCst);
+        let kernel = Kernel::new(u64::MAX, &TEST_KERNEL);
+        let mut buffer = [0u8; 4];
+        let buffer = NonNull::from(&mut buffer).cast();
+
+        let _transfer = Transfer::new(
+            &kernel,
+            TransferKind::Bulk,
+            Direction::In,
+            Some((buffer, 4)),
+        )
+        .unwrap();
+
+        assert_eq!(TEST_KERNEL.prepare_count.load(Ordering::SeqCst), 1);
     }
 }

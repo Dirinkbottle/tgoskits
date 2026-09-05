@@ -10,4 +10,5 @@ repository.workspace = true
 version = "0.1.2"
 
 [dependencies]
+log.workspace = true
 usb-if.workspace = true
