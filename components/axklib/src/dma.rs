@@ -207,7 +207,7 @@ impl DmaOp for KlibDma {
         let dma_addr = dma_addr_from_ptr(addr);
 
         if dma_range_fits_mask(dma_addr, size.get(), constraints.addr_mask)
-            && dma_addr_is_aligned(dma_addr, align)
+            && streaming_range_can_map_direct(dma_addr, size.get(), align)
         {
             return Ok(unsafe { DmaMapHandle::new(addr, dma_addr.into(), layout, None) });
         }
@@ -268,6 +268,15 @@ fn dma_range_fits_mask(dma_addr: u64, size: usize, dma_mask: u64) -> bool {
 
 fn dma_addr_is_aligned(dma_addr: u64, align: usize) -> bool {
     dma_addr.is_multiple_of(align.max(1) as u64)
+}
+
+// A direct non-coherent mapping must own both boundary cache lines. Otherwise
+// the post-DMA invalidate can discard dirty bytes belonging to adjacent objects.
+fn streaming_range_can_map_direct(dma_addr: u64, size: usize, align: usize) -> bool {
+    dma_addr_is_aligned(dma_addr, align)
+        && dma_addr
+            .checked_add(size as u64)
+            .is_some_and(|end| dma_addr_is_aligned(end, align))
 }
 
 #[cfg(test)]
@@ -340,5 +349,11 @@ mod tests {
 
         assert_eq!(result, None);
         assert!(events.borrow().is_empty());
+    }
+
+    #[test]
+    fn streaming_direct_mapping_requires_cacheline_isolated_range() {
+        assert!(!streaming_range_can_map_direct(0x1000, 4, 64));
+        assert!(streaming_range_can_map_direct(0x1000, 64, 64));
     }
 }
