@@ -5,12 +5,14 @@
 //! translate between userspace's split `u32` capability arrays and StarryOS's
 //! internal `Cred` bitmap fields.
 
-use core::ffi::c_char;
+use core::{ffi::c_char, mem::size_of};
 
 use ax_errno::{AxError, AxResult};
 use ax_task::current;
+use kernel_elf_parser::AuxEntry;
 use linux_raw_sys::general::{__user_cap_data_struct, __user_cap_header_struct, CAP_LAST_CAP};
 use starry_vm::{VmMutPtr, VmPtr, vm_write_slice};
+use zerocopy::IntoBytes;
 
 use crate::{
     mm::vm_load_string,
@@ -20,6 +22,19 @@ use crate::{
 const CAPABILITY_VERSION_3: u32 = 0x20080522;
 const CAP_U32S_3: usize = 2;
 const PERSONALITY_GET: u32 = 0xffff_ffff;
+// Linux v6.18 uses 22 generic slots plus architecture-specific slots and one
+// AT_NULL slot in mm_struct::saved_auxv. The K3 reference userspace runs that
+// ABI, and PR_GET_AUXV returns the full fixed array size even for short copies.
+const LINUX_AT_VECTOR_SIZE_BASE: usize = 22;
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+const LINUX_AT_VECTOR_SIZE_ARCH: usize = 2;
+#[cfg(target_arch = "loongarch64")]
+const LINUX_AT_VECTOR_SIZE_ARCH: usize = 1;
+#[cfg(target_arch = "riscv64")]
+const LINUX_AT_VECTOR_SIZE_ARCH: usize = 0;
+const LINUX_SAVED_AUXV_ENTRY_CAPACITY: usize =
+    LINUX_AT_VECTOR_SIZE_BASE + LINUX_AT_VECTOR_SIZE_ARCH + 1;
+const LINUX_SAVED_AUXV_SIZE: usize = LINUX_SAVED_AUXV_ENTRY_CAPACITY * size_of::<AuxEntry>();
 const PR_THP_DISABLE_EXCEPT_ADVISED: usize = 1 << 1;
 const MPOL_DEFAULT: i32 = 0;
 const MPOL_PREFERRED: i32 = 1;
@@ -225,6 +240,43 @@ pub fn sys_personality(persona: usize) -> AxResult<isize> {
         proc_data.replace_personality(persona);
     }
     Ok(old as isize)
+}
+
+fn sys_prctl_get_auxv(
+    address: *mut u8,
+    len: usize,
+    reserved_arg4: usize,
+    reserved_arg5: usize,
+) -> AxResult<isize> {
+    if reserved_arg4 != 0 || reserved_arg5 != 0 {
+        return Err(AxError::InvalidInput);
+    }
+
+    let saved_auxv = {
+        let current_task = current();
+        let auxv = current_task.as_thread().proc_data.auxv.read();
+        saved_auxv_bytes(&auxv)?
+    };
+    let copy_len = len.min(saved_auxv.len());
+    if copy_len != 0 {
+        vm_write_slice(address, &saved_auxv[..copy_len])?;
+    }
+    Ok(saved_auxv.len() as isize)
+}
+
+fn saved_auxv_bytes(auxv: &[AuxEntry]) -> AxResult<[u8; LINUX_SAVED_AUXV_SIZE]> {
+    let auxv_bytes = auxv.as_bytes();
+    let required_size = auxv_bytes
+        .len()
+        .checked_add(size_of::<AuxEntry>())
+        .ok_or(AxError::BadState)?;
+    if required_size > LINUX_SAVED_AUXV_SIZE {
+        return Err(AxError::BadState);
+    }
+
+    let mut saved_auxv = [0; LINUX_SAVED_AUXV_SIZE];
+    saved_auxv[..auxv_bytes.len()].copy_from_slice(auxv_bytes);
+    Ok(saved_auxv)
 }
 
 /// Get NUMA memory policy for a thread.
@@ -541,6 +593,9 @@ pub fn sys_prctl(
                 return Err(AxError::InvalidInput);
             }
             return Ok(current().as_thread().proc_data.thp_disable() as isize);
+        }
+        PR_GET_AUXV => {
+            return sys_prctl_get_auxv(arg2 as *mut u8, arg3, arg4, arg5);
         }
         PR_SET_MM => {
             // not implemented; but avoid annoying warnings

@@ -84,7 +84,12 @@ fn mapping_flags(flags: xmas_elf::program::Flags) -> MappingFlags {
     mapping_flags
 }
 
-fn app_stack_region(args: &[String], envs: &[String], auxv: &[AuxEntry], sp: usize) -> Vec<u8> {
+fn app_stack_region(
+    args: &[String],
+    envs: &[String],
+    auxv: &mut Vec<AuxEntry>,
+    sp: usize,
+) -> Vec<u8> {
     let mut data = VecDeque::new();
     let mut push = |src: &[u8]| -> usize {
         data.extend(src.iter().copied());
@@ -119,17 +124,22 @@ fn app_stack_region(args: &[String], envs: &[String], auxv: &[AuxEntry], sp: usi
     let has_random = auxv.iter().any(|entry| entry.get_type() == AuxType::RANDOM);
     let has_execfn = auxv.iter().any(|entry| entry.get_type() == AuxType::EXECFN);
 
-    // `push` prepends bytes to the stack image. Push the terminator first so
-    // user memory presents auxv as: supplied entries, AT_RANDOM, AT_EXECFN,
-    // AT_NULL. Without AT_NULL, musl keeps parsing argv/env padding as auxv
-    // and can falsely enable AT_SECURE.
-    push(AuxEntry::new(AuxType::NULL, 0).as_bytes());
-    if !has_execfn {
-        push(AuxEntry::new(AuxType::EXECFN, argv_slice[0]).as_bytes());
-    }
+    // Keep ProcessData's saved auxv identical to the vector placed on the
+    // initial stack. Both /proc/self/auxv and PR_GET_AUXV consume that saved
+    // vector after exec, so stack-only entries would leave their pointers
+    // missing from those interfaces.
     if !has_random {
-        push(AuxEntry::new(AuxType::RANDOM, random_str_pos).as_bytes());
+        auxv.push(AuxEntry::new(AuxType::RANDOM, random_str_pos));
     }
+    if !has_execfn {
+        auxv.push(AuxEntry::new(AuxType::EXECFN, argv_slice[0]));
+    }
+
+    // `push` prepends bytes to the stack image. Push the terminator first so
+    // user memory presents auxv as: saved entries, AT_NULL. Without AT_NULL,
+    // musl keeps parsing argv/env padding as auxv and can falsely enable
+    // AT_SECURE.
+    push(AuxEntry::new(AuxType::NULL, 0).as_bytes());
     push(auxv.as_bytes());
 
     push(padding_null.as_bytes());
@@ -692,7 +702,7 @@ pub fn load_user_app(
         return load_user_app(uspace, sh, "/bin/sh", &new_args, envs);
     }
 
-    let (entry, auxv) = match { ELF_LOADER.lock().load(uspace, loc)? } {
+    let (entry, mut auxv) = match { ELF_LOADER.lock().load(uspace, loc)? } {
         Ok((entry, auxv)) => (entry, auxv),
         Err(data) => {
             if data.starts_with(b"#!") {
@@ -731,7 +741,7 @@ pub fn load_user_app(
         Backend::new_alloc(ustack_start, PAGE_SIZE_4K, "[stack]"),
     )?;
 
-    let stack_data = app_stack_region(args, envs, &auxv, ustack_top.into());
+    let stack_data = app_stack_region(args, envs, &mut auxv, ustack_top.into());
     let user_sp = ustack_top - stack_data.len();
     let user_sp_aligned = user_sp.align_down_4k();
     uspace.populate_area(
