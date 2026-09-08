@@ -103,14 +103,6 @@ impl TransferResultHandler {
         }
     }
 
-    pub fn unregister_slot(&self, slot_id: u8) {
-        let mut routes = self.inner.lock();
-        routes
-            .queues
-            .retain(|queue_id, _| queue_id.slot_id != slot_id);
-        routes.enumerating_slots.remove(&slot_id);
-    }
-
     /// Marks a queue completion from the xHCI interrupt path.
     ///
     /// This runs while handling an interrupt, so it must not acquire OS-facing

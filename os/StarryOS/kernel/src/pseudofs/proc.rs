@@ -35,12 +35,14 @@ use crate::{
     },
     task::{
         Cred, PidNamespaceRef, PidNumber, PidView, Process, ProcessData, ROOT_PID_NS, TaskStat,
-        TgidNumber, Thread, TidNumber, UserTaskRef, WeakUserTaskRef, current_user_task,
-        get_task_by_number, processes, tasks,
+        TgidNumber, Thread, TidNumber, UserTaskRef, WeakUserTaskRef, current_user_task, processes,
+        tasks,
     },
 };
 #[cfg(feature = "k3_com260kit")]
 use ax_sync::SpinLock;
+#[cfg(feature = "k3_com260kit")]
+use crate::task::get_task_by_number;
 
 fn upgrade_proc_task(task: &WeakUserTaskRef) -> VfsResult<Option<UserTaskRef>> {
     (*task).upgrade().map_err(|_| VfsError::BadState)

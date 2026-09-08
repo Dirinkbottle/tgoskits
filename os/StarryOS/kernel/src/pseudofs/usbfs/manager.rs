@@ -1469,6 +1469,7 @@ fn snapshot_config_blob(snapshot: &UsbDeviceSnapshot, index: usize) -> Option<&[
     None
 }
 
+#[cfg(test)]
 fn snapshot_device_identity(snapshot: &UsbDeviceSnapshot) -> Option<(u16, u16, u8)> {
     let descriptor = snapshot.descriptor_blob.get(..12)?;
     let vendor_id = u16::from_le_bytes([descriptor[8], descriptor[9]]);

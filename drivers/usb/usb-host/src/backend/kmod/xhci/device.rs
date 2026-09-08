@@ -1082,29 +1082,6 @@ impl Device {
         self.evaluate().await?;
         Ok(())
     }
-
-    async fn disconnect_inner(&mut self) -> Result<()> {
-        let slot_id = self.id.as_u8();
-        trace!("[xhci-hotplug] slot {slot_id}: DisableSlot begin");
-        self.cmd
-            .cmd_request(command::Allowed::DisableSlot(
-                *command::DisableSlot::default().set_slot_id(self.id.into()),
-            ))
-            .await
-            .map_err(|error| {
-                trace!("[xhci-hotplug] slot {slot_id}: DisableSlot failed: {error:?}");
-                error
-            })?;
-
-        // Disable Slot is the hardware ownership boundary. Remove IRQ routing
-        // before endpoint rings are dropped with this device object.
-        self.transfer_result_handler.unregister_slot(slot_id);
-        self.eps.clear();
-        self.ep_interfaces.clear();
-        self.ctrl_ep = None;
-        trace!("[xhci-hotplug] slot {slot_id}: DisableSlot complete");
-        Ok(())
-    }
 }
 
 fn log_enumeration_step<T>(slot_id: u8, step: &str, result: Result<T>) -> Result<T> {

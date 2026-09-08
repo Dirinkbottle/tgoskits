@@ -111,6 +111,7 @@ pub(crate) fn setup_entry(
     }
 }
 
+#[cfg(test)]
 fn kernel_image_end(kernel_end: usize, page_size: usize) -> usize {
     // EFI may place boot data immediately after SizeOfImage. Reserving to a
     // huge-page boundary would claim that firmware-owned data whenever the PE
