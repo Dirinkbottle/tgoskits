@@ -1,6 +1,6 @@
 //! `DeviceOps` 控制面实现：`BUILD_CHANNEL` / `SUBMIT_GRAPH` ioctl。
 
-use alloc::{boxed::Box, collections::btree_map::BTreeMap, vec, vec::Vec};
+use alloc::{boxed::Box, collections::btree_map::BTreeMap};
 use core::any::Any;
 
 use ax_memory_addr::{MemoryAddr, PAGE_SIZE_4K, PhysAddr, VirtAddr, VirtAddrRange, align_up_4k};
@@ -22,7 +22,7 @@ use super::{
     runner::K3AiRunner,
 };
 use crate::{
-    mm::{Backend, UserPtr},
+    mm::{Backend, UserConstPtr, UserPtr, access_user_memory},
     pseudofs::DeviceOps,
     task::AsThread,
 };
@@ -279,6 +279,7 @@ impl K3AiRunner {
                 registered.channel_count,
                 registered.shared_pages.len()
             );
+
             (
                 registered.kernel_va,
                 registered.size_bytes,
@@ -385,8 +386,9 @@ impl K3AiRunner {
         if payload.len() < entry_size {
             return Err(VfsError::InvalidInput);
         }
-
-        // 用户态按 repr(C) 直接发送 entry 字节，这里按相同 ABI 读回来。
+        // `Message::payload` starts at byte 1, so it cannot satisfy
+        // `AiGraphSubmitEntry`'s 64-byte alignment. This fixed-size control
+        // read must stay unaligned; converting it to `&AiGraphSubmitEntry` is UB.
         let graph_entry =
             unsafe { core::ptr::read_unaligned(payload.as_ptr().cast::<AiGraphSubmitEntry>()) };
 
@@ -420,8 +422,9 @@ impl K3AiRunner {
             return Err(VfsError::InvalidInput);
         }
 
-        // 从graph_user_va 和 graph_size反序列化出parsed graph
-        // 必须从user空间copy过来,防止后续被篡改
+        // The graph blob is borrowed only while parsing. User space must keep
+        // its address and contents valid; `AiGraphParser` then owns its nodes
+        // and edges in the returned `AiParsedGraph`.
         info!(
             "k3_airunner: SUBMIT_GRAPH graph_size usize conversion begin pid={}, graph_size={:#x}",
             pid,
@@ -431,42 +434,17 @@ impl K3AiRunner {
             .graph_size
             .try_as_usize()
             .map_err(|_| VfsError::InvalidInput)?;
-        info!(
-            "k3_airunner: SUBMIT_GRAPH graph_size usize conversion done pid={}, graph_size={:#x}",
-            pid, graph_size
-        );
-        info!(
-            "k3_airunner: SUBMIT_GRAPH graph blob alloc begin pid={}, len={:#x}",
-            pid, graph_size
-        );
-        let mut blob_slice: Vec<u8> = vec![0_u8; graph_size];
-        info!(
-            "k3_airunner: SUBMIT_GRAPH graph blob alloc done pid={}, len={:#x}",
-            pid,
-            blob_slice.len()
-        );
-        info!(
-            "k3_airunner: SUBMIT_GRAPH copy graph blob begin pid={}, user_va={:#x}, len={:#x}",
-            pid,
-            graph_entry.graph_user_va.get(),
-            blob_slice.len()
-        );
-        let copy_result =
-            unsafe { K3AiRunner.copy_from_user(graph_entry.graph_user_va.get(), &mut blob_slice) };
-        info!(
-            "k3_airunner: SUBMIT_GRAPH copy graph blob done pid={}, ok={}",
-            pid,
-            copy_result.is_ok()
-        );
-        if copy_result.is_err() {
-            error!("k3_airunner: SUBMIT_GRAPH copy graph blob failed pid={pid}");
-            return Err(VfsError::BadAddress);
-        }
+        let graph_user_va =
+            usize::try_from(graph_entry.graph_user_va.get()).map_err(|_| VfsError::InvalidInput)?;
+        let graph_blob = UserConstPtr::<u8>::from(graph_user_va)
+            .get_as_slice(graph_size)
+            .map_err(|_| VfsError::BadAddress)?;
 
-        let parsed_graph = AiGraphParser::parse(&blob_slice).map_err(|err| {
-            error!("k3_airunner: SUBMIT_GRAPH graph parse failed pid={pid}, err={err:?}");
-            VfsError::InvalidInput
-        })?;
+        let parsed_graph =
+            access_user_memory(|| AiGraphParser::parse(graph_blob)).map_err(|err| {
+                error!("k3_airunner: SUBMIT_GRAPH graph parse failed pid={pid}, err={err:?}");
+                VfsError::InvalidInput
+            })?;
         let task_link = resolve_parsed_graph(0, &parsed_graph).map_err(|err| {
             error!("k3_airunner: SUBMIT_GRAPH graph resolve failed pid={pid}, err={err:?}");
             VfsError::InvalidInput
