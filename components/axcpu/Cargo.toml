@@ -1,6 +1,6 @@
 [package]
 name = "ax-cpu"
-version = "0.8.5"
+version = "0.8.8"
 repository = "https://github.com/rcore-os/tgoskits"
 edition.workspace = true
 authors = [
@@ -30,7 +30,6 @@ host-test = []
 tls = ["cpu-local/tls"]
 uspace = ["exception-table"]
 arm-el2 = []
-svpbmt = []
 xuantie-c9xx = []
 
 [dependencies]
@@ -40,6 +39,7 @@ cfg-if = "1.0"
 log = "0.4"
 ax-memory-addr = { workspace = true }
 bitflags.workspace = true
+bytemuck = "1.24"
 page-table-generic.workspace = true
 [target.'cfg(target_arch = "x86_64")'.dependencies]
 ax-lazyinit = { workspace = true }
@@ -58,6 +58,11 @@ riscv.workspace = true
 
 [target.'cfg(target_arch = "loongarch64")'.dependencies]
 loongArch64 = "0.2"
+
+[dev-dependencies]
+aarch64-cpu = "11.0"
+tock-registers = "0.10"
+
 [lints.clippy]
 new_without_default = "allow"
 

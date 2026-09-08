@@ -1,6 +1,5 @@
 mod args;
 mod assets;
-mod axtest_qemu;
 mod board;
 mod c_qemu;
 mod discovery;
@@ -21,16 +20,16 @@ const ARCEOS_TEST_SUITE_OS: &str = "arceos";
 const ARCEOS_RUST_TEST_PACKAGE: &str = "arceos-test-suit";
 const ARCEOS_RUST_TEST_BUILD_GROUP: &str = "arceos-test-suit";
 const ARCEOS_C_TEST_BUILD_GROUP: &str = "arceos-c-test-suit";
-pub(super) const ARCEOS_AXTEST_RUSTFLAGS: &[&str] =
-    &["--cfg", "axtest", "--check-cfg", "cfg(axtest)"];
-
 const ARCEOS_RUST_ALL_FEATURE: &str = "all";
 const ARCEOS_C_ALL_FEATURE: &str = "all";
 const ARCEOS_RUST_DEBUG_BACKTRACE_FEATURE: &str = "debug-backtrace";
 const ARCEOS_RUST_DEBUG_PANIC_PATH_FEATURE: &str = "debug-panic-path";
 const ARCEOS_RUST_EXCEPTION_PAGE_FAULT_FEATURE: &str = "exception-page-fault";
 const ARCEOS_RUST_LOCKDEP_DETECT_FEATURE: &str = "lockdep-detect";
+const ARCEOS_RUST_MEM_STAGE1_TRANSITION_FEATURE: &str = "mem-stage1-transition";
 const ARCEOS_RUST_STACK_GUARD_PAGE_FEATURE: &str = "task-stack-guard-page";
+const ARCEOS_RUST_TASK_IRQ_FEATURE: &str = "task-irq";
+const ARCEOS_RUST_STANDALONE_FEATURES: &[&str] = &[ARCEOS_RUST_TASK_IRQ_FEATURE];
 
 const ARCEOS_RUST_QEMU_FEATURES: &[&str] = &[
     ARCEOS_RUST_ALL_FEATURE,
@@ -43,15 +42,24 @@ const ARCEOS_RUST_QEMU_FEATURES: &[&str] = &[
     "fs-basic",
     "lockdep-baseline",
     ARCEOS_RUST_LOCKDEP_DETECT_FEATURE,
+    ARCEOS_RUST_MEM_STAGE1_TRANSITION_FEATURE,
     "memtest",
     "net-loopback",
     "sched-cfs",
     "sched-rr",
     "task-affinity",
+    "task-fair-idle-pull",
+    "task-fair-wake-idle-sibling",
     "task-ipi",
-    "task-irq",
+    ARCEOS_RUST_TASK_IRQ_FEATURE,
+    "task-kernel-timer",
+    "task-mutex",
     "task-parallel",
+    "task-pi-mutex",
+    "task-preempt-guard",
     "task-priority",
+    "task-rt-policy",
+    "task-scheduler-irq-window",
     "task-sleep",
     "task-smp-online",
     ARCEOS_RUST_STACK_GUARD_PAGE_FEATURE,

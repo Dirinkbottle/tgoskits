@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.2](https://github.com/rcore-os/tgoskits/compare/riscv_vcpu-v0.6.1...riscv_vcpu-v0.6.2) - 2026-08-27
+
+### Fixed
+
+- *(virtualization)* port isolated interrupt controller fixes ([#2199](https://github.com/rcore-os/tgoskits/pull/2199))
+
+## [0.6.1](https://github.com/rcore-os/tgoskits/compare/riscv_vcpu-v0.6.0...riscv_vcpu-v0.6.1) - 2026-08-25
+
+### Fixed
+
+- *(riscv-vcpu)* preserve host status during setup ([#2132](https://github.com/rcore-os/tgoskits/pull/2132))
+
+## [0.6.0](https://github.com/rcore-os/tgoskits/compare/riscv_vcpu-v0.5.20...riscv_vcpu-v0.6.0) - 2026-08-20
+
+### Fixed
+
+- *(riscv-vcpu)* [**breaking**] persist VSEIP while unbound ([#2090](https://github.com/rcore-os/tgoskits/pull/2090))
+
+### Other
+
+- *(axvm)* layer RISC-V SBI IPI routing ([#1920](https://github.com/rcore-os/tgoskits/pull/1920))
+
+## [0.5.20](https://github.com/rcore-os/tgoskits/compare/riscv_vcpu-v0.5.19...riscv_vcpu-v0.5.20) - 2026-08-09
+
+### Fixed
+
+- *(riscv-vcpu)* handle virtual interrupt injection for SMP guests ([#1681](https://github.com/rcore-os/tgoskits/pull/1681))
+
+### Other
+
+- *(axvm)* unify guest devices and AArch64 timer ownership ([#1717](https://github.com/rcore-os/tgoskits/pull/1717))
+
 ## [0.5.19](https://github.com/rcore-os/tgoskits/compare/riscv_vcpu-v0.5.18...riscv_vcpu-v0.5.19) - 2026-07-23
 
 ### Other

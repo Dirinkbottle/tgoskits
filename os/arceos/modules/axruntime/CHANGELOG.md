@@ -7,6 +7,68 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.3](https://github.com/rcore-os/tgoskits/compare/ax-runtime-v0.11.2...ax-runtime-v0.11.3) - 2026-08-27
+
+### Other
+
+- *(sdmmc)* unify SDIO protocol and AIC8800 driver ([#2201](https://github.com/rcore-os/tgoskits/pull/2201))
+- *(runtime)* make IRQ and multitasking mandatory ([#2188](https://github.com/rcore-os/tgoskits/pull/2188))
+- *(axvm)* unify host timer ownership ([#2190](https://github.com/rcore-os/tgoskits/pull/2190))
+- *(ax-net)* add queue-level NAPI runtime ([#2178](https://github.com/rcore-os/tgoskits/pull/2178))
+
+## [0.11.2](https://github.com/rcore-os/tgoskits/compare/ax-runtime-v0.11.1...ax-runtime-v0.11.2) - 2026-08-25
+
+### Fixed
+
+- *(ax-driver)* attribute RK3588 governor busy by FDT cpu topology ([#2165](https://github.com/rcore-os/tgoskits/pull/2165))
+
+### Other
+
+- *(test)* consolidate Starry and ArceOS test suites ([#2173](https://github.com/rcore-os/tgoskits/pull/2173))
+
+## [0.11.1](https://github.com/rcore-os/tgoskits/compare/ax-runtime-v0.11.0...ax-runtime-v0.11.1) - 2026-08-25
+
+### Fixed
+
+- *(ax-runtime)* catch up expired periodic timer deadlines ([#2137](https://github.com/rcore-os/tgoskits/pull/2137))
+
+### Other
+
+- *(x86-apic-driver)* extract x86 interrupt controllers with rdif-intc support ([#2118](https://github.com/rcore-os/tgoskits/pull/2118))
+
+## [0.11.0](https://github.com/rcore-os/tgoskits/compare/ax-runtime-v0.10.7...ax-runtime-v0.11.0) - 2026-08-20
+
+### Added
+
+- *(dma-api)* [**breaking**] add device DMA coherency with uncached-alias remap ([#2106](https://github.com/rcore-os/tgoskits/pull/2106))
+
+### Fixed
+
+- *(console)* unify sleepable runtime console arbitration ([#2113](https://github.com/rcore-os/tgoskits/pull/2113))
+- *(axtask)* preserve scheduler-frame ownership across switches ([#2101](https://github.com/rcore-os/tgoskits/pull/2101))
+- *(ax-cpu)* harden user access and architecture state transitions ([#2075](https://github.com/rcore-os/tgoskits/pull/2075))
+- *(tty)* handle input flush and wakeups ([#1922](https://github.com/rcore-os/tgoskits/pull/1922))
+
+### Other
+
+- *(serial)* establish bounded owner-affine UART runtime ([#2076](https://github.com/rcore-os/tgoskits/pull/2076))
+- *(cpu-local)* define scheduler-neutral execution context boundary ([#2080](https://github.com/rcore-os/tgoskits/pull/2080))
+- *(errors)* introduce domain-owned error boundaries ([#2024](https://github.com/rcore-os/tgoskits/pull/2024))
+- *(sync)* move lock implementation into ax-task ([#1962](https://github.com/rcore-os/tgoskits/pull/1962))
+- *(sync)* unify lock primitives in ax-sync ([#1956](https://github.com/rcore-os/tgoskits/pull/1956))
+
+## [0.10.7](https://github.com/rcore-os/tgoskits/compare/ax-runtime-v0.10.6...ax-runtime-v0.10.7) - 2026-08-09
+
+### Fixed
+
+- *(ax-plat)* add corrected scheduler clock source ([#1900](https://github.com/rcore-os/tgoskits/pull/1900))
+
+### Other
+
+- *(ax-ipi)* establish typed IPI publication transport ([#1916](https://github.com/rcore-os/tgoskits/pull/1916))
+- *(repo)* unify workspace dependencies ([#1860](https://github.com/rcore-os/tgoskits/pull/1860))
+- *(axvm)* unify guest devices and AArch64 timer ownership ([#1717](https://github.com/rcore-os/tgoskits/pull/1717))
+
 ## [0.10.6](https://github.com/rcore-os/tgoskits/compare/ax-runtime-v0.10.5...ax-runtime-v0.10.6) - 2026-08-03
 
 ### Added

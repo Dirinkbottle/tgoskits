@@ -137,52 +137,27 @@ impl XhciRootHub {
                 .into_iter()
                 .map(PortEvent::Connected),
         );
-        self.acknowledge_port_changes();
         Ok(events)
     }
 
-    fn acknowledge_port_changes(&mut self) {
-        for index in 0..self.portsc.len() {
-            let status = self.portsc.read_volatile_at(index);
-            if status.port_reset() || status.warm_port_reset() {
-                continue;
-            }
-            let has_change = status.connect_status_change()
-                || status.port_enabled_disabled_change()
-                || status.warm_port_reset_change()
-                || status.over_current_change()
-                || status.port_reset_change()
-                || status.port_link_state_change()
-                || status.port_config_error_change();
-            if !has_change {
-                continue;
-            }
-            self.portsc.update_volatile_at(index, |portsc| {
-                // PORTSC change bits are RW1C and retain their read value in
-                // this update, so the write acknowledges every reported
-                // change. Do not disable an enabled port while acknowledging
-                // them. Reset-in-progress ports are skipped above because the
-                // xHCI register API intentionally exposes reset as write-one.
-                portsc.set_0_port_enabled_disabled();
-            });
-        }
-    }
-
     fn handle_disconnected(&mut self) -> Vec<PortEvent> {
-        let statuses = (0..self.portsc.len())
-            .map(|index| self.portsc.read_volatile_at(index).current_connect_status())
+        let disconnected = self
+            .ports()
+            .iter()
+            .filter(|port| matches!(port.state, PortState::Probed))
+            .filter_map(|port| {
+                let index = usize::from(port.port_id - 1);
+                (!self.portsc.read_volatile_at(index).current_connect_status())
+                    .then_some(port.port_id)
+            })
             .collect::<Vec<_>>();
-        let mut events = Vec::new();
-        for (index, connected) in statuses.into_iter().enumerate() {
-            let port_id = index as u8 + 1;
-            if let Some(event) = self.ports_mut()[index]
-                .state
-                .take_disconnect_event(connected, port_id)
-            {
-                events.push(event);
-            }
+        for port_id in &disconnected {
+            self.ports_mut()[usize::from(*port_id - 1)].state = PortState::Uninit;
         }
-        events
+        disconnected
+            .into_iter()
+            .map(|port_id| PortEvent::Disconnected { port_id })
+            .collect()
     }
 
     async fn handle_uninit(&mut self) -> Result<(), USBError> {

@@ -8,7 +8,6 @@ pub use device::{HubDevice, PortState};
 use futures::future::BoxFuture;
 use usb_if::{err::USBError, host::hub::Speed};
 
-/// Monotonic identity of a hub in the USB topology.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct HubId(usize);
 
@@ -21,15 +20,9 @@ impl HubId {
 pub trait HubOp: Send + 'static + Any {
     fn init<'a>(&'a mut self, info: HubInfo) -> BoxFuture<'a, Result<HubInfo, USBError>>;
     fn changed_ports<'a>(&'a mut self) -> BoxFuture<'a, Result<Vec<PortEvent>, USBError>>;
-
-    /// Releases the device backing an external hub.
-    ///
-    /// Root hubs use the default because they are part of the host controller
-    /// and do not own a device slot.
     fn disconnect(&mut self) -> BoxFuture<'_, Result<(), USBError>> {
         Box::pin(async { Ok(()) })
     }
-
     fn slot_id(&self) -> u8;
 }
 

@@ -6,7 +6,9 @@ use alloc::vec::Vec;
 pub use super::backend::kmod::*;
 #[cfg(umod)]
 pub use super::backend::umod::*;
-pub use crate::device::{Device, DeviceInfo, HubDeviceInfo, ProbeChanges, ProbedDevice};
+pub use crate::device::{
+    Device, DeviceInfo, HubDeviceInfo, InterfaceSession, ProbeChanges, ProbedDevice,
+};
 use crate::{
     backend::{BackendOp, ty::*},
     err::Result,
@@ -30,13 +32,7 @@ impl USBHost {
     }
 
     #[cfg(any(kmod, umod))]
-    pub async fn probe_devices(&mut self) -> Result<Vec<ProbedDevice>> {
-        Ok(self.probe_changes().await?.connected)
-    }
-
-    #[cfg(any(kmod, umod))]
-    /// Returns connection and disconnection transitions since the last scan.
-    pub async fn probe_changes(&mut self) -> Result<ProbeChanges> {
+    pub async fn probe_devices(&mut self) -> Result<ProbeChanges> {
         let changes = self.backend.device_list().await?;
         let mut connected = Vec::new();
         for dev in changes.connected {
@@ -89,6 +85,21 @@ pub struct EventHandler {
 }
 
 impl EventHandler {
+    /// Acknowledges one device IRQ without draining task-owned completions.
+    pub fn acknowledge_irq(&self) -> bool {
+        self.handler.acknowledge_irq()
+    }
+
+    /// Drains one event batch in task context.
+    pub fn drain_event(&self) -> Event {
+        self.handler.drain_event()
+    }
+
+    /// Rearms device interrupts after task-context event draining.
+    pub fn rearm_irq(&self) {
+        self.handler.rearm_irq()
+    }
+
     /// 处理事件
     pub fn handle_event(&self) -> Event {
         self.handler.handle_event()
@@ -137,11 +148,10 @@ mod tests {
         fn device_list<'a>(
             &'a mut self,
         ) -> futures::future::BoxFuture<'a, crate::err::Result<ProbeChangesOp>> {
-            let disconnected = core::mem::take(&mut self.disconnected);
             async {
                 Ok(ProbeChangesOp {
                     connected: Vec::new(),
-                    disconnected,
+                    disconnected: Vec::new(),
                 })
             }
             .boxed()
@@ -175,9 +185,15 @@ mod tests {
 
     #[cfg(kmod)]
     impl crate::backend::ty::EventHandlerOp for TestEventHandler {
-        fn handle_event(&self) -> crate::backend::ty::Event {
+        fn acknowledge_irq(&self) -> bool {
+            false
+        }
+
+        fn drain_event(&self) -> crate::backend::ty::Event {
             crate::backend::ty::Event::Nothing
         }
+
+        fn rearm_irq(&self) {}
     }
 
     fn block_on_ready<F: Future>(mut future: F) -> F::Output {

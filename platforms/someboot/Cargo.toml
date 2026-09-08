@@ -7,10 +7,9 @@ keywords = ["os"]
 license = "MPL-2.0"
 name = "someboot"
 repository.workspace = true
-version = "0.3.7"
+version = "0.4.2"
 
 [features]
-axtest = []
 efi = []
 hv = []
 mmu = []
@@ -21,7 +20,7 @@ zicbom = []
 uspace = ["mmu"]
 
 [lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(axtest)'] }
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(axtest)', 'cfg(axtest_coverage)'] }
 
 [dependencies]
 acpi = "6.0.1"
@@ -46,7 +45,6 @@ ranges-ext = { workspace = true }
 rgb = "0.8"
 some-serial.workspace = true
 somehal-macros = { workspace = true }
-spin = { workspace = true }
 tock-registers.workspace = true
 uguid = "2.2.1"
 derive_more.workspace = true

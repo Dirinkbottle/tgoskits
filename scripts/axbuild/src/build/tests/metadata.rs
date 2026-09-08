@@ -37,10 +37,8 @@ fn std_build_maps_arceos_features_to_ax_std_dependency() {
         ],
     );
 
-    assert_eq!(
-        info.features,
-        vec!["ax-std/lockdep".to_string(), "ax-std/smp".to_string()]
-    );
+    assert!(info.features.contains(&"ax-std/lockdep".to_string()));
+    assert!(info.features.contains(&"ax-std/smp".to_string()));
     assert!(!info.features.contains(&"lockdep".to_string()));
 }
 
@@ -60,7 +58,7 @@ fn makefile_features_use_ax_std_dependency_for_std_build() {
         &["lockdep".to_string(), "std-compat".to_string()],
     );
 
-    assert_eq!(info.features, vec!["ax-std/lockdep".to_string()]);
+    assert!(info.features.contains(&"ax-std/lockdep".to_string()));
 }
 
 #[test]

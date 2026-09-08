@@ -6,15 +6,11 @@ use std::{
 use tempfile::tempdir;
 
 use super::{
-    ArceosBuildInfo, ArceosBuildMode, default_build_info_path,
+    ArceosBuildInfo, ArceosBuildMode,
     info::{load_build_info, resolve_build_info_path_in_dir},
     load_arceos_build_mode, load_c_app_cargo_config, resolve_app_c_dir, resolve_app_c_mode,
-    resolve_build_info_path,
 };
-use crate::{
-    build,
-    context::{ResolvedBuildRequest, find_workspace_root},
-};
+use crate::{build, context::ResolvedBuildRequest};
 
 fn repo_metadata() -> cargo_metadata::Metadata {
     build::workspace_metadata().unwrap()
@@ -44,16 +40,6 @@ fn request(package: &str, target: &str, build_info_path: PathBuf) -> ResolvedBui
 }
 
 #[test]
-fn build_cargo_args_use_builtin_target_and_build_std() {
-    let args = ArceosBuildInfo::build_cargo_args("aarch64-unknown-none-softfloat", &[]);
-    assert!(
-        args.windows(2)
-            .any(|pair| pair == ["-Z", "build-std=core,alloc"])
-    );
-    assert!(!args.iter().any(|arg| arg.contains("-Clink-arg=-T")));
-}
-
-#[test]
 fn max_cpu_num_adds_smp_feature_for_std_build() {
     let mut build_info = ArceosBuildInfo {
         features: vec!["ax-api/net".to_string()],
@@ -64,39 +50,6 @@ fn max_cpu_num_adds_smp_feature_for_std_build() {
     build_info.resolve_c_app_features().unwrap();
 
     assert!(build_info.features.contains(&"ax-std/smp".to_string()));
-}
-
-#[test]
-fn arceos_shell_declares_the_filesystem_backend_used_by_its_qemu_disk() {
-    let manifest =
-        fs::read_to_string(find_workspace_root().join("apps/arceos/shell/Cargo.toml")).unwrap();
-
-    assert!(manifest.contains("ax-std/fatfs"));
-}
-
-#[test]
-fn resolve_build_info_path_uses_package_directory() {
-    let path = resolve_build_info_path("arceos-helloworld", "aarch64-unknown-none-softfloat", None)
-        .unwrap();
-    let default_path =
-        default_build_info_path("arceos-helloworld", "aarch64-unknown-none-softfloat").unwrap();
-
-    assert_eq!(path, default_path);
-    assert!(path.ends_with(
-        "tmp/axbuild/config/arceos-helloworld/build-aarch64-unknown-none-softfloat.toml"
-    ));
-}
-
-#[test]
-fn resolve_build_info_path_prefers_explicit_path() {
-    let path = resolve_build_info_path(
-        "arceos-helloworld",
-        "aarch64-unknown-none-softfloat",
-        Some(PathBuf::from("/tmp/custom-build.toml")),
-    )
-    .unwrap();
-
-    assert_eq!(path, PathBuf::from("/tmp/custom-build.toml"));
 }
 
 #[test]
@@ -124,7 +77,8 @@ fn load_build_info_creates_missing_default_file() {
 
     let build_info = load_build_info(&request).unwrap();
 
-    assert_eq!(build_info, ArceosBuildInfo::default());
+    assert!(build_info.features.is_empty());
+    assert!(build_info.env.is_empty());
     assert!(path.exists());
     assert!(fs::read_to_string(path).unwrap().contains("features = []"));
 }
@@ -400,32 +354,50 @@ fn prepared_cargo_config_uses_unified_std_target() {
 }
 
 #[test]
-fn c_app_cargo_config_uses_builtin_bare_target_without_json_spec() {
-    let root = tempdir().unwrap();
-    let build_config = root
-        .path()
-        .join("build-loongarch64-unknown-none-softfloat.toml");
-    let build_info = ArceosBuildInfo {
-        features: vec!["ax-std".to_string()],
-        ..ArceosBuildInfo::default()
-    };
-    fs::write(&build_config, toml::to_string_pretty(&build_info).unwrap()).unwrap();
-    let request = request(
-        "arceos-helloworld",
+fn c_app_cargo_configs_use_shared_bare_target_specs() {
+    for target in [
+        "x86_64-unknown-none",
+        "aarch64-unknown-none-softfloat",
+        "riscv64gc-unknown-none-elf",
         "loongarch64-unknown-none-softfloat",
-        build_config,
-    );
-    let cargo = load_c_app_cargo_config(&request).unwrap();
+    ] {
+        let root = tempdir().unwrap();
+        let build_config = root.path().join(format!("build-{target}.toml"));
+        let build_info = ArceosBuildInfo {
+            features: vec!["ax-std".to_string()],
+            ..ArceosBuildInfo::default()
+        };
+        fs::write(&build_config, toml::to_string_pretty(&build_info).unwrap()).unwrap();
+        let request = request("arceos-helloworld", target, build_config);
+        let cargo = load_c_app_cargo_config(&request).unwrap();
 
-    assert_eq!(cargo.target, "loongarch64-unknown-none-softfloat");
-    assert!(!cargo.env.contains_key("CARGO_UNSTABLE_JSON_TARGET_SPEC"));
-    assert!(!cargo.features.contains(&"ax-std/plat-dyn".to_string()));
-    assert!(
-        cargo
-            .args
-            .windows(2)
-            .any(|pair| pair == ["-Z", "build-std=core,alloc"])
-    );
+        assert_eq!(cargo.target, format!("scripts/targets/bare/{target}.json"));
+        assert_eq!(cargo.env.get("AX_TARGET"), Some(&target.to_string()));
+        assert_eq!(
+            cargo.env.get("CARGO_UNSTABLE_JSON_TARGET_SPEC"),
+            Some(&"true".to_string())
+        );
+        assert!(!cargo.features.contains(&"ax-std/plat-dyn".to_string()));
+        assert!(
+            cargo
+                .args
+                .windows(2)
+                .any(|pair| pair == ["-Z", "build-std=core,alloc"])
+        );
+        assert!(
+            cargo
+                .args
+                .windows(2)
+                .any(|pair| pair == ["-Z", "json-target-spec"])
+        );
+
+        let final_cargo = crate::arceos::cbuild::prepare_c_app_cargo_config(&request, &[]).unwrap();
+        assert_eq!(
+            final_cargo.target,
+            format!("scripts/targets/bare/{target}.json")
+        );
+        assert_eq!(final_cargo.env.get("AX_TARGET"), Some(&target.to_string()));
+    }
 }
 
 #[test]

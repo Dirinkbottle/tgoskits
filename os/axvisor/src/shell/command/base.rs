@@ -21,7 +21,6 @@ use std::fs::{FileTypeExt, PermissionsExt};
 use std::io::{self, Read, Write};
 #[cfg(all(feature = "fs", unix))]
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
-use std::println;
 use std::string::{String, ToString};
 
 #[cfg(feature = "fs")]
@@ -30,6 +29,11 @@ use crate::shell::command::fs::{
     move_file_or_dir, path_basename, remove_path, touch_file,
 };
 use crate::shell::command::{CommandNode, FlagDef, ParsedCommand};
+#[cfg(feature = "fs")]
+use axvisor::shell_support::{
+    CopyMode, RemoveOptions, collect_directory_entry_names, copy_operands, copy_path,
+    move_file_or_dir, path_basename, remove_path, touch_file,
+};
 
 #[cfg(feature = "fs")]
 macro_rules! print_err {
@@ -135,7 +139,7 @@ fn do_cat(cmd: &ParsedCommand) {
         loop {
             let n = file.read(&mut buf)?;
             if n > 0 {
-                io::stdout().write_all(&buf[..n])?;
+                crate::shell::submit_shell_bytes(&buf[..n]);
             } else {
                 return Ok(());
             }
@@ -182,8 +186,6 @@ fn do_echo(cmd: &ParsedCommand) {
             print_err!("echo", fname, e);
         }
     } else if no_newline {
-        use std::print;
-
         print!("{}", args_str);
     } else {
         println!("{}", args_str);

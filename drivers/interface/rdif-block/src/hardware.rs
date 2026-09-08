@@ -136,8 +136,9 @@ pub trait HardwareQueue: Send + 'static {
 
     /// Quiesces the queue and returns every request whose DMA is safe to reuse.
     ///
-    /// Backing still reachable by hardware must be quarantined by the driver
-    /// instead of being reported as completed.
+    /// Backing still reachable by hardware must not be reported as completed.
+    /// If this method returns an error, the queue may still own DMA-visible
+    /// backing, so the caller must keep the entire queue alive.
     ///
     /// # Errors
     ///
@@ -219,16 +220,24 @@ pub enum ControllerState {
 /// IRQ endpoint emitted by a controller transition.
 pub struct IrqEndpoint {
     source_id: usize,
-    queue_bits: u64,
+    queue_mask: crate::IrqQueueMask,
     handler: Box<dyn HardIrqHandler>,
 }
 
 impl IrqEndpoint {
-    /// Creates an endpoint whose boxed handler is owned by one IRQ token.
-    pub fn new(source_id: usize, queue_bits: u64, handler: Box<dyn HardIrqHandler>) -> Self {
+    /// Creates a complete routing snapshot for one physical IRQ source.
+    ///
+    /// Emitting the same `source_id` again replaces its installed endpoint.
+    /// The driver must keep that source masked until the runtime advances
+    /// [`ControllerEvent::Rearm`] after publishing the replacement.
+    pub fn new(
+        source_id: usize,
+        queue_mask: crate::IrqQueueMask,
+        handler: Box<dyn HardIrqHandler>,
+    ) -> Self {
         Self {
             source_id,
-            queue_bits,
+            queue_mask,
             handler,
         }
     }
@@ -239,8 +248,8 @@ impl IrqEndpoint {
     }
 
     /// Returns the hardware queues activated by this fixed endpoint.
-    pub const fn queue_bits(&self) -> u64 {
-        self.queue_bits
+    pub const fn queue_mask(&self) -> crate::IrqQueueMask {
+        self.queue_mask
     }
 
     /// Transfers the handler into the runtime IRQ registration token.
@@ -338,6 +347,14 @@ mod tests {
         OwnedRequestBatch, QueueLimits, RequestFlags, RequestOp, SubmissionSink,
     };
 
+    fn test_dma() -> dma_api::DmaDeviceInfo {
+        dma_api::DmaDeviceInfo::new(
+            dma_api::DmaDomainId::Direct,
+            dma_api::DmaCoherency::NonCoherent,
+            dma_api::DmaConstraints::new(u64::MAX),
+        )
+    }
+
     #[derive(Default)]
     struct AcceptedIds(Vec<RequestId>);
 
@@ -358,7 +375,7 @@ mod tests {
             QueueInfo {
                 id: self.id(),
                 device: DeviceInfo::new(8, 512),
-                limits: QueueLimits::simple(512, u64::MAX),
+                limits: QueueLimits::simple(512, test_dma()),
             }
         }
 
@@ -394,7 +411,7 @@ mod tests {
     #[test]
     fn controller_update_transfers_move_only_queue_and_handler_ownership() {
         let queue: BHardwareQueue = Box::new(NoopQueue);
-        let endpoint = IrqEndpoint::new(7, 1 << 3, Box::new(QueueIrq));
+        let endpoint = IrqEndpoint::new(7, IrqQueueMask::from_queue(3), Box::new(QueueIrq));
         let mut update =
             ControllerUpdate::with_resources(ControllerState::Ready, vec![queue], vec![endpoint]);
 
@@ -402,6 +419,7 @@ mod tests {
         let mut endpoints = update.take_irq_endpoints();
         assert_eq!(queues[0].id(), 3);
         assert_eq!(endpoints[0].source_id(), 7);
+        assert_eq!(endpoints[0].queue_mask(), IrqQueueMask::from_queue(3));
 
         let request = OwnedRequest {
             op: RequestOp::Flush,
@@ -449,6 +467,6 @@ mod tests {
         assert_eq!(result.disposition(), BatchSubmitDisposition::QueueFull);
         assert!(accepted.0.is_empty());
         assert_eq!(batch.len(), 2);
-        assert_eq!(QueueLimits::simple(512, u64::MAX).max_submit_batch, 1);
+        assert_eq!(QueueLimits::simple(512, test_dma()).max_submit_batch, 1);
     }
 }

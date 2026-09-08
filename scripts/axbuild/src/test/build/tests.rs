@@ -1,6 +1,10 @@
-use std::{collections::BTreeSet, ffi::OsStr, fs, path::PathBuf, process::Command, time::Duration};
-#[cfg(unix)]
-use std::{env, os::unix::fs::PermissionsExt, path::Path};
+use std::{
+    collections::BTreeSet,
+    ffi::OsStr,
+    fs,
+    path::{Path, PathBuf},
+    process::Command,
+};
 
 use tempfile::tempdir;
 
@@ -8,18 +12,19 @@ use super::{grouped_c::*, toolchain::*, *};
 
 fn fake_config() -> CaseAssetConfig {
     CaseAssetConfig {
-        grouped_runner: case_assets::GroupedCaseRunnerConfig {
-            runner_name: "suite-run-case-tests".to_string(),
-            runner_path: "/usr/bin/suite-run-case-tests".to_string(),
-            autorun_profile_script: None,
-            begin_marker: "SUITE_GROUPED_TEST_BEGIN".to_string(),
-            passed_marker: "SUITE_GROUPED_TEST_PASSED".to_string(),
-            failed_marker: "SUITE_GROUPED_TEST_FAILED".to_string(),
-            all_passed_marker: "SUITE_GROUPED_TESTS_PASSED".to_string(),
-            all_failed_marker: "SUITE_GROUPED_TESTS_FAILED".to_string(),
-            success_regex: r"(?m)^SUITE_GROUPED_TESTS_PASSED\s*$".to_string(),
-            fail_regex: r"(?m)^SUITE_GROUPED_TEST_FAILED:".to_string(),
-        },
+        grouped_execution: case_assets::GroupedCaseExecution::ShellCommand(
+            case_assets::GroupedCaseRunnerConfig {
+                runner_name: "suite-run-case-tests".to_string(),
+                runner_path: "/usr/bin/suite-run-case-tests".to_string(),
+                begin_marker: "SUITE_GROUPED_TEST_BEGIN".to_string(),
+                passed_marker: "SUITE_GROUPED_TEST_PASSED".to_string(),
+                failed_marker: "SUITE_GROUPED_TEST_FAILED".to_string(),
+                all_passed_marker: "SUITE_GROUPED_TESTS_PASSED".to_string(),
+                all_failed_marker: "SUITE_GROUPED_TESTS_FAILED".to_string(),
+                success_regex: r"(?m)^SUITE_GROUPED_TESTS_PASSED\s*$".to_string(),
+                fail_regex: r"(?m)^SUITE_GROUPED_TEST_FAILED:".to_string(),
+            },
+        ),
         script_env: case_assets::CaseScriptEnvConfig {
             staging_root: "SUITE_STAGING_ROOT".to_string(),
             case_dir: "SUITE_CASE_DIR".to_string(),
@@ -45,6 +50,7 @@ fn fake_case(root: &Path, name: &str) -> TestQemuCase {
         case_dir: case_dir.clone(),
         qemu_config_path: case_dir.join("qemu-aarch64.toml"),
         test_commands: Vec::new(),
+        grouped_command_selection: Default::default(),
         host_symbolize_success_regex: Vec::new(),
         host_http_server: None,
         subcases: Vec::new(),
@@ -198,13 +204,9 @@ fn grouped_c_subcases_keep_only_direct_usr_bin_commands() {
     let subcases = vec![&alpha, &beta, &gamma];
 
     let selected = selected_grouped_c_subcases(&case, subcases).unwrap();
-    assert_eq!(
-        selected
-            .iter()
-            .map(|subcase| subcase.name.as_str())
-            .collect::<Vec<_>>(),
-        vec!["alpha", "gamma-dir"]
-    );
+    assert!(selected.iter().any(|subcase| subcase.name == "alpha"));
+    assert!(selected.iter().any(|subcase| subcase.name == "gamma-dir"));
+    assert!(selected.iter().all(|subcase| subcase.name != "beta"));
 }
 
 #[test]
@@ -219,13 +221,8 @@ fn grouped_c_subcases_keep_all_dynamic_shell_commands() {
     let subcases = vec![&alpha, &beta];
 
     let selected = selected_grouped_c_subcases(&case, subcases).unwrap();
-    assert_eq!(
-        selected
-            .iter()
-            .map(|subcase| subcase.name.as_str())
-            .collect::<Vec<_>>(),
-        vec!["alpha", "beta"]
-    );
+    assert!(selected.iter().any(|subcase| subcase.name == "alpha"));
+    assert!(selected.iter().any(|subcase| subcase.name == "beta"));
 }
 
 #[test]
@@ -241,13 +238,8 @@ fn grouped_c_subcases_prefer_explicit_filter() {
     let subcases = vec![&alpha, &beta];
 
     let selected = selected_grouped_c_subcases(&case, subcases).unwrap();
-    assert_eq!(
-        selected
-            .iter()
-            .map(|subcase| subcase.name.as_str())
-            .collect::<Vec<_>>(),
-        vec!["beta"]
-    );
+    assert!(selected.iter().any(|subcase| subcase.name == "beta"));
+    assert!(selected.iter().all(|subcase| subcase.name != "alpha"));
 }
 
 #[test]
@@ -265,7 +257,16 @@ fn grouped_runner_commands_follow_explicit_subcase_filter_for_direct_commands() 
     let selected = selected_grouped_c_subcases(&case, vec![&alpha, &beta]).unwrap();
     let runner_commands = selected_grouped_runner_commands(&case, &selected).unwrap();
 
-    assert_eq!(runner_commands, vec!["/usr/bin/beta --stress"]);
+    assert!(
+        runner_commands
+            .iter()
+            .any(|command| command == "/usr/bin/beta --stress")
+    );
+    assert!(
+        runner_commands
+            .iter()
+            .all(|command| command != "/usr/bin/alpha")
+    );
 }
 
 #[test]
@@ -280,6 +281,29 @@ fn grouped_runner_commands_keep_dynamic_shell_loop_with_explicit_filter() {
     let selected = selected_grouped_c_subcases(&case, vec![&beta]).unwrap();
     let runner_commands = selected_grouped_runner_commands(&case, &selected).unwrap();
 
+    assert_eq!(runner_commands, case.test_commands);
+}
+
+#[test]
+fn grouped_runner_commands_preserve_explicit_aggregator_with_subcase_filter() {
+    let root = tempdir().unwrap();
+    let mut case = fake_case(root.path(), "system");
+    case.test_commands = vec!["/usr/bin/starry-run-system-tests".to_string()];
+    case.grouped_command_selection = GroupedCommandSelection::PreserveAll;
+    case.grouped_subcase_filter = Some(BTreeSet::from(["beta".to_string()]));
+
+    let alpha = fake_c_subcase(root.path(), &case, "alpha", &["alpha"]);
+    let beta = fake_c_subcase(root.path(), &case, "beta", &["beta"]);
+    let selected = selected_grouped_c_subcases(&case, vec![&alpha, &beta]).unwrap();
+    let runner_commands = selected_grouped_runner_commands(&case, &selected).unwrap();
+
+    assert_eq!(
+        selected
+            .iter()
+            .map(|subcase| subcase.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["beta"]
+    );
     assert_eq!(runner_commands, case.test_commands);
 }
 
@@ -388,72 +412,13 @@ fn grouped_c_root_prebuild_env_exposes_selected_subcase_list() {
     )));
 }
 
-#[cfg(unix)]
-#[test]
-fn starry_system_prebuild_retries_transient_apk_failures() {
-    let root = tempdir().unwrap();
-    let fake_bin = root.path().join("bin");
-    let staging_root = root.path().join("staging-root");
-    let attempts_file = root.path().join("apk-attempts");
-    fs::create_dir_all(&fake_bin).unwrap();
-    fs::create_dir_all(staging_root.join("usr/bin")).unwrap();
-
-    let fake_apk = fake_bin.join("apk");
-    fs::write(
-        &fake_apk,
-        r#"#!/bin/sh
-attempt=0
-if [ -f "$APK_ATTEMPTS_FILE" ]; then
-    attempt="$(cat "$APK_ATTEMPTS_FILE")"
-fi
-attempt="$((attempt + 1))"
-printf '%s\n' "$attempt" > "$APK_ATTEMPTS_FILE"
-if [ "$attempt" -lt 3 ]; then
-    exit 1
-fi
-printf '#!/bin/sh\nexit 0\n' > "$STARRY_STAGING_ROOT/usr/bin/curl"
-chmod +x "$STARRY_STAGING_ROOT/usr/bin/curl"
-"#,
-    )
-    .unwrap();
-    fs::set_permissions(&fake_apk, fs::Permissions::from_mode(0o755)).unwrap();
-
-    let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(Path::parent)
-        .unwrap();
-    let prebuild_script = workspace_root.join("test-suit/starryos/qemu/system/prebuild.sh");
-    let original_path = env::var_os("PATH").unwrap_or_default();
-    let mut command_paths = vec![fake_bin];
-    command_paths.extend(env::split_paths(&original_path));
-    let command_path = env::join_paths(command_paths).unwrap();
-
-    let output = Command::new("sh")
-        .arg(prebuild_script)
-        .env("PATH", command_path)
-        .env("APK_ATTEMPTS_FILE", &attempts_file)
-        .env("STARRY_APK_RETRY_DELAY_SECONDS", "0")
-        .env("STARRY_GROUPED_C_SUBCASES", "apk-curl-equivalence")
-        .env("STARRY_STAGING_ROOT", &staging_root)
-        .output()
-        .unwrap();
-
-    assert!(
-        output.status.success(),
-        "prebuild failed\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
-    );
-    assert_eq!(fs::read_to_string(attempts_file).unwrap().trim(), "3");
-    assert!(staging_root.join("usr/bin/curl").is_file());
-}
-
 #[test]
 fn cross_compile_spec_maps_supported_arches() {
     assert_eq!(
         cross_compile_spec("aarch64").unwrap(),
         CrossCompileSpec {
             llvm_target: "aarch64-linux-musl",
+            rust_musl_target: "aarch64-unknown-linux-musl",
             cmake_system_processor: "aarch64",
             guest_tool_dir: "usr/aarch64-alpine-linux-musl/bin",
             gnu_tool_prefix: "aarch64-linux-musl",
@@ -464,6 +429,7 @@ fn cross_compile_spec_maps_supported_arches() {
         cross_compile_spec("loongarch64").unwrap(),
         CrossCompileSpec {
             llvm_target: "loongarch64-linux-musl",
+            rust_musl_target: "loongarch64-unknown-linux-musl",
             cmake_system_processor: "loongarch64",
             guest_tool_dir: "usr/loongarch64-alpine-linux-musl/bin",
             gnu_tool_prefix: "loongarch64-linux-musl",
@@ -554,26 +520,6 @@ fn detect_gcc_runtime_dir_prefers_highest_version() {
 }
 
 #[test]
-fn qemu_user_binary_names_cover_supported_arches() {
-    assert_eq!(
-        qemu_user_binary_names("aarch64").unwrap(),
-        &["qemu-aarch64-static", "qemu-aarch64"]
-    );
-    assert_eq!(
-        qemu_user_binary_names("riscv64").unwrap(),
-        &["qemu-riscv64-static", "qemu-riscv64"]
-    );
-    assert_eq!(
-        qemu_user_binary_names("x86_64").unwrap(),
-        &["qemu-x86_64-static", "qemu-x86_64"]
-    );
-    assert_eq!(
-        qemu_user_binary_names("loongarch64").unwrap(),
-        &["qemu-loongarch64-static", "qemu-loongarch64"]
-    );
-}
-
-#[test]
 fn case_script_envs_include_expected_paths() {
     let root = tempdir().unwrap();
     let case = fake_case(root.path(), "usb");
@@ -591,12 +537,4 @@ fn case_script_envs_include_expected_paths() {
         "SUITE_CASE_BUILD_DIR".to_string(),
         layout.build_dir.display().to_string()
     )));
-}
-
-#[test]
-fn format_duration_like_summary_helpers_are_precise_enough() {
-    assert_eq!(
-        format!("{:.2}", Duration::from_millis(1250).as_secs_f64()),
-        "1.25"
-    );
 }

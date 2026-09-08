@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.24.1](https://github.com/rcore-os/tgoskits/compare/rdrive-v0.24.0...rdrive-v0.24.1) - 2026-08-27
+
+### Added
+
+- *(loongarch-intc-driver)* extract OS-independent interrupt controllers ([#2174](https://github.com/rcore-os/tgoskits/pull/2174))
+
+## [0.24.0](https://github.com/rcore-os/tgoskits/compare/rdrive-v0.23.9...rdrive-v0.24.0) - 2026-08-20
+
+### Added
+
+- *(dma-api)* [**breaking**] add device DMA coherency with uncached-alias remap ([#2106](https://github.com/rcore-os/tgoskits/pull/2106))
+
+### Fixed
+
+- *(axbuild)* lint host-test targets with clippy ([#2022](https://github.com/rcore-os/tgoskits/pull/2022))
+- *(rdrive)* make FDT assigned-clocks best-effort, not probe-fatal ([#2002](https://github.com/rcore-os/tgoskits/pull/2002))
+
+### Other
+
+- *(axtest)* standardize Cargo and QEMU test flow ([#2088](https://github.com/rcore-os/tgoskits/pull/2088))
+- *(errors)* introduce domain-owned error boundaries ([#2024](https://github.com/rcore-os/tgoskits/pull/2024))
+- *(rdrive)* add fdt_ref() to borrow the device tree without cloning ([#2004](https://github.com/rcore-os/tgoskits/pull/2004))
+- *(sync)* unify lock primitives in ax-sync ([#1956](https://github.com/rcore-os/tgoskits/pull/1956))
+
+## [0.23.9](https://github.com/rcore-os/tgoskits/compare/rdrive-v0.23.8...rdrive-v0.23.9) - 2026-08-09
+
+### Added
+
+- *(axvisor)* build VMs from a resolved device graph ([#1718](https://github.com/rcore-os/tgoskits/pull/1718))
+
+### Fixed
+
+- *(dwmmc)* restore RK3588 SD card boot ([#1830](https://github.com/rcore-os/tgoskits/pull/1830))
+
 ## [0.23.8](https://github.com/rcore-os/tgoskits/compare/rdrive-v0.23.7...rdrive-v0.23.8) - 2026-08-03
 
 ### Other

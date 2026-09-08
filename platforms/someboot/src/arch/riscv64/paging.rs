@@ -1,10 +1,11 @@
 use core::arch::asm;
 
+use num_align::NumAlign;
 use page_table_generic::MapConfig;
 
 use crate::{
     console::print_mapping,
-    mem::{__kimage_va, __va, MemAttributes, PageTableInfo, PteConfig, cpu_area_phys_to_virt},
+    mem::{__kimage_va, __va, MB, MemAttributes, PageTableInfo, PteConfig, cpu_area_phys_to_virt},
     smp::PerCpuMeta,
 };
 

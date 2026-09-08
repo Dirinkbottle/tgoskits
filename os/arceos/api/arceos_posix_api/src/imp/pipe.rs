@@ -1,12 +1,10 @@
 use alloc::sync::Arc;
 use core::ffi::c_int;
 
-use ax_errno::{LinuxError, LinuxResult};
 use ax_io::PollState;
-use ax_sync::Mutex;
 
 use super::fd_ops::{FileLike, add_file_like, close_file_like};
-use crate::ctypes;
+use crate::{PosixError, PosixResult, ctypes, sync::Mutex};
 
 #[derive(Copy, Clone, PartialEq)]
 enum RingBufferStatus {
@@ -98,12 +96,12 @@ impl PipeRingBuffer {
         }
     }
 
-    pub const fn readiness_version(&self, readable_end: bool) -> u64 {
-        if readable_end {
-            self.read_readiness_version
-        } else {
-            self.write_readiness_version
-        }
+    pub const fn read_readiness_version(&self) -> u64 {
+        self.read_readiness_version
+    }
+
+    pub const fn write_readiness_version(&self) -> u64 {
+        self.write_readiness_version
     }
 }
 
@@ -140,9 +138,9 @@ impl Pipe {
 }
 
 impl FileLike for Pipe {
-    fn read(&self, buf: &mut [u8]) -> LinuxResult<usize> {
+    fn read(&self, buf: &mut [u8]) -> PosixResult<usize> {
         if !self.readable() {
-            return Err(LinuxError::EPERM);
+            return Err(PosixError::EPERM);
         }
         if buf.is_empty() {
             return Ok(0);
@@ -177,9 +175,9 @@ impl FileLike for Pipe {
         }
     }
 
-    fn write(&self, buf: &[u8]) -> LinuxResult<usize> {
+    fn write(&self, buf: &[u8]) -> PosixResult<usize> {
         if !self.writable() {
-            return Err(LinuxError::EPERM);
+            return Err(PosixError::EPERM);
         }
         if buf.is_empty() {
             return Ok(0);
@@ -208,7 +206,7 @@ impl FileLike for Pipe {
         }
     }
 
-    fn stat(&self) -> LinuxResult<ctypes::stat> {
+    fn stat(&self) -> PosixResult<ctypes::stat> {
         let st_mode = 0o10000 | 0o600u32; // S_IFIFO | rw-------
         Ok(ctypes::stat {
             st_ino: 1,
@@ -225,16 +223,20 @@ impl FileLike for Pipe {
         self
     }
 
-    fn poll(&self) -> LinuxResult<PollState> {
+    fn poll(&self) -> PosixResult<PollState> {
         let buf = self.buffer.lock();
         Ok(PollState {
             readable: self.readable() && buf.available_read() > 0,
             writable: self.writable() && buf.available_write() > 0,
-            readiness_version: buf.readiness_version(self.readable()),
+            // Both ends report both directions: the shared ring buffer owns the
+            // readiness of the pipe as a whole, and the epoll edge logic keys
+            // each event class off its own direction's version.
+            read_readiness_version: buf.read_readiness_version(),
+            write_readiness_version: buf.write_readiness_version(),
         })
     }
 
-    fn set_nonblocking(&self, _nonblocking: bool) -> LinuxResult {
+    fn set_nonblocking(&self, _nonblocking: bool) -> PosixResult {
         Ok(())
     }
 }
@@ -246,7 +248,7 @@ pub fn sys_pipe(fds: &mut [c_int]) -> c_int {
     debug!("sys_pipe <= {:#x}", fds.as_ptr() as usize);
     syscall_body!(sys_pipe, {
         if fds.len() != 2 {
-            return Err(LinuxError::EFAULT);
+            return Err(PosixError::EFAULT);
         }
 
         let (read_end, write_end) = Pipe::new();

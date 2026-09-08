@@ -1,6 +1,6 @@
 [package]
 name = "axplat-dyn"
-version = "0.7.14"
+version = "0.8.1"
 authors = ["周睿 <zrufo747@outlook.com>"]
 categories.workspace = true
 description = "A dynamic platform module for ArceOS, providing runtime platform detection and configuration"
@@ -10,16 +10,15 @@ license.workspace = true
 repository.workspace = true
 
 [features]
-default = ["smp", "irq" ]
+default = ["smp"]
 smp = ["ax-plat/smp"]
-irq = ["ax-plat/irq"]
 rtc = []
 efi = ["somehal/efi"]
 fp-simd = ["ax-cpu/fp-simd"]
 tls = ["somehal/tls", "ax-cpu/tls", "cpu-local/tls"]
 uspace = ["somehal/uspace"]
 hv = ["somehal/hv"]
-svpbmt = ["somehal/svpbmt", "ax-cpu/svpbmt"]
+svpbmt = ["somehal/svpbmt"]
 thead-mae = ["somehal/thead-mae", "ax-cpu/xuantie-c9xx"]
 zicbom = ["somehal/zicbom"]
 
@@ -28,7 +27,7 @@ anyhow = { workspace = true }
 ax-cpu.workspace = true
 cpu-local.workspace = true
 ax-driver.workspace = true
-ax-errno.workspace = true
+ax-lazyinit.workspace = true
 axklib = { workspace = true, features = ["buddy-slab"] }
 ax-plat.workspace = true
 heapless = "0.9"
@@ -38,7 +37,7 @@ ax-percpu.workspace = true
 rdrive.workspace = true
 someboot.workspace = true
 somehal.workspace = true
-spin = { workspace = true }
+thiserror.workspace = true
 
 [package.metadata.axplat]
 platform = "dyn"

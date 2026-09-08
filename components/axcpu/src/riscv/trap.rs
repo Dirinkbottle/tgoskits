@@ -1,8 +1,8 @@
 use core::mem::size_of;
 
 #[cfg(not(feature = "tls"))]
-use cpu_local::CURRENT_THREAD_CPU_BASE_OFFSET;
-#[cfg(any(feature = "fp-simd", feature = "vector"))]
+use cpu_local::EXECUTION_CONTEXT_CPU_BASE_OFFSET;
+#[cfg(feature = "fp-simd")]
 use riscv::register::sstatus;
 #[cfg(feature = "vector")]
 use riscv::register::sstatus::VS;
@@ -104,7 +104,7 @@ core::arch::global_asm!(
     trapframe_size = const size_of::<RawTrapFrame>(),
     kernel_stack_pointer_index = const CPU_KERNEL_STACK_POINTER_OFFSET / size_of::<usize>(),
     user_trap_frame_index = const CPU_USER_TRAP_FRAME_OFFSET / size_of::<usize>(),
-    thread_cpu_base_index = const CURRENT_THREAD_CPU_BASE_OFFSET / size_of::<usize>(),
+    thread_cpu_base_index = const EXECUTION_CONTEXT_CPU_BASE_OFFSET / size_of::<usize>(),
     thread_scratch0_index = const THREAD_SCRATCH0_OFFSET / size_of::<usize>(),
     thread_scratch1_index = const THREAD_SCRATCH1_OFFSET / size_of::<usize>(),
 );
@@ -142,6 +142,10 @@ fn panic_illegal_instruction(tf: &KernelTrapFrame<'_>) -> ! {
 
 fn handle_page_fault(tf: &mut KernelTrapFrame<'_>, access_flags: PageFaultFlags) {
     let vaddr = va!(stval::read());
+    #[cfg(feature = "exception-table")]
+    if tf.raw.0.fixup_nofault_exception() {
+        return;
+    }
     if crate::trap::call_page_fault_handler_with_parent_irqs(
         vaddr,
         access_flags,
@@ -215,7 +219,7 @@ fn handle_trap(tf: &mut KernelTrapFrame<'_>) {
                 }
             }
             Trap::Interrupt(_) => {
-                crate::trap::dispatch_irq(scause.bits());
+                crate::trap::dispatch_irq(scause.bits(), crate::trap::TrapOrigin::Kernel);
             }
             _ => {
                 let snapshot = tf.snapshot();

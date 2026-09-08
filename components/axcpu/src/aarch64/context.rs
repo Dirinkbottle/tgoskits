@@ -6,7 +6,7 @@ use core::{
 };
 
 use ax_memory_addr::VirtAddr;
-use cpu_local::{CurrentThreadHeader, PreparedThreadSwitch};
+use cpu_local::{ExecutionContextHeader, PreparedContextSwitch};
 
 use crate::{KernelTlsBase, TaskLocalState};
 
@@ -211,9 +211,6 @@ pub struct TaskContext {
     lr: u64, // r30
     /// Architecture-neutral current-header and kernel-TLS switch state.
     task_local: TaskLocalState,
-    /// The `TTBR0_EL1` value restored for this task's userspace address space.
-    #[cfg(feature = "uspace")]
-    page_table_root: ax_memory_addr::PhysAddr,
     #[cfg(feature = "fp-simd")]
     fp_state: FpState,
 }
@@ -253,34 +250,22 @@ impl TaskContext {
         self.task_local.set_kernel_tls(kernel_tls);
     }
 
-    /// Sets the pinned task-owned current-thread header.
-    pub fn set_current_header(&mut self, header: NonNull<CurrentThreadHeader>) {
-        self.task_local.set_current_header(header);
+    /// Sets the pinned task-owned execution-context header.
+    pub fn set_context_header(&mut self, header: NonNull<ExecutionContextHeader>) {
+        self.task_local.set_context_header(header);
     }
 
-    /// Returns the configured task-owned current-thread header.
-    pub const fn current_header(&self) -> Option<NonNull<CurrentThreadHeader>> {
-        self.task_local.current_header()
+    /// Returns the configured task-owned execution-context header.
+    pub const fn context_header(&self) -> Option<NonNull<ExecutionContextHeader>> {
+        self.task_local.context_header()
     }
 
-    /// Changes the page table root restored for this task.
-    #[cfg(feature = "uspace")]
-    pub fn set_page_table_root(&mut self, page_table_root: ax_memory_addr::PhysAddr) {
-        self.page_table_root = page_table_root;
-    }
-
-    /// Completes FP/SIMD work before current-thread publication.
+    /// Completes FP/SIMD work before current-context publication.
     pub fn prepare_switch_to(&mut self, _next_ctx: &Self) {
         #[cfg(feature = "fp-simd")]
         {
             self.fp_state.save();
             _next_ctx.fp_state.restore();
-        }
-        #[cfg(feature = "uspace")]
-        if self.page_table_root != _next_ctx.page_table_root {
-            // SAFETY: the scheduler owns both contexts with IRQs disabled.
-            unsafe { crate::asm::write_user_page_table(_next_ctx.page_table_root) };
-            crate::asm::flush_tlb(None);
         }
     }
 
@@ -294,13 +279,8 @@ impl TaskContext {
     pub unsafe fn switch_to_prepared(
         &mut self,
         next_ctx: &Self,
-        prepared: PreparedThreadSwitch<'_>,
+        prepared: PreparedContextSwitch<'_>,
     ) {
-        assert_eq!(
-            next_ctx.current_header(),
-            Some(prepared.next_header()),
-            "prepared switch token must belong to the next task context",
-        );
         unsafe { prepared.commit() };
         unsafe { context_switch_raw(self, next_ctx) }
     }
@@ -334,6 +314,8 @@ unsafe extern "C" fn context_switch_raw(_current_task: &mut TaskContext, _next_t
         ldp     x25, x26, [x1, {r25_offset}]
         ldp     x27, x28, [x1, {r27_offset}]
         ldp     x29, x30, [x1, {r29_offset}]
+        ldr     x9, [x1, {context_header_offset}]
+        msr     sp_el0, x9
 
         ret",
         sp_offset = const offset_of!(TaskContext, sp),
@@ -343,6 +325,8 @@ unsafe extern "C" fn context_switch_raw(_current_task: &mut TaskContext, _next_t
         r25_offset = const offset_of!(TaskContext, r25),
         r27_offset = const offset_of!(TaskContext, r27),
         r29_offset = const offset_of!(TaskContext, r29),
+        context_header_offset = const offset_of!(TaskContext, task_local)
+            + offset_of!(TaskLocalState, context_header),
         kernel_tls_offset = const offset_of!(TaskContext, task_local)
             + offset_of!(TaskLocalState, kernel_tls),
     )
@@ -373,7 +357,7 @@ unsafe extern "C" fn context_switch_raw(_current_task: &mut TaskContext, _next_t
         ldp     x25, x26, [x1, {r25_offset}]
         ldp     x27, x28, [x1, {r27_offset}]
         ldp     x29, x30, [x1, {r29_offset}]
-        ldr     x9, [x1, {current_header_offset}]
+        ldr     x9, [x1, {context_header_offset}]
         msr     sp_el0, x9
         ret",
         sp_offset = const offset_of!(TaskContext, sp),
@@ -383,8 +367,8 @@ unsafe extern "C" fn context_switch_raw(_current_task: &mut TaskContext, _next_t
         r25_offset = const offset_of!(TaskContext, r25),
         r27_offset = const offset_of!(TaskContext, r27),
         r29_offset = const offset_of!(TaskContext, r29),
-        current_header_offset = const offset_of!(TaskContext, task_local)
-            + offset_of!(TaskLocalState, current_header),
+        context_header_offset = const offset_of!(TaskContext, task_local)
+            + offset_of!(TaskLocalState, context_header),
     )
 }
 

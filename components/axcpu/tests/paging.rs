@@ -4,6 +4,14 @@ mod paging {
 
 // Compile target-owned PTE modules in the host test harness so their entry
 // semantics can be exercised without a target-side test runner.
+#[path = "../src/aarch64/asid.rs"]
+mod aarch64_asid;
+#[expect(
+    dead_code,
+    reason = "the host adapter exercises PTE behavior without architecture initialization"
+)]
+#[path = "../src/aarch64/paging.rs"]
+mod aarch64_paging;
 #[expect(
     dead_code,
     reason = "the host adapter exercises PTE behavior without architecture initialization"
@@ -17,6 +25,7 @@ mod loongarch64_paging;
 #[path = "../src/riscv/paging.rs"]
 mod riscv_paging;
 
+use aarch64_paging::A64Pte;
 use ax_cpu::trap::PageFaultFlags;
 use ax_memory_addr::{PAGE_SIZE_4K, PhysAddr};
 use loongarch64_paging::La64Pte;
@@ -39,6 +48,66 @@ fn page_fault_access_converts_to_mapping_permissions() {
 }
 
 #[test]
+fn aarch64_relocated_normal_leaf_preserves_memory_type() {
+    let source_paddr = PhysAddr::from_usize(0x1_81ea_5000);
+    let target_paddr = PhysAddr::from_usize(0x1_8200_0000);
+    let flags = MappingFlags::READ | MappingFlags::WRITE | MappingFlags::USER;
+    let source_pte = A64Pte::new_page(source_paddr, flags, false);
+    let queried_flags = source_pte.config(false);
+    let target_pte = A64Pte::new_page(target_paddr, queried_flags, false);
+
+    assert_eq!(queried_flags, flags);
+    assert_eq!(target_pte.config(false), flags);
+}
+
+#[test]
+fn aarch64_explicit_memory_types_roundtrip() {
+    let paddr = PhysAddr::from_usize(0x1_81ea_5000);
+    for memory_type in [MappingFlags::DEVICE, MappingFlags::UNCACHED] {
+        let flags = MappingFlags::READ | MappingFlags::WRITE | memory_type;
+        let pte = A64Pte::new_page(paddr, flags, false);
+
+        assert_eq!(pte.config(false), flags);
+    }
+}
+
+#[test]
+fn aarch64_user_leaf_is_non_global_for_asid_isolation() {
+    const PTE_NG: u64 = 1 << 11;
+    let paddr = PhysAddr::from_usize(0x4000_0000);
+
+    for is_huge in [false, true] {
+        let user = A64Pte::new_page(paddr, MappingFlags::READ | MappingFlags::USER, is_huge);
+        let kernel = A64Pte::new_page(paddr, MappingFlags::READ, is_huge);
+
+        assert_ne!(user.raw_for_test() & PTE_NG, 0);
+        assert_eq!(kernel.raw_for_test() & PTE_NG, 0);
+    }
+}
+
+#[test]
+fn aarch64_unprogrammed_mair_indices_decode_as_device() {
+    let paddr = PhysAddr::from_usize(0x1_81ea_5000);
+    let normal_flags = MappingFlags::READ | MappingFlags::WRITE;
+    for index in 3..8 {
+        let pte = A64Pte::new_page(paddr, normal_flags, false).with_attr_index(index);
+
+        assert_eq!(
+            pte.config(false),
+            normal_flags | MappingFlags::DEVICE,
+            "AttrIndx {index} must match its zero-valued MAIR slot"
+        );
+    }
+}
+
+#[test]
+fn aarch64_tag_capacity_follows_the_configured_tcr_width() {
+    assert_eq!(aarch64_asid::configured_tag_capacity(2, 0), 1 << 8);
+    assert_eq!(aarch64_asid::configured_tag_capacity(2, 1), 1 << 16);
+    assert_eq!(aarch64_asid::configured_tag_capacity(0, 1), 1 << 8);
+}
+
+#[test]
 fn non_present_riscv_huge_leaf_retains_its_structure() {
     let paddr = PhysAddr::from_usize(0x4000_0000);
     let pte = Rv64Pte::new_page(paddr, MappingFlags::empty(), true);
@@ -47,21 +116,6 @@ fn non_present_riscv_huge_leaf_retains_its_structure() {
     assert!(!pte.unused());
     assert!(pte.huge(true));
     assert_eq!(pte.paddr(false), paddr);
-}
-
-#[cfg(feature = "svpbmt")]
-#[test]
-fn riscv_svpbmt_preserves_leaf_memory_types() {
-    let paddr = PhysAddr::from_usize(0x4000_0000);
-    let permissions = MappingFlags::READ | MappingFlags::WRITE;
-
-    let uncached = Rv64Pte::new_page(paddr, permissions | MappingFlags::UNCACHED, false);
-    assert_eq!((uncached.raw_for_test() >> 61) & 0b11, 0b01);
-    assert_eq!(uncached.config(false), permissions | MappingFlags::UNCACHED);
-
-    let device = Rv64Pte::new_page(paddr, permissions | MappingFlags::DEVICE, false);
-    assert_eq!((device.raw_for_test() >> 61) & 0b11, 0b10);
-    assert_eq!(device.config(false), permissions | MappingFlags::DEVICE);
 }
 
 #[test]

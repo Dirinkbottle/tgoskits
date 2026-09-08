@@ -15,6 +15,9 @@ test-suit/starryos/<build_wrapper>/<case>/<runtime-config>.toml
 
 - QEMU 用例通过 `<case>/qemu-<arch>.toml` 发现。
 - Board 用例通过 `<case>/board-<board>.toml` 发现。
+- 只在非空宿主环境变量存在时才能运行的 Board 用例，在同一 case 目录的
+  `requirements.toml` 中声明 `required_env = ["NAME", ...]`。缺失或空值会保留
+  `--list` 可见性并输出明确的 skipped 结果，不构建或占用板卡。
 - `<build_wrapper>` 用于共享构建配置，例如 `qemu`、`board-orangepi-5-plus`。
 - 构建配置位于 case 或最近的 build wrapper 中，文件名为 `build-<target>.toml`。
 - 如果目录自身同时包含 `build-*` 和 `qemu-*` / `board-*`，它本身也可以作为 case 被发现。
@@ -30,6 +33,18 @@ test-suit/starryos/<build_wrapper>/<case>/<runtime-config>.toml
 
 旧的 Starry `--test-group` 和 `--stress` 入口已经移除。需要运行迁出的压力、K230、
 visual 或 golden 类用例时，使用 `cargo xtask starry app ...` 或对应脚本。
+
+## CI 精确路由
+
+CI 路由不改变上述 xtask 发现规则。`.github/ci/checks/starry.toml` 通过 check 下的
+`[[check.suite]]` 注册当前可用的 QEMU 架构或 board runner；planner 再以实际存在的
+`qemu-<arch>.toml`、`board-<board>.toml` 和最近的 `build-<target>.toml` 解析 case。
+不要从目录名字手工拼接 CI job，也不要为未在 CI 中运行的板卡借用其他 runner。
+
+PR 的有效改动全部位于 `test-suit/**` 时，只运行匹配的已注册 case。多个 case 取
+稳定去重并集；共享 build wrapper 变更展开到该 wrapper 下所有已注册 case。
+`qemu/system/<subcase>` 源码变更会生成 `qemu/<subcase>` selector。若新增 case 或
+board 尚未在 manifest 注册，`Plan CI` 会明确失败，而不是静默跳过或自动启用真机。
 
 ## 当前目录概览
 
@@ -70,14 +85,24 @@ test-suit/starryos/
         src/
   board-orangepi-5-plus/
     build-aarch64-unknown-none-softfloat.toml
-    npu-yolov8/
+    native-hardware-smoke/
       board-orangepi-5-plus.toml
-    pcie-enumerate/
+    native-network-smoke/
       board-orangepi-5-plus.toml
+      iperf-smoke.sh
 ```
 
 `qemu/system` 是统一的 SMP4 聚合 QEMU case。`qemu/` 根目录只放四架构 build
 config，不放 `qemu-*.toml`。
+
+### AArch64 CI 启动 smoke
+
+AArch64 CI 在运行 `cargo xtask starry test qemu --arch aarch64` 前，会先执行一次
+带 `--smp 4` 的普通 `starry qemu` 启动，并通过
+`os/StarryOS/configs/qemu/qemu-aarch64-gicv2-boot.toml` 显式选择 GICv2 和 SMP4。
+这个 smoke 等待四个 CPU 完成启动并进入 shell 后输出唯一成功标记，用来
+覆盖 test-suit 的 GICv3/SMP4 配置没有覆盖到的普通 GICv2 启动路径；它不是
+`test-suit/starryos/` 下的可发现 case。
 
 ## qemu/system 聚合
 
@@ -92,12 +117,27 @@ qemu/system/<subcase>/
 
 子测例目录不要再放 `qemu-*.toml`。架构过滤不能依赖子目录下的 runtime config，而应在代码或 CMake 中显式处理。
 
-`system/qemu-*.toml` 的 `test_commands` 使用 grouped runner 风格，扫描
-`/usr/bin/starry-test-suit/*` 并逐个执行。所有子测例通过后打印：
+`system/qemu-*.toml` 的 `test_commands` 统一调用
+`/usr/bin/starry-run-system-tests`。该 runner 稳定排序并扫描
+`/usr/bin/starry-test-suit/*`，为每个 binary 建立独立 PID 和 mount namespace，并重挂载
+绑定该 PID namespace 的 procfs。最小 namespace-init supervisor 等待 binary 主进程并保留
+其退出结果，随后以该结果退出；每个子测例最多运行 120 秒，超时后 outer runner 会杀死
+namespace init，内核通过 PID namespace shutdown 路径清理并回收全部 descendants。后代即使
+调用 `setpgid()` 或 `setsid()` 也不能逃出这个所有权边界。所有子测例
+通过后打印：
+
+这些配置同时声明 `grouped_command_selection = "preserve_all"`，表示单子测例过滤只裁剪
+要构建的 C subcase，不把共享聚合器误当作某个 subcase 的直接命令。
 
 ```text
 STARRY_GROUPED_TESTS_PASSED
 ```
+
+system runner 会为每个 binary 单独创建 PID namespace 和 mount namespace。namespace
+中的 PID 1 先把挂载传播设为 private，重新挂载该 namespace 独有的 procfs，再 fork
+普通测试进程；这样测试不会受到 PID 1 特殊信号语义影响。测试进程结束或超时后，退出
+namespace init 会统一终止并回收该 namespace 中的全部后代，包括调用 `setsid()` 逃离
+原进程组的进程。不得把跨 binary 的清理建立在 process group 或 session 上。
 
 日志为每个 binary 保留一条开始标记和一条带耗时的完成结果，失败结果还包含退出码；
 suite 结束时只打印一条总数、成功数、失败数和总耗时汇总，不再重复输出一份逐项
@@ -105,18 +145,85 @@ timing 列表。例如：
 
 ```text
 STARRY_SYSTEM_TEST_BEGIN: /usr/bin/starry-test-suit/mytest
-STARRY_SYSTEM_TEST_PASSED: /usr/bin/starry-test-suit/mytest elapsed_s=1
-STARRY_SYSTEM_TEST_SUMMARY: total=1 passed=1 failed=0 elapsed_s=1
+STARRY_SYSTEM_TEST_PASSED: /usr/bin/starry-test-suit/mytest elapsed_s=0.012
+STARRY_SYSTEM_TEST_SUMMARY: total=1 passed=1 failed=0 elapsed_s=0.012
 ```
 
 开始标记用于在超时时定位卡住的 binary；失败时保留该 binary 的原始输出、
 `STARRY_SYSTEM_TEST_FAILED`、退出码和耗时。
+
+### PR #1775 LTP 阶段
+
+`qemu/system/ltp-syscalls` 使用 rootfs 中固定的 Linux Test Project
+`20260529`（上游 commit `3a64d78f58bdceba93ed321e91215fb969a047ed`）。
+该目录不会复制 LTP 测试逻辑：`cases.txt` 中每个 testcase 会生成一个独立 wrapper，
+wrapper 在 guest 内依次确认 `/opt/ltp/Version`、`runtest/syscalls` 的唯一条目和对应
+可执行文件，然后原样运行上游命令并传播退出码；即使 LTP 返回 0，wrapper 也会检查
+输出并拒绝 `TCONF`、`TBROK`、`TFAIL`，并且至少出现一项 `TPASS`。
+`minimum-passes.txt` 保存从固定上游源码核实的完成数量契约；例如 `execve03` 必须完成
+六个 errno 用例，不能把“前四项通过后进程被错误替换、随后退出 0”当成成功。
+`CMakeLists.txt` 把该门槛写入每个 wrapper，兼容新旧 LTP 输出中 `TPASS` 的空格差异。
+这些门槛不从历史绿色日志推导，也不随共同集重新生成而丢失。
+
+system runner 固定分成两个顺序阶段：先按名称执行剩余的原生 C binary，再执行所有
+`ltp-syscalls-*` wrapper。两个阶段仍对每个 binary 分配独立 PID/mount namespace，日志用
+以下 marker 明确阶段边界；只有全部 binary 返回 0 后才打印
+`STARRY_GROUPED_TESTS_PASSED`：
+
+```text
+STARRY_SYSTEM_PHASE_BEGIN: native-c
+STARRY_SYSTEM_PHASE_END: native-c
+STARRY_SYSTEM_PHASE_BEGIN: ltp-syscalls
+STARRY_SYSTEM_PHASE_END: ltp-syscalls
+```
+
+`scripts/test/ltp-syscalls/probe-cases.txt` 保存从 PR #1775 所触及 C cases 对应到的
+官方 LTP families，包括
+process/namespace/pidfd/ptrace、futex/pipe/poll/epoll/socket、scheduler/affinity/timer/
+membarrier，以及 mmap/mprotect/memfd/perf。更新共同集时，先让候选集在四架构分别完成
+probe 并保存完整日志，再运行：
+
+```bash
+scripts/test/ltp-syscalls/generate-common.sh \
+  scripts/test/ltp-syscalls/probe-cases.txt \
+  test-suit/starryos/qemu/system/ltp-syscalls/cases.txt \
+  x86_64.log aarch64.log riscv64.log loongarch64.log
+```
+
+生成器只保留四份完整 LTP 阶段日志中都出现 `STARRY_SYSTEM_TEST_PASSED`，并且对应
+输出中没有 `TCONF`、`TBROK`、`TFAIL`，且满足同一 `minimum-passes.txt` 完成门槛的 testcase，
+再按静态排序冻结 `cases.txt`。旧日志即使错误打印了通过标记，缺失的完成项也会使它失去候选资格。
+`qemu/system/ltp-syscalls` 运行目录只保存该最终 manifest 和 wrapper 生成资产。修改候选集、LTP
+版本或镜像内容后必须重新进行四架构 probe，不能依据单一架构或历史 TODO 清单手工放行。
+
+这次接管的边界有意收缩：PR #1775 新增或修改过可执行 C 源码的 Starry cases 从发现
+流程中整项移除，由最终共同集中的官方 LTP 结果承担回归；原 C cases 中 LTP 没有表达的
+自定义断言不再保留，也不再宣称仍被覆盖。ArceOS C 测试仍由 ArceOS 自己的测试入口维护。
+性能基准 `apps/starry/wakeup-latency-bench` 作为独立 Starry app 保留，供后续调优使用。
 
 子测例 CMake 产物应安装到：
 
 ```cmake
 install(TARGETS mytest RUNTIME DESTINATION usr/bin/starry-test-suit)
 ```
+
+串口/TTY 事务回归由 `qemu/system/test-tty-termios-transaction` 覆盖。它在真实
+`/dev/ttyS0` 上验证配置错误不会发布新 termios，并让普通输出与
+`TCSETSW2`/`TCSETSF2` 并发；同时通过 PTY 验证 `TCSETSF2` 在配置事务完成后清理旧输入。
+该子目录不放自己的 `qemu-*.toml`，而是由 `qemu/system/qemu-*.toml` 的统一 SMP4 guest
+承载。单独运行四个架构时使用：
+
+```bash
+cargo xtask starry test qemu --arch x86_64 -c qemu/system/test-tty-termios-transaction
+cargo xtask starry test qemu --arch riscv64 -c qemu/system/test-tty-termios-transaction
+cargo xtask starry test qemu --arch aarch64 -c qemu/system/test-tty-termios-transaction
+cargo xtask starry test qemu --arch loongarch64 -c qemu/system/test-tty-termios-transaction
+```
+
+同一 grouped runner 还必须保留 `test-tty-flush` 和
+`tty-bugfix-bug-raw-terminal-polling`。前者保持 `TCIFLUSH`、`TCOFLUSH`、`TCIOFLUSH`
+以及串口 output flush 的断言，后者保持 raw mode 下 `poll()` 超时的原有成功/失败条件。
+`tty-console-input-burst` 继续作为独立 shell-injection case，不迁入 grouped runner。
 
 如果某个 C 子测例只支持部分架构，优先使用 `system/common/starry_arch_filter.cmake`
 生成 skip 二进制。skip 输出要清楚说明目标和原因，并返回 0。
@@ -143,7 +250,7 @@ install(TARGETS mytest RUNTIME DESTINATION usr/bin/starry-test-suit)
 
 | Pipeline | 触发条件 | 行为 |
 | --- | --- | --- |
-| `plain` | 无 `test_commands`，且无 `c/`、`sh/`、`python/` | 直接启动共享 rootfs，并追加 QEMU `-snapshot` |
+| `plain` | 无 `test_commands`，且无 `c/`、`sh/`、`python/` | 直接启动共享 rootfs，由 rootfs patcher 仅对主 rootfs drive 设置 `snapshot=on` |
 | `c` | case 目录下存在 `c/` | 使用 CMake 交叉编译，安装产物到 rootfs overlay |
 | `sh` | case 目录下存在 `sh/` | 将 shell 脚本注入 `/usr/bin/` |
 | `python` | case 目录下存在 `python/` | 在 staging rootfs 中安装 `python3`，并注入 `.py` 文件 |
@@ -155,7 +262,10 @@ Pipeline case 会创建每个 case 独立的 rootfs 副本，并把注入后的 
 target/<target>/qemu-cases/<build_group>/<case>/cache/rootfs/
 ```
 
-plain case 不复制 rootfs，依赖 QEMU `-snapshot` 保证 guest 写入不落回共享镜像。
+plain case 不复制 rootfs。所有 test-suit pipeline 都由 rootfs patcher 对实际主 rootfs
+drive 应用 `snapshot=on`，保证正常退出、panic 或强制终止时 guest 写入不落回源镜像；
+不会使用会同时改变 VVFAT ESP、额外数据盘或 pflash 语义的全局 `-snapshot`。
+Pipeline 创建的副本只负责资产注入，不承担 QEMU 运行期写隔离。
 
 需要 staging rootfs 的 pipeline 依赖 `debugfs` 和 `fakeroot`。xtask 会在启动
 `debugfs rdump` 前检查 EUID；Linux 上还会检查 UID/GID identity mapping 和有效
@@ -172,6 +282,7 @@ plain case 不复制 rootfs，依赖 QEMU `-snapshot` 保证 guest 写入不落�
 | `args` | QEMU 参数，`${workspace}` / `${workspaceFolder}` 会解析为仓库根目录 |
 | `uefi` | 是否使用 UEFI |
 | `to_bin` | 是否把 ELF 转为裸二进制 |
+| `rootfs_write_policy` | test-suit 只能省略或设为 `"discard"`；`"persist"` 会被拒绝 |
 | `shell_prefix` | 等待 guest shell 的提示符 |
 | `shell_init_cmd` | plain/C/sh/python case 的 guest 命令 |
 | `test_commands` | grouped case 的 guest 命令列表；不能与 `shell_init_cmd` 同时使用 |
@@ -291,7 +402,7 @@ success_regex = ["(?m)^STARRY_GROUPED_TESTS_PASSED\\s*$"]
 fail_regex = ['(?i)\bpanic(?:ked)?\b', '(?m)^STARRY_GROUPED_TEST_FAILED:']
 ```
 
-运行器会稳定排序子目录、构建 C subcase，并注入 grouped runner 支持文件。每个命令执行前后都会打印带 `step=当前/总数`、`epoch=`、`status=` 和 `command=` 的标记，例如：
+普通（非 `qemu/system`）grouped case 的运行器会稳定排序子目录、构建 C subcase，并注入 grouped runner 支持文件。每个命令执行前后都会打印带 `step=当前/总数`、`epoch=`、`status=` 和 `command=` 的标记，例如：
 
 ```text
 STARRY_GROUPED_TEST_BEGIN: step=1/2 epoch=... command=/usr/bin/test-a
@@ -299,6 +410,17 @@ STARRY_GROUPED_TEST_PASSED: step=1/2 epoch=... status=0 command=/usr/bin/test-a
 ```
 
 如果 grouped case 超时，CI 日志中最后一个 `STARRY_GROUPED_TEST_BEGIN` 通常就是卡住的子命令。
+`qemu/system` 使用独立的 `starry-run-system-tests`，日志标记为
+`STARRY_SYSTEM_TEST_BEGIN/PASSED/FAILED`，但仍只在全部 binary 通过后打印既有的
+`STARRY_GROUPED_TESTS_PASSED`，失败时仍打印 `STARRY_GROUPED_TEST_FAILED`。
+共享 runner 默认限制每个 binary 最多运行 120 秒；同步写入密集型的
+`test-ext4-inode-unique` 和完成 1400 个磁盘文件清理的 `test-pagecache-cap` 通过显式名称表
+取得 240 秒预算。慢用例例外必须保留在共享 runner 中并由静态契约测试覆盖，不能放宽所有
+binary 的默认预算。TOML `timeout` 约束整个 QEMU case，不替代上述单 binary 超时。
+单 binary 超时后的 PID namespace 清理另有 30 秒硬上限；清理失败必须打印
+`STARRY_SYSTEM_TEST_CLEANUP_TIMEOUT` 并立即中止 suite，不能继续运行下一个 binary，也不能
+阻塞到外层 QEMU timeout。隔离回归会让持锁后代停在 raw pipe wait，确保 namespace SIGKILL
+路径确实强制唤醒并回收这类任务。
 目前 grouped Rust subcase 还不支持。
 
 ## Shell 和 Python 用例
@@ -348,7 +470,7 @@ os/StarryOS/configs/board/<board>.toml
 
 ```toml
 session_files = [
-  "iperf-smoke.sh",
+  "iperf-bench.sh",
   "tools/network/probe.sh",
 ]
 ```
@@ -361,6 +483,13 @@ session_files = [
 - `${boardServerIp}`：板端可访问的 ostool-server 地址。
 - `${boardServerHttpBaseUrl}`：板端可访问的 session HTTP 基础 URL。
 - `${sessionFile:<relative-path>}`：对应共享文件的完整下载 URL。
+
+AKA 的安全 Wi-Fi board case 在构建时从 `STARRY_WIFI_SSID` 和
+`STARRY_WIFI_PASSWORD` 生成 AIC station 启动事务。凭据不使用额外 sidecar 或 guest
+helper；连接和 DHCP 完成后，脚本仍按上面的普通 HTTP session file 机制下载。runner
+只为可信 boot entropy 创建带 `/chosen/rng-seed` 的临时 DTB 副本，不修改仓库 DTB。
+空 `STARRY_WIFI_SSID` 只禁用 station 启动连接；AIC8800 驱动仍初始化并注册 `wlan0`，
+且其他 AKA board case 继续运行。只有 `wifi-iperf-smoke` 因无法联网而记为 skipped。
 
 普通 shell 变量（例如 `${HOME}`）保持原样。未解析的 session 保留变量会在上板运行
 前报错；无论上传、展开还是运行失败，xtask 都会释放 session。
@@ -413,14 +542,47 @@ App 的 `board-<name>.toml` 默认复用
 
 ```bash
 cargo xtask starry test board --board orangepi-5-plus
-cargo xtask starry test board -c board-orangepi-5-plus/pcie-enumerate --board orangepi-5-plus
-cargo xtask starry test board -c iperf-smoke --board orangepi-5-plus --server 10.3.10.194 --port 2999
+cargo xtask starry test board -c native-hardware-smoke --board orangepi-5-plus
+cargo xtask starry app board -t iperf3 -b OrangePi-5-Plus
 ```
 
-`iperf-smoke` 会等待 OrangePi 的 `eth0` 通过 DHCP 获得板测网段地址，再从 session
-HTTP 端点下载同名脚本，并连接 `${boardServerIp}:5201` 执行 2 秒、1 Mbit/s 的
-iperf3 UDP JSON 测试。该用例只验证下载、执行和网络连通性，不设置吞吐门槛；服务端
-需预先运行 iperf3 server。
+`native-hardware-smoke` 在一次启动中依次验证启动、PCIe、USB2、PWM 和 NPU。
+`native-network-smoke` 只执行一条短 TCP TX 命令，随后在 `eth1` 上验证 rtnetlink
+地址增删，适合作为 CI 连通性检查。完整吞吐测试位于 `apps/starry/iperf3`，直接通过
+上面的 `cargo xtask starry app board` 命令启动板测；ostool server 持续提供 iperf3
+服务，board 配置的 `shell_init_cmd` 通过活动 session 的 `${boardServerIp}` 和
+`${sessionFile:iperf-bench.sh}` 获取实际地址；app 的 `init.sh` 会按现有 xtask 流程合并
+到该命令中，下载并启动测试脚本，不依赖固定网卡、固定 IP、固定网段或额外的板测
+启动脚本。
+
+完整 benchmark 固定执行 T01--T07：单流 TX、单流 RX、单流双向、2/4/8 流 TX 和
+4 流 RX。每个场景使用 `-t 10 -O 2 -l 128K` 运行 3 次，每个连接结束后固定冷却
+15 秒，避免上一轮 TCP teardown 干扰下一轮；脚本直接打印原始输出、中位数和最终
+汇总表：
+
+```text
+T01  Single-stream DUT TX
+Command: iperf3 -c <session-host> -t 10 -O 2 -P 1 -l 128K
+
+Run 1/3
+<native iperf3 output>
+Result  DUT TX: ... Mbps
+
+Run 2/3
+<native iperf3 output>
+Result  DUT TX: ... Mbps
+
+Run 3/3
+<native iperf3 output>
+Result  DUT TX: ... Mbps
+
+Median DUT TX: ... Mbps
+STARRY_IPERF3_BENCH_PASSED
+```
+
+每轮 iperf3 原始文本和机器可读汇总保存在板端 `/tmp/starry-iperf3-bench/`。
+benchmark 只要求所有场景完成并产生有效速率，不设置与机器绑定的吞吐门槛；端口和
+测试档位固定，避免不同运行使用不同参数。
 
 ROCK 4D 使用板卡服务名称 `Rock-4D`、仓库内的 RK3576 DTB 和 1,500,000 baud
 串口。维护的单核启动回归命令为：
@@ -441,12 +603,12 @@ cargo xtask starry board \
 
 两条路径都必须进入 `root@starry:/root #` 并打印独立的
 `STARRY_ROCK4D_BOOT_OK` 成功行。RK3576 的固件、PSCI、CPU 拓扑和 CRU/PMU
-检查点见 `.claude/skills/arch-platform-porting/references/boot-debugging.md`。
+检查点见 `.agents/skills/arch-platform-porting/references/boot-debugging.md`。
 
 `board-aka-00-sg2002/usb2-libuvc-init` 提供静态交叉编译固定版本上游 libuvc 的
-C 资产和 `board-aka-00-sg2002.toml.disabled` 配置模板。AKA-00-SG2002 当前没有
-StarryOS 网络设备，无法从 session HTTP URL 下载程序，因此该模板不会被 board
-discovery 或 CI 启用。后续网络可用时移除 `.disabled` 后缀；其
+C 资产和 `board-aka-00-sg2002.toml.disabled` 配置模板。该 USB 用例尚未完成
+AKA 实板验收，因此模板不会被 board discovery 或 CI 启用。完成验证后可移除
+`.disabled` 后缀；其
 `shell_init_cmd` 会使用 `wget` 下载程序，并只验证 `uvc_init` / `uvc_exit`，不枚举
 摄像头、不采集帧，也不验证 DWC2 isochronous 传输。
 
@@ -465,7 +627,7 @@ cargo xtask starry test board -l
 
 # board
 cargo xtask starry test board --board orangepi-5-plus
-cargo xtask starry test board -c board-orangepi-5-plus/npu-yolov8 --board orangepi-5-plus
+cargo xtask starry test board -c native-hardware-smoke --board orangepi-5-plus
 
 # 迁出的 heavy app
 cargo xtask starry app qemu -t stress/git --arch riscv64

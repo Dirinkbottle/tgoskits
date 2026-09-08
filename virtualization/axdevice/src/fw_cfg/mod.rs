@@ -1,7 +1,7 @@
 use alloc::{boxed::Box, format, string::String, sync::Arc, vec::Vec};
 use core::cell::RefCell;
 
-use ax_kspin::SpinNoIrq as Mutex;
+use ax_sync::SpinLock as Mutex;
 use axdevice_base::*;
 use axvm_types::GuestPhysAddr;
 
@@ -282,7 +282,7 @@ impl FwCfg {
     }
 
     pub(crate) fn read_data(&self, width: AccessWidth) -> usize {
-        let mut state = self.state.lock();
+        let mut state = self.state.lock_irqsave();
         let entry = self.selected_bytes(state.selected);
         let data = entry.as_slice();
         let mut value = 0usize;
@@ -318,11 +318,11 @@ impl FwCfg {
     }
 
     pub(crate) fn read_selector(&self) -> u16 {
-        self.state.lock().selected
+        self.state.lock_irqsave().selected
     }
 
     pub(crate) fn select(&self, selector: u16) {
-        let mut state = self.state.lock();
+        let mut state = self.state.lock_irqsave();
         state.selected = selector;
         state.offset = 0;
     }
@@ -355,7 +355,7 @@ impl FwCfg {
         }
         match addr.as_usize() - self.base.as_usize() {
             FW_CFG_DATA_OFFSET => Ok(self.read_data(width)),
-            FW_CFG_SELECTOR_OFFSET => Ok(self.state.lock().selected as usize),
+            FW_CFG_SELECTOR_OFFSET => Ok(self.state.lock_irqsave().selected as usize),
             _ => Ok(0),
         }
     }
@@ -425,7 +425,7 @@ impl FwCfg {
     ) -> DeviceManagerResult<Option<GuestPhysAddr>> {
         const LOW_DWORD_MASK: u64 = u32::MAX as u64;
 
-        let mut state = self.state.lock();
+        let mut state = self.state.lock_irqsave();
         match (offset, width) {
             (0, AccessWidth::Dword) => {
                 let high = (value as u32).swap_bytes() as u64;
@@ -467,7 +467,13 @@ impl FwCfg {
                 "failed to read fw_cfg DMA descriptor at {:#x}: {error}",
                 desc_addr.as_usize()
             );
-            let _ = write_guest(desc_addr, &FW_CFG_DMA_CTL_ERROR.to_be_bytes());
+            if let Err(status_error) = write_guest(desc_addr, &FW_CFG_DMA_CTL_ERROR.to_be_bytes()) {
+                warn!(
+                    "failed to write fw_cfg DMA error status at {:#x}: {status_error}",
+                    desc_addr.as_usize()
+                );
+                return Err(error);
+            }
             return Ok(());
         }
 
@@ -516,7 +522,7 @@ impl FwCfg {
     {
         validate_dma_buffer(buffer_addr, length)?;
 
-        let mut state = self.state.lock();
+        let mut state = self.state.lock_irqsave();
         if control & FW_CFG_DMA_CTL_SELECT != 0 {
             state.selected = (control >> 16) as u16;
             state.offset = 0;

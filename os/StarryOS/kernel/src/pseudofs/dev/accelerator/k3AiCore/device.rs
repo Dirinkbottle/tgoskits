@@ -1,11 +1,10 @@
 //! `DeviceOps` 控制面实现：`BUILD_CHANNEL` / `SUBMIT_GRAPH` ioctl。
 
-use alloc::{boxed::Box, collections::btree_map::BTreeMap};
+use alloc::{boxed::Box, collections::btree_map::BTreeMap, vec::Vec};
 use core::any::Any;
 
 use ax_memory_addr::{MemoryAddr, PAGE_SIZE_4K, PhysAddr, VirtAddr, VirtAddrRange, align_up_4k};
 use ax_runtime::hal::paging::MappingFlags;
-use ax_task::current;
 use axfs_ng_vfs::{NodeFlags, VfsError, VfsResult};
 use k3_ai_scheduler::{K3SchedulerOps, kd_kring::resolve_parsed_graph, scheduler::run_graph};
 use k3_ai_uabi::{
@@ -22,22 +21,27 @@ use super::{
     runner::K3AiRunner,
 };
 use crate::{
-    mm::{Backend, UserConstPtr, UserPtr, access_user_memory},
+    mm::{UserConstPtr, UserPtr},
     pseudofs::DeviceOps,
-    task::AsThread,
+    task::UserTaskRef,
 };
 
 impl K3AiRunner {
     /// `BUILD_CHANNEL` ioctl: 注册用户态 ovchannel 共享区并建立连续 kernel VA alias。
-    fn build_channel(&self, arg: usize) -> VfsResult<usize> {
+    fn build_channel(&self, current: &UserTaskRef, arg: usize) -> VfsResult<usize> {
         info!("k3_airunner: BUILD_CHANNEL ioctl reached, arg={arg:#x}");
 
         // 先从用户态读 build 参数。
-        let build_param = UserPtr::<K3AiChannelBuildParam>::from(arg).get_as_mut()?;
+        // SAFETY: this is the fixed-width, repr(C) ioctl ABI. `read_abi` copies
+        // every byte from the validated user range before constructing the value.
+        let build_param = unsafe {
+            UserPtr::<K3AiChannelBuildParam>::from(arg)
+                .read_abi(current)
+                .map_err(|_| VfsError::BadAddress)?
+        };
 
         // 以当前线程所属进程作为 channel 所有者。
-        let curr = current();
-        let pid = curr.as_thread().proc_data.proc.pid();
+        let pid = current.as_thread().proc_data.proc.pid().get();
 
         if build_param.abi_version != AI_ABI_VERSION {
             error!(
@@ -52,43 +56,34 @@ impl K3AiRunner {
         }
 
         // UAPI 使用固定宽度字段，这里先收窄成内核 usize。
-        let user_va = usize::try_from(build_param.user_va).map_err(|_| VfsError::InvalidInput)?;
+        let user_va = usize::try_from(build_param.user_va)
+            .map_err(|_| VfsError::InvalidInput)?;
         let size_bytes =
             usize::try_from(build_param.size_bytes).map_err(|_| VfsError::InvalidInput)?;
         if size_bytes == 0 {
             return Err(VfsError::InvalidInput);
         }
 
-        // 当前实现只接受用户态通过 MAP_SHARED 建出来的共享区。
-        // 这样这段内存背后一定有 SharedPages，可以直接抓到 Arc 保活。
-        let range_start = VirtAddr::from(user_va).align_down_4k();
-        let range_end = VirtAddr::from(user_va + size_bytes).align_up_4k();
-        let range_len = range_end - range_start;
+        let range_end_unaligned = user_va
+            .checked_add(size_bytes)
+            .ok_or(VfsError::InvalidInput)?;
+        let range_start = VirtAddr::from_usize(user_va).align_down_4k();
+        let range_end = VirtAddr::from_usize(range_end_unaligned).align_up_4k();
+        let range_len = range_end
+            .as_usize()
+            .checked_sub(range_start.as_usize())
+            .ok_or(VfsError::InvalidInput)?;
 
-        let aspace_arc = curr.as_thread().proc_data.aspace();
-        let aspace = aspace_arc.lock();
+        let aspace_arc = current.as_thread().proc_data.aspace();
+        let mut aspace = aspace_arc.lock();
 
-        // 用户给的是 user_va，先确认整段地址还落在同一个 VMA 中。
-        let area = aspace
-            .find_area(VirtAddr::from(user_va))
-            .ok_or(VfsError::BadAddress)?;
-        if area.start() > range_start || area.end() < range_end {
+        // 先确认整段地址都属于用户 VMA，再将惰性页物化，随后按页取得物理地址。
+        if !aspace.contains_range(range_start, range_len) {
             return Err(VfsError::InvalidInput);
         }
-
-        // 只接受 SharedBackend，这样能拿到 SharedPages 的 Arc 保活物理页。
-        let shared_pages = match area.backend() {
-            Backend::Shared(shared) => shared.pages().clone(),
-            _ => {
-                info!(
-                    "k3_airunner: BUILD_CHANNEL rejected non-shared backend, pid={}, va={:#x}, \
-                     size={:#x}",
-                    pid, user_va, size_bytes
-                );
-                return Err(VfsError::InvalidInput);
-            }
-        };
-        drop(aspace);
+        aspace
+            .populate_area(range_start, range_len, MappingFlags::READ | MappingFlags::WRITE)
+            .map_err(|_| VfsError::BadAddress)?;
 
         let shared_memory_size = core::mem::size_of::<SharedMemory<K3_CHANNEL_COUNT>>();
         // 现在内核和用户态都约定 ovchannel 为 SharedMemory<2>。
@@ -103,16 +98,17 @@ impl K3AiRunner {
 
         // range_len 已经页对齐，alias 需要映射同样数量的 4K 页。
         let required_pages = range_len / PAGE_SIZE_4K;
-        if shared_pages.len() < required_pages {
-            info!(
-                "k3_airunner: BUILD_CHANNEL rejected short SharedPages pid={}, pages={}, \
-                 required={}",
-                pid,
-                shared_pages.len(),
-                required_pages
-            );
-            return Err(VfsError::InvalidInput);
+        let mut physical_pages = Vec::with_capacity(required_pages);
+        for page_index in 0..required_pages {
+            let offset = page_index
+                .checked_mul(PAGE_SIZE_4K)
+                .ok_or(VfsError::InvalidInput)?;
+            let page_va = range_start
+                .checked_add(offset)
+                .ok_or(VfsError::InvalidInput)?;
+            physical_pages.push(aspace.translate(page_va).map_err(|_| VfsError::BadAddress)?);
         }
+        drop(aspace);
 
         {
             // 幂等：同一 pid 重复 BUILD_CHANNEL 时，检查参数是否与已注册的一致。
@@ -132,7 +128,13 @@ impl K3AiRunner {
                          user_va={:#x}, size={:#x}, channels={}",
                         pid, user_va, size_bytes, build_param.channel_count
                     );
-                    build_param.owner_pid = pid;
+                    UserPtr::<K3AiChannelBuildParam>::from(arg)
+                        .write_field(
+                            current,
+                            core::mem::offset_of!(K3AiChannelBuildParam, owner_pid),
+                            pid,
+                        )
+                        .map_err(|_| VfsError::BadAddress)?;
                     return Ok(0);
                 }
                 // 参数不一致，打印差异后拒绝。
@@ -173,8 +175,8 @@ impl K3AiRunner {
                 )
                 .ok_or(VfsError::NoMemory)?;
             let kernel_va = virt_start.as_usize();
-            // 将不连续的 SharedPages 逐页拼到连续 kernel VA 上。
-            for paddr in shared_pages.iter().take(required_pages) {
+            // 将用户地址空间的物理页逐页拼到连续 kernel VA 上。
+            for paddr in physical_pages {
                 if guard
                     .map_linear(
                         virt_start,
@@ -215,7 +217,6 @@ impl K3AiRunner {
                     user_va,
                     size_bytes,
                     channel_count: build_param.channel_count,
-                    shared_pages,
                     kernel_va,
                     kernel_map_size,
                 },
@@ -231,12 +232,17 @@ impl K3AiRunner {
                     registered.kernel_va,
                     registered.kernel_map_size
                 );
-                let _ = registered.shared_pages.len();
             }
         }
 
         // 回填 owner pid，用户态后面可以拿它做日志或调试匹配。
-        build_param.owner_pid = pid;
+        UserPtr::<K3AiChannelBuildParam>::from(arg)
+            .write_field(
+                current,
+                core::mem::offset_of!(K3AiChannelBuildParam, owner_pid),
+                pid,
+            )
+            .map_err(|_| VfsError::BadAddress)?;
 
         // 这里先不真正创建 ov-channel sender/receiver，也不唤醒 guard。
         info!(
@@ -250,13 +256,12 @@ impl K3AiRunner {
     }
 
     /// `SUBMIT_GRAPH` ioctl: 从 channel 读取 graph 提交项，反序列化并交给调度器执行。
-    fn submit_graph(&self, arg: usize) -> VfsResult<usize> {
+    fn submit_graph(&self, current: &UserTaskRef, arg: usize) -> VfsResult<usize> {
         info!("k3_airunner: SUBMIT_GRAPH ioctl reached, arg={arg:#x}");
 
-        let curr = current();
-        let pid = curr.as_thread().proc_data.proc.pid();
-        // 取出 BUILD_CHANNEL 建好的 kernel alias；clone Arc 保证本次 submit 期间页仍存活。
-        let (kernel_va, size_bytes, channel_count, _shared_pages) = {
+        let pid = current.as_thread().proc_data.proc.pid().get();
+        // 取出 BUILD_CHANNEL 建好的 kernel alias。
+        let (kernel_va, size_bytes, channel_count) = {
             let table = CHANNEL_MEMORY_TABLE.lock();
             let registered = table
                 .as_ref()
@@ -270,21 +275,19 @@ impl K3AiRunner {
                 })?;
             info!(
                 "k3_airunner: SUBMIT_GRAPH registered channel pid={}, user_va={:#x}, \
-                 kernel_va={:#x}, size={:#x}, kernel_map_size={:#x}, channels={}, pages={}",
+                 kernel_va={:#x}, size={:#x}, kernel_map_size={:#x}, channels={}",
                 pid,
                 registered.user_va,
                 registered.kernel_va,
                 registered.size_bytes,
                 registered.kernel_map_size,
-                registered.channel_count,
-                registered.shared_pages.len()
+                registered.channel_count
             );
 
             (
                 registered.kernel_va,
                 registered.size_bytes,
                 registered.channel_count,
-                registered.shared_pages.clone(),
             )
         };
 
@@ -437,14 +440,13 @@ impl K3AiRunner {
         let graph_user_va =
             usize::try_from(graph_entry.graph_user_va.get()).map_err(|_| VfsError::InvalidInput)?;
         let graph_blob = UserConstPtr::<u8>::from(graph_user_va)
-            .get_as_slice(graph_size)
+            .read_slice(current, graph_size)
             .map_err(|_| VfsError::BadAddress)?;
 
-        let parsed_graph =
-            access_user_memory(|| AiGraphParser::parse(graph_blob)).map_err(|err| {
-                error!("k3_airunner: SUBMIT_GRAPH graph parse failed pid={pid}, err={err:?}");
-                VfsError::InvalidInput
-            })?;
+        let parsed_graph = AiGraphParser::parse(&graph_blob).map_err(|err| {
+            error!("k3_airunner: SUBMIT_GRAPH graph parse failed pid={pid}, err={err:?}");
+            VfsError::InvalidInput
+        })?;
         let task_link = resolve_parsed_graph(0, &parsed_graph).map_err(|err| {
             error!("k3_airunner: SUBMIT_GRAPH graph resolve failed pid={pid}, err={err:?}");
             VfsError::InvalidInput
@@ -530,7 +532,7 @@ impl K3AiRunner {
                 if tensor.kernel_va != 0 {
                     // 非法参数,阻止
                     error!("kernel_va should writen by kernel!");
-                    return Err(ax_errno::AxError::BadAddress);
+                    return Err(VfsError::BadAddress);
                 }
 
                 if tensor.user_va != 0 && tensor.size_bytes != 0 {
@@ -565,12 +567,12 @@ impl K3AiRunner {
                                 user_va,
                                 tensor.size_bytes.get()
                             );
-                            return Err(ax_errno::AxError::BadAddress);
+                            return Err(VfsError::BadAddress);
                         }
                     }
                 } else {
                     error!("Tensor va or tensor size can't be null ptr!");
-                    return Err(ax_errno::AxError::BadAddress);
+                    return Err(VfsError::BadAddress);
                 }
             }
 
@@ -669,10 +671,10 @@ impl DeviceOps for K3AiRunner {
         Err(VfsError::InvalidInput)
     }
 
-    fn ioctl(&self, cmd: u32, arg: usize) -> VfsResult<usize> {
+    fn ioctl(&self, current: &UserTaskRef, cmd: u32, arg: usize) -> VfsResult<usize> {
         match cmd {
-            K3_AI_IOC_BUILD_CHANNEL => self.build_channel(arg),
-            K3_AI_IOC_SUBMIT_GRAPH => self.submit_graph(arg),
+            K3_AI_IOC_BUILD_CHANNEL => self.build_channel(current, arg),
+            K3_AI_IOC_SUBMIT_GRAPH => self.submit_graph(current, arg),
             _ => Err(VfsError::OperationNotSupported),
         }
     }

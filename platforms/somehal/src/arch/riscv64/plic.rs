@@ -122,33 +122,17 @@ impl ActiveIrq {
     }
 
     pub(super) fn take_plic_claim(&mut self) -> Option<PlicClaim> {
-        let completion = core::mem::replace(&mut self.completion, Completion::None);
-        match completion {
+        match core::mem::replace(&mut self.completion, Completion::None) {
+            Completion::None => None,
             Completion::Plic(claim) => Some(claim),
-            other => {
-                self.completion = other;
-                None
-            }
-        }
-    }
-
-    /// 供 AIA（IMSIC）使用：claim 与 EOI 已在 `begin_external_irq` 中
-    /// 合并为单条 `csrrw stopei, x0` 原子完成，Drop 时无需（也不得）再
-    /// 写——事后补写会清掉执行期间到达的同 EID 新 MSI（丢中断 + APLIC
-    /// 电平源锁死，见调用方注释）。
-    pub fn new_imsic_completed(irq: rdrive::IrqId) -> Self {
-        Self {
-            irq,
-            completion: Completion::None,
         }
     }
 }
 
 impl Drop for ActiveIrq {
     fn drop(&mut self) {
-        match core::mem::replace(&mut self.completion, Completion::None) {
-            Completion::Plic(claim) => complete_external_irq_claim(claim),
-            Completion::None => {}
+        if let Some(claim) = self.take_plic_claim() {
+            complete_external_irq_claim(claim);
         }
     }
 }
@@ -206,8 +190,9 @@ pub fn secondary_init_intc(cpu_idx: usize) {
 
 pub fn send_ipi_to_cpu(cpu_id: usize) -> Result<(), crate::irq::IrqError> {
     let hart_id = someboot::smp::cpu_idx_to_id(cpu_id).ok_or(crate::irq::IrqError::InvalidCpu)?;
-    // The SBI IPI is a doorbell for earlier shared-memory publication. Keep
-    // that publication ordered before firmware makes the interrupt visible.
+    // An SBI IPI is only a doorbell. Complete the shared-memory publication
+    // before entering firmware, whose later MMIO/IMSIC operation may otherwise
+    // become visible to the target hart first under RVWMO.
     unsafe {
         core::arch::asm!("fence rw, rw", options(nostack, preserves_flags));
     }

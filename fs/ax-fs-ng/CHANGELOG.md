@@ -25,6 +25,89 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Route typed ext4 preallocation, range mutation, extent inspection, and xattr
+  operations through the page-cache and inode adapters.
+- Propagate native block geometry, read-only, flush, and FUA capabilities
+  through the shared filesystem block cache.
+
+### Fixed
+
+- Serialize collapse/insert range mapping shifts with cached I/O and invalidate
+  pages from the shift point after stable-length revalidation.
+- Send FUA writes directly through the block runtime after overlapping dirty
+  cache writeback, then refresh or invalidate shared cache state from the
+  completion result.
+- Keep unlinked inode page-cache lifetime out of the global reclaim registry.
+
+## [0.9.3](https://github.com/rcore-os/tgoskits/compare/ax-fs-ng-v0.9.2...ax-fs-ng-v0.9.3) - 2026-08-27
+
+### Added
+
+- *(ax-fs-ng)* add shared block cache between block and filesystem layers ([#2171](https://github.com/rcore-os/tgoskits/pull/2171))
+
+## [0.9.2](https://github.com/rcore-os/tgoskits/compare/ax-fs-ng-v0.9.1...ax-fs-ng-v0.9.2) - 2026-08-25
+
+### Other
+
+- *(test)* consolidate Starry and ArceOS test suites ([#2173](https://github.com/rcore-os/tgoskits/pull/2173))
+
+## [0.9.1](https://github.com/rcore-os/tgoskits/compare/ax-fs-ng-v0.9.0...ax-fs-ng-v0.9.1) - 2026-08-25
+
+### Fixed
+
+- *(ax-fs-ng)* release reclaim registry lock before file locks ([#2170](https://github.com/rcore-os/tgoskits/pull/2170))
+- *(starry)* keep parent traversal inside chroot ([#2037](https://github.com/rcore-os/tgoskits/pull/2037))
+- *(ax-fs-ng)* stabilize block runtime lifecycle publication ([#2135](https://github.com/rcore-os/tgoskits/pull/2135))
+
+## [0.9.0](https://github.com/rcore-os/tgoskits/compare/ax-fs-ng-v0.8.7...ax-fs-ng-v0.9.0) - 2026-08-20
+
+### Added
+
+- *(dma-api)* [**breaking**] add device DMA coherency with uncached-alias remap ([#2106](https://github.com/rcore-os/tgoskits/pull/2106))
+- *(starry-nixos)* add Stage-2 NixOS userspace baseline ([#1923](https://github.com/rcore-os/tgoskits/pull/1923))
+
+### Fixed
+
+- *(sdmmc)* align Rockchip reset failure lifecycle ([#1987](https://github.com/rcore-os/tgoskits/pull/1987))
+- *(rsext4)* propagate journal I/O failures without panicking ([#1967](https://github.com/rcore-os/tgoskits/pull/1967))
+- *(ax-std)* implement futimens for regular files ([#1950](https://github.com/rcore-os/tgoskits/pull/1950))
+
+### Other
+
+- *(axtest)* standardize Cargo and QEMU test flow ([#2088](https://github.com/rcore-os/tgoskits/pull/2088))
+- *(errors)* introduce domain-owned error boundaries ([#2024](https://github.com/rcore-os/tgoskits/pull/2024))
+- *(sync)* unify lock primitives in ax-sync ([#1956](https://github.com/rcore-os/tgoskits/pull/1956))
+
+## [0.8.7](https://github.com/rcore-os/tgoskits/compare/ax-fs-ng-v0.8.6...ax-fs-ng-v0.8.7) - 2026-08-09
+
+### Fixed
+
+- *(axvisor)* correct shell filesystem command handling ([#1616](https://github.com/rcore-os/tgoskits/pull/1616))
+- *(starry-fs)* complete mount contexts and notifications ([#1902](https://github.com/rcore-os/tgoskits/pull/1902))
+- *(ax-fs-ng)* arm shared IRQ before device sources ([#1879](https://github.com/rcore-os/tgoskits/pull/1879))
+
+### Other
+
+- *(repo)* move filesystem crates to fs/ directory ([#1867](https://github.com/rcore-os/tgoskits/pull/1867))
+
+## [0.8.6](https://github.com/rcore-os/tgoskits/compare/ax-fs-ng-v0.8.5...ax-fs-ng-v0.8.6) - 2026-08-03
+
+### Added
+
+- *(ahci-driver)* add portable multi-disk AHCI support ([#1795](https://github.com/rcore-os/tgoskits/pull/1795))
+
+### Fixed
+
+- *(dma-api)* retire legacy axdma release paths ([#1796](https://github.com/rcore-os/tgoskits/pull/1796))
+- *(ax-fs-ng)* preserve zero-fill across cached resize ([#1790](https://github.com/rcore-os/tgoskits/pull/1790))
+
+### Other
+
+- *(block)* adopt IRQ-driven multi-queue runtime ([#1768](https://github.com/rcore-os/tgoskits/pull/1768))
+- enhance axtest coverage for various starry-kernel contracts ([#1674](https://github.com/rcore-os/tgoskits/pull/1674))
+
+### Added
+
 - Add bounded sequential page-cache readahead and runtime batch/commit/completion diagnostics.
 
 ### Changed

@@ -14,6 +14,7 @@ pub(crate) mod pte;
 mod register;
 mod relocate;
 mod trap;
+mod virtual_address;
 
 use core::{hint::spin_loop, ptr::null};
 
@@ -25,9 +26,8 @@ use loongArch64::{
 pub use paging::Entry as Pte;
 pub use relocate::relocate;
 
-use crate::{ArchTrait, DCacheOp, efi_stub, irq::IrqId, power::CpuOnError};
+use crate::{ArchTrait, DCacheOp, SystimerArch, efi_stub, irq::IrqId, power::CpuOnError};
 
-const MIN_TICKS: usize = 4;
 #[cfg(feature = "tls")]
 const BOOT_TLS_SIZE: usize = 64 * 1024;
 
@@ -104,44 +104,6 @@ impl ArchTrait for Arch {
         trap::per_cpu_trap_init(is_primary);
     }
 
-    fn systimer_enable() {
-        tcfg::set_en(true);
-    }
-
-    fn systimer_irq_enable() {
-        tcfg::set_en(true);
-    }
-
-    fn systimer_irq_disable() {
-        tcfg::set_en(false);
-    }
-
-    fn systimer_irq_is_enabled() -> bool {
-        tcfg::read().en()
-    }
-    fn systimer_set_interval(ticks: usize) {
-        let ticks = ticks.max(MIN_TICKS);
-        // Ensure the value is aligned to a multiple of 4 as required by TCFG
-        let ticks = (ticks + 3) & !3;
-
-        // 先禁用定时器
-        tcfg::set_en(false);
-        // 设置单次模式
-        tcfg::set_periodic(false);
-        // 设置初始值
-        tcfg::set_init_val(ticks);
-        // 清除可能存在的中断
-        ticlr::clear_timer_interrupt();
-        // Arm the one-shot event. Linux and the static LoongArch platform both
-        // program the next event with TCFG.EN set; leaving it disabled stalls
-        // timer-based sleeps after the first reprogram.
-        tcfg::set_en(true);
-    }
-
-    fn systimer_ack() {
-        ticlr::clear_timer_interrupt();
-    }
-
     fn systimer_freq() -> usize {
         get_timer_freq()
     }
@@ -190,48 +152,6 @@ impl ArchTrait for Arch {
 
     fn irq_all_set_enable(enable: bool) {
         crmd::set_ie(enable);
-    }
-
-    fn irq_is_enabled(irq: IrqId) -> bool {
-        use loongArch64::register::ecfg::{self, LineBasedInterrupt};
-
-        match irq.kind() {
-            trap::IrqKind::Private(hwirq) => {
-                // 对于 CPU 本地中断，检查 ECFG.LIE 对应位
-                // ECFG.LIE 位 0-12 对应中断 0-12 (SWI0-1, HWI0-7, PCOV, TI, IPI)
-                let lie = ecfg::read().lie();
-                let mask = LineBasedInterrupt::from_bits_retain(1 << hwirq);
-                lie.contains(mask)
-            }
-            trap::IrqKind::External(_hwirq) => {
-                // 外部中断需要通过级联中断控制器来检查
-                // 目前暂不支持，返回 false
-                false
-            }
-        }
-    }
-
-    fn irq_set_enable(irq: IrqId, enable: bool) {
-        use loongArch64::register::ecfg::{self, LineBasedInterrupt};
-
-        match irq.kind() {
-            trap::IrqKind::Private(hwirq) => {
-                // 对于 CPU 本地中断，设置 ECFG.LIE 对应位
-                // 参考 Linux: set_csr_ecfg(ECFGF(d->hwirq)) / clear_csr_ecfg(ECFGF(d->hwirq))
-                let current_lie = ecfg::read().lie();
-                let mask = LineBasedInterrupt::from_bits_retain(1 << hwirq);
-                let new_lie = if enable {
-                    current_lie | mask
-                } else {
-                    current_lie - mask
-                };
-                ecfg::set_lie(new_lie);
-            }
-            trap::IrqKind::External(_hwirq) => {
-                // 外部中断需要通过级联中断控制器来设置
-                // 目前暂不支持
-            }
-        }
     }
 
     fn kernel_page_table() -> crate::mem::PageTableInfo {
@@ -317,15 +237,25 @@ impl ArchTrait for Arch {
         cpuid::read().core_id()
     }
 
-    fn kernel_space() -> core::ops::Range<usize> {
-        addrspace::PAGE_OFFSET..usize::MAX
+    fn virtual_address_space()
+    -> Result<crate::mem::VirtualAddressSpaceLayout, crate::mem::VirtualAddressSpaceError> {
+        let geometry = virtual_address::LoongArchVirtualAddressLayout::from_valen(
+            loongArch64::cpu::get_valen(),
+        )
+        .map_err(|error| {
+            crate::mem::VirtualAddressSpaceError::UnsupportedAddressWidth { valen: error.valen }
+        })?;
+        crate::mem::VirtualAddressSpaceLayout::try_new(
+            crate::mem::configured_user_space(geometry.lower_end()),
+            geometry.upper_start()..usize::MAX,
+        )
     }
 
     fn is_mmu_enabled() -> bool {
         crmd::read().pg()
     }
 
-    fn cpu_on(hartid: usize, entry: usize, arg: usize) -> Result<(), CpuOnError> {
+    fn kick_secondary_cpu(hartid: usize, entry: usize, arg: usize) -> Result<(), CpuOnError> {
         power::cpu_on(hartid, entry, arg)
     }
 
@@ -340,6 +270,116 @@ impl ArchTrait for Arch {
     unsafe fn efi_enter_kernel(system_table: *const ::core::ffi::c_void) -> bool {
         unsafe { crate::arch::entry::kernel_entry(1, null(), system_table) };
         unreachable!()
+    }
+}
+
+impl SystimerArch for Arch {
+    fn systimer_irq_id() -> IrqId {
+        irq::systimer_irq()
+    }
+
+    fn systimer_enable() {
+        Self::systimer_cancel_oneshot();
+    }
+
+    fn systimer_irq_enable() {
+        tcfg::set_en(true);
+    }
+
+    fn systimer_irq_disable() {
+        tcfg::set_en(false);
+    }
+
+    fn systimer_irq_is_enabled() -> bool {
+        tcfg::read().en()
+    }
+
+    fn systimer_set_deadline(deadline_ticks: u64) {
+        let current_ticks = Self::systimer_tick() as u64;
+        let interval_ticks = deadline_ticks.saturating_sub(current_ticks).max(1);
+        let ticks = crate::timer::loongarch64_interval::aligned_ticks(
+            usize::try_from(interval_ticks).unwrap_or(usize::MAX),
+        );
+
+        // 先禁用定时器
+        tcfg::set_en(false);
+        // 设置单次模式
+        tcfg::set_periodic(false);
+        // 设置初始值
+        tcfg::set_init_val(ticks);
+        // 清除可能存在的中断
+        ticlr::clear_timer_interrupt();
+        // Arm the one-shot event. Linux and the static LoongArch platform both
+        // program the next event with TCFG.EN set; leaving it disabled stalls
+        // timer-based sleeps after the first reprogram.
+        tcfg::set_en(true);
+    }
+
+    fn systimer_requires_irq_quiesce() -> bool {
+        false
+    }
+
+    fn systimer_cancel_oneshot() {
+        tcfg::set_en(false);
+        tcfg::set_periodic(false);
+        tcfg::set_init_val(crate::timer::loongarch64_interval::stopped_ticks());
+        ticlr::clear_timer_interrupt();
+    }
+
+    fn systimer_resume_oneshot(deadline_ticks: u64) {
+        // Programming TCFG also enables the one-shot after clearing stale TI.
+        Self::systimer_set_deadline(deadline_ticks);
+    }
+
+    /// The pending timer interrupt latches in TICLR and must be cleared
+    /// explicitly, overriding the re-arm-clears default.
+    fn systimer_ack() {
+        ticlr::clear_timer_interrupt();
+    }
+
+    /// LoongArch masks every CPU-local line through ECFG.LIE, so the per-line
+    /// pair covers all private lines (timer, IPI, cascaded controllers), not
+    /// just the system-timer line the default knows.
+    fn irq_is_enabled(irq: IrqId) -> bool {
+        use loongArch64::register::ecfg::{self, LineBasedInterrupt};
+
+        match irq.kind() {
+            trap::IrqKind::Private(hwirq) => {
+                // 对于 CPU 本地中断，检查 ECFG.LIE 对应位
+                // ECFG.LIE 位 0-12 对应中断 0-12 (SWI0-1, HWI0-7, PCOV, TI, IPI)
+                let lie = ecfg::read().lie();
+                let mask = LineBasedInterrupt::from_bits_retain(1 << hwirq);
+                lie.contains(mask)
+            }
+            trap::IrqKind::External(_hwirq) => {
+                // 外部中断需要通过级联中断控制器来检查
+                // 目前暂不支持，返回 false
+                false
+            }
+        }
+    }
+
+    fn irq_set_enable(irq: IrqId, enable: bool) {
+        use loongArch64::register::ecfg::{self, LineBasedInterrupt};
+
+        match irq.kind() {
+            trap::IrqKind::Private(hwirq) => {
+                // 对于 CPU 本地中断，设置 ECFG.LIE 对应位
+                // 参考 Linux: set_csr_ecfg(ECFGF(d->hwirq)) / clear_csr_ecfg(ECFGF(d->hwirq))
+                let current_lie = ecfg::read().lie();
+                let mask = LineBasedInterrupt::from_bits_retain(1 << hwirq);
+                let new_lie = if enable {
+                    current_lie | mask
+                } else {
+                    current_lie - mask
+                };
+                ecfg::set_lie(new_lie);
+            }
+            trap::IrqKind::External(_hwirq) => {
+                // 外部中断需要通过级联中断控制器来设置
+                // 目前暂不支持
+            }
+        }
     }
 }
 

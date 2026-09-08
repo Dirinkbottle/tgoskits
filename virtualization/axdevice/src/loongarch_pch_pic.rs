@@ -8,10 +8,7 @@
 use alloc::{boxed::Box, sync::Arc};
 use core::sync::atomic::{AtomicUsize, Ordering};
 
-#[cfg(not(test))]
-use ax_kspin::SpinNoIrq as Mutex;
-#[cfg(test)]
-use ax_kspin::SpinRaw as Mutex;
+use ax_sync::SpinLock as Mutex;
 use axdevice_base::*;
 use axvm_types::GuestPhysAddr;
 
@@ -113,6 +110,12 @@ pub trait PchPicOutputPort: Send + Sync {
     fn take_output_event(&self) -> Option<PchPicOutputEvent>;
 }
 
+/// Architecture-owned sink for cascaded PCH-PIC output transitions.
+pub trait PchPicOutputSink: Send + Sync {
+    /// Publishes one controller output after a register access changes routing.
+    fn publish(&self, event: PchPicOutputEvent) -> DeviceManagerResult;
+}
+
 /// Type key for the VM-local LoongArch PCH-PIC output port.
 pub struct PchPicOutputPortKey;
 
@@ -151,7 +154,7 @@ impl LoongArchPchPic {
 
     /// Updates a PCH input source level and returns the EIOINTC source to assert, if any.
     pub fn set_irq_level(&self, irq: usize, level: bool) -> Option<usize> {
-        let mut state = self.state.lock();
+        let mut state = self.state.lock_irqsave();
         if irq >= PCH_PIC_IRQ_COUNT {
             return None;
         }
@@ -172,7 +175,7 @@ impl LoongArchPchPic {
 
     /// Returns the pending EIOINTC source for an already-latched PCH source.
     pub fn pending_vector(&self, irq: usize) -> Option<usize> {
-        let mut state = self.state.lock();
+        let mut state = self.state.lock_irqsave();
         if irq >= PCH_PIC_IRQ_COUNT {
             return None;
         }
@@ -184,7 +187,7 @@ impl LoongArchPchPic {
     pub fn drain_output_events(&self, mut f: impl FnMut(PchPicOutputEvent)) {
         loop {
             let event = {
-                let mut state = self.state.lock();
+                let mut state = self.state.lock_irqsave();
                 pop_output_event(&mut state)
             };
             match event {
@@ -195,7 +198,7 @@ impl LoongArchPchPic {
     }
 
     fn take_output_event(&self) -> Option<PchPicOutputEvent> {
-        let mut state = self.state.lock();
+        let mut state = self.state.lock_irqsave();
         pop_output_event(&mut state)
     }
 
@@ -214,7 +217,7 @@ impl LoongArchPchPic {
             });
         }
         let offset = addr.as_usize() - self.base.as_usize();
-        let state = self.state.lock();
+        let state = self.state.lock_irqsave();
         let value = match width {
             AccessWidth::Byte => read_byte(&state, offset),
             AccessWidth::Word => read_split_bytes(&state, offset, 2),
@@ -240,7 +243,7 @@ impl LoongArchPchPic {
             });
         }
         let offset = addr.as_usize() - self.base.as_usize();
-        let mut state = self.state.lock();
+        let mut state = self.state.lock_irqsave();
         log_pch_pic_io("write", offset, width, val);
         match width {
             AccessWidth::Byte => write_byte(&mut state, offset, val as u8),
@@ -270,6 +273,7 @@ pub struct LoongArchPchPicFactory {
     base: usize,
     length: usize,
     domain_factory: Arc<dyn LoongArchInterruptDomainFactory>,
+    output_sink: Arc<dyn PchPicOutputSink>,
 }
 
 /// Architecture adapter that creates the VM-local cascaded interrupt domain.
@@ -287,11 +291,13 @@ impl LoongArchPchPicFactory {
         base: usize,
         length: usize,
         domain_factory: Arc<dyn LoongArchInterruptDomainFactory>,
+        output_sink: Arc<dyn PchPicOutputSink>,
     ) -> Self {
         Self {
             base,
             length,
             domain_factory,
+            output_sink,
         }
     }
 }
@@ -303,6 +309,25 @@ impl DeviceModel for LoongArchPchPicFactory {
             self.length as u64,
             1,
             ResourceRequest::Fixed(self.base as u64),
+        )
+    }
+
+    fn firmware(&self) -> DeviceFirmwareSpec {
+        DeviceFirmwareSpec::interfaces(
+            Some(alloc::vec![FdtContributionSpec::InterruptController {
+                controller: axdevice_base::InterruptControllerId::new(0),
+                node: FdtNodeSpec::new("interrupt-controller")
+                    .with_compatible("loongson,pch-pic-1.0")
+                    .with_register(
+                        ResourceSlot::new("registers").expect("static PCH-PIC slot is valid"),
+                    ),
+            }]),
+            Some(alloc::vec![AcpiContributionSpec::InterruptController {
+                controller: axdevice_base::InterruptControllerId::new(0),
+                device: AcpiDeviceSpec::table("PCH0").with_register(
+                    ResourceSlot::new("registers").expect("static PCH-PIC slot is valid"),
+                ),
+            }]),
         )
     }
 
@@ -324,7 +349,10 @@ impl DeviceModel for LoongArchPchPicFactory {
         })?;
         let pic = Arc::new(LoongArchPchPic::new(base.into(), length));
         let interrupt_controller = self.domain_factory.create(pic.clone());
-        let device: Arc<dyn Device> = pic.clone();
+        let device: Arc<dyn Device> = Arc::new(LoongArchPchPicDevice {
+            pic: pic.clone(),
+            output_sink: self.output_sink.clone(),
+        });
         let output: Arc<dyn PchPicOutputPort> = pic;
         let mut bundle = DeviceBundle::from_registration(DeviceRegistration::Device(device))
             .with_service::<PchPicOutputPortKey>(output)?;
@@ -332,6 +360,46 @@ impl DeviceModel for LoongArchPchPicFactory {
             ControllerRegistration::new(interrupt_controller.id(), interrupt_controller),
         ));
         Ok(bundle)
+    }
+}
+
+struct LoongArchPchPicDevice {
+    pic: Arc<LoongArchPchPic>,
+    output_sink: Arc<dyn PchPicOutputSink>,
+}
+
+impl LoongArchPchPicDevice {
+    fn publish_pending_outputs(&self) -> DeviceResult {
+        while let Some(event) = self.pic.take_output_event() {
+            self.output_sink.publish(event).map_err(DeviceError::from)?;
+        }
+        Ok(())
+    }
+}
+
+impl Device for LoongArchPchPicDevice {
+    fn name(&self) -> &str {
+        self.pic.name()
+    }
+
+    fn resources(&self) -> &[Resource] {
+        self.pic.resources()
+    }
+
+    fn read(&self, access: &DeviceAccess, context: &mut dyn DeviceContext) -> DeviceResult<u64> {
+        let value = self.pic.read(access, context)?;
+        self.publish_pending_outputs()?;
+        Ok(value)
+    }
+
+    fn write(
+        &self,
+        access: &DeviceAccess,
+        value: u64,
+        context: &mut dyn DeviceContext,
+    ) -> DeviceResult {
+        self.pic.write(access, value, context)?;
+        self.publish_pending_outputs()
     }
 }
 
@@ -344,28 +412,40 @@ impl Device for LoongArchPchPic {
         &self.resources
     }
 
-    fn access(
-        &self,
-        access: &BusAccess,
-        _context: &mut dyn DeviceAccess,
-    ) -> Result<BusResponse, DeviceError> {
-        if access.kind != BusKind::Mmio {
-            return Err(DeviceError::OutOfRange { addr: access.addr });
+    fn read(&self, access: &DeviceAccess, _context: &mut dyn DeviceContext) -> DeviceResult<u64> {
+        if access.bus() != BusKind::Mmio {
+            return Err(DeviceError::OutOfRange {
+                addr: access.address(),
+            });
         }
-        let addr = GuestPhysAddr::from_usize(access.addr as usize);
+        let addr = GuestPhysAddr::from_usize(access.address() as usize);
         if !self.contains(addr) {
-            return Err(DeviceError::OutOfRange { addr: access.addr });
+            return Err(DeviceError::OutOfRange {
+                addr: access.address(),
+            });
         }
+        self.read_register(addr, access.width())
+            .map(|value| value as u64)
+    }
 
-        if access.is_read {
-            self.read_register(addr, access.width)
-                .map(|value| BusResponse::Read {
-                    value: value as u64,
-                })
-        } else {
-            self.write_register(addr, access.width, access.data as usize)
-                .map(|_| BusResponse::Write)
+    fn write(
+        &self,
+        access: &DeviceAccess,
+        value: u64,
+        _context: &mut dyn DeviceContext,
+    ) -> DeviceResult {
+        if access.bus() != BusKind::Mmio {
+            return Err(DeviceError::OutOfRange {
+                addr: access.address(),
+            });
         }
+        let addr = GuestPhysAddr::from_usize(access.address() as usize);
+        if !self.contains(addr) {
+            return Err(DeviceError::OutOfRange {
+                addr: access.address(),
+            });
+        }
+        self.write_register(addr, access.width(), value as usize)
     }
 }
 

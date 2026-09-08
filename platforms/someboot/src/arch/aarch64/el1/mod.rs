@@ -167,7 +167,15 @@ pub fn setup_table_regs() {
         + TCR_EL1::ORGN1::WriteBack_ReadAlloc_WriteAlloc_Cacheable
         + TCR_EL1::IRGN1::WriteBack_ReadAlloc_WriteAlloc_Cacheable
         + TCR_EL1::T1SZ.val(T0SZ);
-    TCR_EL1.write(TCR_EL1::IPS::Bits_48 + tcr_flags0 + tcr_flags1);
+    // Configure the widest ASID mode implemented by this CPU. Runtime tag
+    // allocation observes this TCR field instead of assuming that a hardware
+    // capability has already been enabled by the boot path.
+    let asid_size = if ID_AA64MMFR0_EL1.read(ID_AA64MMFR0_EL1::ASIDBits) == 2 {
+        TCR_EL1::AS::ASID16Bits
+    } else {
+        TCR_EL1::AS::ASID8Bits
+    };
+    TCR_EL1.write(TCR_EL1::IPS::Bits_48 + asid_size + tcr_flags0 + tcr_flags1);
 
     tlbi(VMALLE1);
     barrier::dsb(barrier::SY);
@@ -237,6 +245,11 @@ pub fn systick_irq_disable() {
     }
 }
 
+pub fn systick_stop_oneshot() {
+    systick_irq_disable();
+    timer::aarch64_deadline::el1::disarm(&El1TimerRegisters, timer::aarch64_timer_mode());
+}
+
 pub fn systick_irq_enable() {
     match timer::aarch64_timer_mode() {
         ArchTimerMode::El1Virt => CNTV_CTL_EL0.modify(CNTV_CTL_EL0::IMASK::CLEAR),
@@ -275,10 +288,10 @@ impl timer::aarch64_deadline::el1::TimerRegisters for El1TimerRegisters {
     }
 }
 
-pub fn systick_set_interval(ticks: usize) {
-    timer::aarch64_deadline::el1::program(
+pub fn systick_set_deadline(deadline_ticks: u64) {
+    timer::aarch64_deadline::el1::program_deadline(
         &El1TimerRegisters,
         timer::aarch64_timer_mode(),
-        ticks as u64,
+        deadline_ticks,
     );
 }

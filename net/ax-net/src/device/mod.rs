@@ -14,13 +14,15 @@
 //!
 //! # Readiness
 //!
-//! A device may use platform IRQs, polling, or out-of-band notifications. The
-//! router asks devices for a readiness poll set and performs `PollSet`
-//! register/wake operations after releasing the concrete device lock.
+//! Physical devices enter the router only through the IRQ-backed queue runtime;
+//! periodic polling and out-of-band wake fallbacks are not supported. The
+//! in-memory loopback device has no hardware readiness source. The router asks
+//! devices for protocol-side readiness and performs `PollSet` register/wake
+//! operations after releasing the concrete device lock.
 
-use alloc::{string::String, sync::Arc, vec::Vec};
+use alloc::{string::String, vec::Vec};
+use core::ops::Range;
 
-use axpoll::PollSet;
 use smoltcp::{
     storage::PacketBuffer,
     time::Instant,
@@ -41,6 +43,54 @@ pub use loopback::*;
 #[cfg(feature = "vsock")]
 pub use vsock::*;
 
+/// Owned IP packet whose backing RX DMA token is retained through consumption.
+pub(crate) struct DeviceRxPacket {
+    frame_len: usize,
+    frame: ProtocolRxFrame,
+    packet: Range<usize>,
+}
+
+impl DeviceRxPacket {
+    pub(crate) fn with_packet_range(
+        frame_len: usize,
+        frame: ProtocolRxFrame,
+        packet: Range<usize>,
+    ) -> Self {
+        assert!(packet.end <= frame.packet_len());
+        Self {
+            frame_len,
+            frame,
+            packet,
+        }
+    }
+
+    /// Borrows the IP packet without releasing the RX DMA token.
+    pub fn read_with<R>(&self, consume: impl FnOnce(&[u8]) -> R) -> R {
+        self.frame
+            .read_with(|frame| consume(&frame[self.packet.clone()]))
+    }
+
+    /// Consumes the IP packet and recycles its DMA token afterwards.
+    pub fn consume<R>(self, consume: impl FnOnce(&[u8]) -> R) -> R {
+        self.read_with(consume)
+    }
+
+    /// Returns the received L2 frame length excluding FCS.
+    pub const fn frame_len(&self) -> usize {
+        self.frame_len
+    }
+}
+
+/// Result of polling a device's optional owned receive path.
+pub(crate) enum DeviceRxPoll {
+    /// This device only implements the compatibility receive path.
+    Unsupported,
+    /// The owned receive path is supported but no IP packet is ready.
+    Idle,
+    /// One IP packet and its backing DMA token were received.
+    Packet(DeviceRxPacket),
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ArpEntry {
     /// IPv4 address in network byte order.
@@ -56,7 +106,7 @@ pub struct ArpEntry {
 }
 
 /// Packet I/O endpoint behind the multi-device router.
-pub trait Device: Send + Sync {
+pub(crate) trait Device: Send {
     /// Human-readable device name used in logs and userspace queries.
     fn name(&self) -> &str;
 
@@ -73,7 +123,7 @@ pub trait Device: Send + Sync {
     ///
     /// Each call that returns a non-zero value MUST have enqueued exactly one
     /// IP packet into `buffer`. The return value is the L2 frame length of
-    /// that specific packet. The router RX worker relies on this 1:1
+    /// that specific packet. The protocol executor relies on this 1:1
     /// correspondence to pair frame lengths with dequeued packets in FIFO
     /// order.
     fn recv(
@@ -83,6 +133,25 @@ pub trait Device: Send + Sync {
         timestamp: Instant,
         snoop: &mut dyn FnMut(&[u8]),
     ) -> usize;
+
+    /// Polls an optional owned receive path that retains DMA through `RxToken`.
+    fn poll_owned_rx(&mut self, _timestamp: Instant) -> DeviceRxPoll {
+        DeviceRxPoll::Unsupported
+    }
+
+    /// Receives directly from queue-owned backing into the final protocol
+    /// destination when supported.
+    ///
+    /// `None` selects the compatibility [`recv`](Self::recv) path. `Some(0)`
+    /// means the direct path is supported but no IP packet was delivered.
+    fn recv_direct(
+        &mut self,
+        _timestamp: Instant,
+        _deliver: &mut dyn FnMut(&[u8]) -> bool,
+        _snoop: &mut dyn FnMut(&[u8]),
+    ) -> Option<usize> {
+        None
+    }
     /// Sends a packet to the next hop.
     ///
     /// Returns the L2 frame byte count (excluding FCS) actually transmitted,
@@ -90,6 +159,19 @@ pub trait Device: Send + Sync {
     /// resolution) or could not be sent. The returned byte count aligns with
     /// Linux `/proc/net/dev` semantics.
     fn send(&mut self, next_hop: IpAddress, packet: &[u8], timestamp: Instant) -> usize;
+
+    /// Attempts a transmission while preserving transient queue backpressure.
+    ///
+    /// [`NetDeviceError::Again`] means the caller still owns the packet and
+    /// must leave it queued until a later protocol poll.
+    fn try_send(
+        &mut self,
+        next_hop: IpAddress,
+        packet: &[u8],
+        timestamp: Instant,
+    ) -> NetDeviceResult<usize> {
+        Ok(self.send(next_hop, packet, timestamp))
+    }
 
     /// Returns the per-packet L2 frame byte counts for packets transmitted
     /// on a side path during `recv()` (e.g. ARP resolution and replies)
@@ -154,13 +236,62 @@ pub trait Device: Send + Sync {
     fn arp_entries(&self, _timestamp: Instant) -> Vec<ArpEntry> {
         Vec::new()
     }
+}
 
-    /// Returns the device readiness poll set when the device has a wake source.
-    ///
-    /// Interrupt-driven and out-of-band devices return a poll set. Pure-polling
-    /// devices should return `None`, or their wakers would sit on a poll set
-    /// that is never woken.
-    fn readiness_poll(&self) -> Option<Arc<PollSet>> {
-        None
+#[cfg(test)]
+mod tests {
+    use smoltcp::wire::Ipv4Address;
+
+    use super::*;
+
+    struct DefaultDevice;
+
+    impl Device for DefaultDevice {
+        fn name(&self) -> &str {
+            "default-device"
+        }
+
+        fn recv(
+            &mut self,
+            _interface_id: InterfaceId,
+            _buffer: &mut PacketBuffer<InterfaceId>,
+            _timestamp: Instant,
+            _snoop: &mut dyn FnMut(&[u8]),
+        ) -> usize {
+            0
+        }
+
+        fn send(&mut self, _next_hop: IpAddress, _packet: &[u8], _timestamp: Instant) -> usize {
+            0
+        }
+    }
+
+    #[test]
+    fn device_defaults_report_no_deferred_work_or_readiness() {
+        let mut device = DefaultDevice;
+
+        assert_eq!(device.name(), "default-device");
+        assert!(device.drain_deferred_tx().is_empty());
+        assert!(device.drain_deferred_rx().is_empty());
+        assert_eq!(device.drain_deferred_tx_errors(), 0);
+        assert_eq!(device.drain_deferred_tx_drops(), 0);
+        assert_eq!(device.drain_deferred_rx_errors(), 0);
+        assert_eq!(device.drain_deferred_rx_drops(), 0);
+        assert!(device.arp_entries(Instant::from_millis(1)).is_empty());
+        device.set_ipv4_addr(Some(Ipv4Cidr::new(Ipv4Address::LOCALHOST, 8)));
+    }
+
+    #[test]
+    fn arp_entry_keeps_neighbor_metadata() {
+        let entry = ArpEntry {
+            ip_addr: [192, 168, 1, 1],
+            hw_type: 1,
+            flags: 2,
+            hw_addr: [1, 2, 3, 4, 5, 6],
+            device: String::from("eth0"),
+        };
+
+        assert_eq!(entry.ip_addr, [192, 168, 1, 1]);
+        assert_eq!(entry.device, "eth0");
     }
 }

@@ -17,12 +17,10 @@ use core::{
 };
 
 use ax_alloc::GlobalPage;
-use ax_errno::{AxError, AxResult};
 use ax_hal::mem::virt_to_phys;
-use ax_kspin::SpinNoIrq;
 use ax_memory_addr::{PAGE_SIZE_4K, PhysAddr};
-use ax_task::IrqNotify;
-use axpoll::{IoEvents, PollSet, Pollable};
+use axpoll::{IoEvents, Pollable};
+use axpoll_set::PollSet;
 use kbpf_basic::{
     linux_bpf::{perf_event_mmap_page, perf_event_sample_format},
     perf::{PerfProbeArgs, bpf::BpfPerfEvent},
@@ -34,8 +32,11 @@ use super::PerfEventOps;
 #[cfg(target_arch = "x86_64")]
 use crate::perf::BPFJitMemory;
 use crate::{
+    StarryError, StarryResult,
     ebpf::{BPF_HELPER_FUN_SET, error::BpfResultExt, prog::BpfProg},
     file::FileLike,
+    sync::IrqMutex,
+    task::future::IrqNotify,
 };
 
 /// Number of 4K pages reserved for x86_64 BPF JIT executable memory.
@@ -67,18 +68,55 @@ impl BpfPerfEventState {
 /// and emits an IRQ-safe worker notification.
 #[derive(Clone)]
 pub(super) struct BpfPerfOutput {
-    state: Arc<SpinNoIrq<BpfPerfEventState>>,
+    state: Arc<IrqMutex<BpfPerfEventState>>,
     poll_notify: Arc<IrqNotify>,
 }
 
+/// Task-context readiness capability separated from mutable perf control.
+#[derive(Clone)]
+pub(super) struct BpfPerfPoll {
+    state: Arc<IrqMutex<BpfPerfEventState>>,
+    poll_ready: Arc<PollSet>,
+}
+
+impl Pollable for BpfPerfPoll {
+    fn poll(&self) -> IoEvents {
+        if self.state.lock().inner.readable() {
+            IoEvents::IN
+        } else {
+            IoEvents::empty()
+        }
+    }
+
+    unsafe fn register_shared(
+        &self,
+        sink: &mut dyn axpoll::SharedRegistrationSink,
+        events: IoEvents,
+    ) {
+        if events.contains(IoEvents::IN) {
+            unsafe { sink.register_shared(&self.poll_ready, IoEvents::IN) };
+        }
+    }
+
+    unsafe fn register_exclusive(
+        &self,
+        sink: &mut dyn axpoll::ExclusiveRegistrationSink,
+        events: IoEvents,
+    ) {
+        if events.contains(IoEvents::IN) {
+            unsafe { sink.register_exclusive(&self.poll_ready, IoEvents::IN) };
+        }
+    }
+}
+
 impl BpfPerfOutput {
-    pub(super) fn write_event(&self, data: &[u8]) -> AxResult<()> {
+    pub(super) fn write_event(&self, data: &[u8]) -> StarryResult<()> {
         let notify = {
             let mut state = self.state.lock();
             if !state.is_mapped() {
                 return Ok(());
             }
-            state.inner.write_event(data).into_ax_result()?;
+            state.inner.write_event(data).into_starry_result()?;
             state.inner.enabled()
         };
         if notify {
@@ -112,8 +150,8 @@ impl BpfPerfOutput {
 /// access is gated on [`BpfPerfEventState::is_mapped`]), so a dangling pointer
 /// left after the pages free is harmless.
 pub struct BpfPerfEventWrapper {
-    state: Arc<SpinNoIrq<BpfPerfEventState>>,
-    poll_ready: Arc<PollSet>,
+    state: Arc<IrqMutex<BpfPerfEventState>>,
+    poll: BpfPerfPoll,
     poll_notify: Arc<IrqNotify>,
     poll_alive: Arc<AtomicBool>,
 }
@@ -125,9 +163,13 @@ impl BpfPerfEventWrapper {
         let poll_notify = Arc::new(IrqNotify::new());
         let poll_alive = Arc::new(AtomicBool::new(true));
         start_bpf_perf_notify_worker(poll_ready.clone(), poll_notify.clone(), poll_alive.clone());
+        let state = Arc::new(IrqMutex::new(BpfPerfEventState { inner, pages: None }));
         Self {
-            state: Arc::new(SpinNoIrq::new(BpfPerfEventState { inner, pages: None })),
-            poll_ready,
+            poll: BpfPerfPoll {
+                state: Arc::clone(&state),
+                poll_ready,
+            },
+            state,
             poll_notify,
             poll_alive,
         }
@@ -138,6 +180,10 @@ impl BpfPerfEventWrapper {
             state: Arc::clone(&self.state),
             poll_notify: Arc::clone(&self.poll_notify),
         }
+    }
+
+    pub(super) fn poll_handle(&self) -> BpfPerfPoll {
+        self.poll.clone()
     }
 }
 
@@ -153,7 +199,7 @@ fn start_bpf_perf_notify_worker(
     poll_notify: Arc<IrqNotify>,
     poll_alive: Arc<AtomicBool>,
 ) {
-    ax_task::spawn_with_name(
+    crate::task::spawn_kernel_thread(
         move || loop {
             poll_notify.wait();
             if !poll_alive.load(Ordering::Acquire) {
@@ -173,13 +219,13 @@ impl Debug for BpfPerfEventWrapper {
 }
 
 impl PerfEventOps for BpfPerfEventWrapper {
-    fn enable(&mut self) -> AxResult<()> {
-        self.state.lock().inner.enable().into_ax_result()?;
+    fn enable(&mut self) -> StarryResult<()> {
+        self.state.lock().inner.enable().into_starry_result()?;
         Ok(())
     }
 
-    fn disable(&mut self) -> AxResult<()> {
-        self.state.lock().inner.disable().into_ax_result()?;
+    fn disable(&mut self) -> StarryResult<()> {
+        self.state.lock().inner.disable().into_starry_result()?;
         Ok(())
     }
 
@@ -187,25 +233,26 @@ impl PerfEventOps for BpfPerfEventWrapper {
         self
     }
 
-    fn device_mmap(&mut self, len: usize) -> AxResult<(PhysAddr, Arc<dyn Any + Send + Sync>)> {
+    fn device_mmap(&mut self, len: usize) -> StarryResult<(PhysAddr, Arc<dyn Any + Send + Sync>)> {
         if self.state.lock().is_mapped() {
             // Linux allows only one live mmap per perf event fd; a second
             // mapping while the first is alive would orphan it. A stale
             // `Weak` from an abandoned or munmap'd previous attempt does not
             // count (its pages are already freed), so the fd stays mmap-able.
-            return Err(AxError::ResourceBusy);
+            return Err(StarryError::ResourceBusy);
         }
         // libbpf requires `(1 + 2^N) * PAGE_SIZE` so the data region is a
         // power of two pages; `RingPage::init` enforces ≥ 2 pages total and
         // 4 K alignment. Reject anything that would trip those asserts.
         if len == 0 || !len.is_multiple_of(PAGE_SIZE_4K) {
-            return Err(AxError::InvalidInput);
+            return Err(StarryError::InvalidInput);
         }
         let num_pages = len / PAGE_SIZE_4K;
         if num_pages < 2 || !(num_pages - 1).is_power_of_two() {
-            return Err(AxError::InvalidInput);
+            return Err(StarryError::InvalidInput);
         }
-        let mut pages = GlobalPage::alloc_contiguous(num_pages, PAGE_SIZE_4K)?;
+        let mut pages = GlobalPage::alloc_contiguous(num_pages, PAGE_SIZE_4K)
+            .map_err(|_| StarryError::NoMemory)?;
         pages.zero();
         let kvirt = pages.start_vaddr();
         let paddr = virt_to_phys(kvirt);
@@ -213,12 +260,12 @@ impl PerfEventOps for BpfPerfEventWrapper {
 
         let mut state = self.state.lock();
         if state.is_mapped() {
-            return Err(AxError::ResourceBusy);
+            return Err(StarryError::ResourceBusy);
         }
         state
             .inner
             .do_mmap(kvirt.as_usize(), len, 0)
-            .map_err(|_| AxError::InvalidInput)?;
+            .map_err(|_| StarryError::InvalidInput)?;
         // kbpf_basic::RingPage::init sets the data-region geometry but leaves
         // version at 0. perf checks `perf_event_mmap_page.version == 1` and
         // rejects 0 (`perf_mmap__is_mmap_ok`), so we must set it here.
@@ -245,18 +292,23 @@ impl PerfEventOps for BpfPerfEventWrapper {
 
 impl Pollable for BpfPerfEventWrapper {
     fn poll(&self) -> axpoll::IoEvents {
-        if self.state.lock().inner.readable() {
-            IoEvents::IN
-        } else {
-            IoEvents::empty()
-        }
+        self.poll.poll()
     }
 
-    fn register(&self, context: &mut core::task::Context<'_>, events: axpoll::IoEvents) {
-        if events.contains(IoEvents::IN) {
-            // Registration happens from file poll task context.
-            unsafe { self.poll_ready.register(context.waker(), IoEvents::IN) };
-        }
+    unsafe fn register_shared(
+        &self,
+        sink: &mut dyn axpoll::SharedRegistrationSink,
+        events: axpoll::IoEvents,
+    ) {
+        unsafe { self.poll.register_shared(sink, events) };
+    }
+
+    unsafe fn register_exclusive(
+        &self,
+        sink: &mut dyn axpoll::ExclusiveRegistrationSink,
+        events: axpoll::IoEvents,
+    ) {
+        unsafe { self.poll.register_exclusive(sink, events) };
     }
 }
 
@@ -293,11 +345,11 @@ impl OwnedEbpfVm {
     /// Build an `rbpf::EbpfVmRaw` around the program's instruction stream
     /// and register the kernel helper table on it. The returned value owns
     /// both the VM and the [`Arc<BpfProg>`] backing its instruction buffer.
-    pub fn new(bpf_prog: Arc<dyn FileLike>) -> AxResult<Self> {
+    pub fn new(bpf_prog: Arc<dyn FileLike>) -> StarryResult<Self> {
         let prog = bpf_prog
             .into_any_arc()
             .downcast::<BpfProg>()
-            .map_err(|_| AxError::InvalidInput)?;
+            .map_err(|_| StarryError::InvalidInput)?;
         // Extend the borrow of `prog.insns()` to `'static`. SAFETY: the
         // Arc<BpfProg> is moved into the returned `OwnedEbpfVm` together
         // with the VM, and the struct's field drop order (vm before _prog)
@@ -307,7 +359,7 @@ impl OwnedEbpfVm {
             unsafe { core::slice::from_raw_parts(prog_slice.as_ptr(), prog_slice.len()) };
         let mut vm = EbpfVmRaw::new(Some(prog_slice)).map_err(|e| {
             error!("rbpf::EbpfVmRaw::new failed: {e:?}");
-            AxError::InvalidInput
+            StarryError::InvalidInput
         })?;
 
         if let Some(table) = BPF_HELPER_FUN_SET.get() {
@@ -335,12 +387,12 @@ impl OwnedEbpfVm {
             let jit_slice = unsafe { jit_exec_memory.as_static_mut_slice() };
             vm.set_jit_exec_memory(jit_slice).map_err(|e| {
                 error!("rbpf::EbpfVmRaw::set_jit_exec_memory failed: {e:?}");
-                AxError::InvalidInput
+                StarryError::InvalidInput
             })?;
 
             vm.jit_compile().map_err(|e| {
                 error!("rbpf::EbpfVmRaw::jit_compile failed: {e:?}");
-                AxError::InvalidInput
+                StarryError::InvalidInput
             })?;
 
             Ok(Self {

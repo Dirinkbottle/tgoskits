@@ -4,23 +4,24 @@ use core::{
     time::Duration,
 };
 
-use ax_errno::{AxError, AxResult};
-use ax_kspin::SpinRwLock as RwLock;
+use ax_sync::SpinRwLock as RwLock;
+
+use crate::{BlockError, BlockResult};
 
 /// Wait/notify object created and owned by the block runtime.
 pub trait BlockNotification: Send + Sync + 'static {
-    /// Publishes work from normal task context.
+    /// Publishes work from task or hard IRQ context without allocation or
+    /// sleeping.
     fn notify(&self);
 
-    /// Publishes work from hard IRQ context without allocation or sleeping.
-    fn notify_from_irq(&self);
-
     /// Blocks until a notification is pending and consumes that notification.
+    #[track_caller]
     fn wait(&self);
 
     /// Blocks until notified or the duration expires.
     ///
     /// Returns `true` when the wait timed out.
+    #[track_caller]
     fn wait_timeout(&self, duration: Duration) -> bool;
 }
 
@@ -56,7 +57,7 @@ pub trait BlockRuntimeOps: Send + Sync {
         name: String,
         cpu: usize,
         entry: Box<dyn FnOnce() + Send + 'static>,
-    ) -> AxResult<Box<dyn BlockThread>>;
+    ) -> BlockResult<Box<dyn BlockThread>>;
 }
 
 static RUNTIME_OPS: RwLock<Option<&'static dyn BlockRuntimeOps>> = RwLock::new(None);
@@ -72,13 +73,13 @@ pub fn set_runtime_ops(ops: &'static dyn BlockRuntimeOps) {
 ///
 /// # Errors
 ///
-/// Returns [`AxError::BadState`] before `axruntime` installs the adapter.
-pub fn runtime_ops() -> AxResult<&'static dyn BlockRuntimeOps> {
+/// Returns [`BlockError::RuntimeUnavailable`] before `axruntime` installs the adapter.
+pub fn runtime_ops() -> BlockResult<&'static dyn BlockRuntimeOps> {
     RUNTIME_OPS
         .read()
         .as_ref()
         .copied()
-        .ok_or(AxError::BadState)
+        .ok_or(BlockError::RuntimeUnavailable)
 }
 
 /// Returns whether the runtime adapter has been installed.
@@ -115,10 +116,8 @@ mod tests {
         time::Instant,
     };
 
-    use ax_errno::AxResult;
-
     use super::{BlockNotification, BlockRuntimeOps, BlockThread};
-    use crate::os::time::BlockTimeProvider;
+    use crate::{BlockResult, os::time::BlockTimeProvider};
 
     pub(super) static TEST_RUNTIME_OPS: TestRuntimeOps = TestRuntimeOps;
     pub(super) static TEST_TIME_PROVIDER: TestTimeProvider = TestTimeProvider;
@@ -156,11 +155,12 @@ mod tests {
             self.publish();
         }
 
-        fn notify_from_irq(&self) {
-            self.publish();
-        }
-
+        #[track_caller]
         fn wait(&self) {
+            assert!(
+                !crate::os::sync::current_thread_holds_irq_mutex(),
+                "block notification wait cannot hold a non-sleeping lock"
+            );
             let mut pending = self.pending.lock().unwrap();
             while !*pending {
                 pending = self.ready.wait(pending).unwrap();
@@ -168,7 +168,12 @@ mod tests {
             *pending = false;
         }
 
+        #[track_caller]
         fn wait_timeout(&self, duration: Duration) -> bool {
+            assert!(
+                !crate::os::sync::current_thread_holds_irq_mutex(),
+                "block notification wait cannot hold a non-sleeping lock"
+            );
             TEST_WAIT_TIMEOUTS.fetch_add(1, Ordering::Relaxed);
             let mut pending = self.pending.lock().unwrap();
             if !*pending {
@@ -213,7 +218,7 @@ mod tests {
             name: String,
             _cpu: usize,
             entry: Box<dyn FnOnce() + Send + 'static>,
-        ) -> AxResult<Box<dyn BlockThread>> {
+        ) -> BlockResult<Box<dyn BlockThread>> {
             let join = thread::Builder::new().name(name).spawn(entry).unwrap();
             Ok(Box::new(TestThread {
                 join: Mutex::new(Some(join)),
@@ -223,6 +228,10 @@ mod tests {
 
     impl BlockTimeProvider for TestTimeProvider {
         fn wall_time(&self) -> Duration {
+            TEST_START.get_or_init(Instant::now).elapsed()
+        }
+
+        fn monotonic_time(&self) -> Duration {
             TEST_START.get_or_init(Instant::now).elapsed()
         }
     }

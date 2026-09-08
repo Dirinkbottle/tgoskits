@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.33](https://github.com/rcore-os/tgoskits/compare/ax-libc-v0.5.32...ax-libc-v0.5.33) - 2026-08-27
+
+### Other
+
+- *(runtime)* make IRQ and multitasking mandatory ([#2188](https://github.com/rcore-os/tgoskits/pull/2188))
+
+## [0.5.32](https://github.com/rcore-os/tgoskits/compare/ax-libc-v0.5.31...ax-libc-v0.5.32) - 2026-08-20
+
+### Other
+
+- *(errors)* introduce domain-owned error boundaries ([#2024](https://github.com/rcore-os/tgoskits/pull/2024))
+- *(sync)* move lock implementation into ax-task ([#1962](https://github.com/rcore-os/tgoskits/pull/1962))
+- *(sync)* unify lock primitives in ax-sync ([#1956](https://github.com/rcore-os/tgoskits/pull/1956))
+
+## [0.5.31](https://github.com/rcore-os/tgoskits/compare/ax-libc-v0.5.30...ax-libc-v0.5.31) - 2026-08-09
+
+### Added
+
+- *(posix)* implement eventfd and bridge epoll for std async ([#1887](https://github.com/rcore-os/tgoskits/pull/1887))
+
+### Fixed
+
+- *(axvisor)* correct shell filesystem command handling ([#1616](https://github.com/rcore-os/tgoskits/pull/1616))
+
 ## [0.5.30](https://github.com/rcore-os/tgoskits/compare/ax-libc-v0.5.29...ax-libc-v0.5.30) - 2026-08-03
 
 ### Other

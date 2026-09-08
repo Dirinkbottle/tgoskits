@@ -69,154 +69,88 @@ fn musl_toolchain_bindgen_args_pin_clang_to_musl_toolchain() -> anyhow::Result<(
 }
 
 #[test]
-fn std_target_specs_keep_kernel_fields_with_std_identity() {
-    for (std_target, llvm_target, arch, pointer_width) in [
+fn bare_build_targets_use_json_specs_for_all_architectures() {
+    for target_name in [
+        "x86_64-unknown-none",
+        "aarch64-unknown-none-softfloat",
+        "riscv64gc-unknown-none-elf",
+        "loongarch64-unknown-none-softfloat",
+    ] {
+        let target = bare_build_target_for(target_name).unwrap();
+
+        assert_eq!(
+            target.target,
+            format!("scripts/targets/bare/{target_name}.json")
+        );
+        assert_eq!(
+            target.env.get("CARGO_UNSTABLE_JSON_TARGET_SPEC"),
+            Some(&"true".to_string())
+        );
+        assert_eq!(
+            target.cargo_args,
+            ["-Z", "json-target-spec", "-Z", "build-std=core,alloc"]
+        );
+    }
+}
+
+#[test]
+fn bare_target_specs_preserve_builtin_abi_and_isa_contracts() {
+    for (target_name, arch, llvm_target, features, max_atomic_width) in [
         (
-            "x86_64-unknown-linux-musl",
-            "x86_64-unknown-none-elf",
+            "x86_64-unknown-none",
             "x86_64",
+            "x86_64-unknown-none-elf",
+            "-mmx,-sse,-sse2,-sse3,-ssse3,-sse4.1,-sse4.2,-avx,-avx2,+soft-float",
             64,
         ),
         (
-            "aarch64-unknown-linux-musl",
-            "aarch64-unknown-none",
+            "aarch64-unknown-none-softfloat",
             "aarch64",
+            "aarch64-unknown-none",
+            "+v8a,+strict-align,-neon",
+            128,
+        ),
+        (
+            "riscv64gc-unknown-none-elf",
+            "riscv64",
+            "riscv64",
+            "+m,+a,+f,+d,+c,+zicsr,+zifencei",
             64,
         ),
-        ("riscv64gc-unknown-linux-musl", "riscv64", "riscv64", 64),
         (
-            "loongarch64-unknown-linux-musl",
-            "loongarch64-unknown-none",
+            "loongarch64-unknown-none-softfloat",
             "loongarch64",
+            "loongarch64-unknown-none",
+            "-f,-d,-ual",
             64,
         ),
     ] {
-        let workspace = crate::context::workspace_root_path().unwrap();
-        let std_path = workspace.join(std_target_json_path(std_target));
-        assert!(
-            std_path.exists(),
-            "missing std target spec {}",
-            std_path.display()
-        );
+        let path = crate::context::workspace_root_path()
+            .unwrap()
+            .join(format!("scripts/targets/bare/{target_name}.json"));
+        let spec: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
 
-        let std_spec: serde_json::Value =
-            serde_json::from_str(&fs::read_to_string(&std_path).unwrap()).unwrap();
-
-        assert_eq!(std_spec["arch"], arch);
-        assert_eq!(std_spec["llvm-target"], llvm_target);
-        assert_eq!(std_spec["target-pointer-width"], pointer_width);
-        assert_eq!(std_spec["os"], "linux");
-        assert_eq!(std_spec["env"], "musl");
-        assert_eq!(std_spec["target-family"], serde_json::json!(["unix"]));
-        assert_eq!(std_spec["has-thread-local"], true);
-        let expected_tls_model = if std_target.starts_with("riscv64") {
-            "local-exec"
-        } else {
-            "initial-exec"
-        };
-        assert_eq!(std_spec["tls-model"], expected_tls_model);
-        assert_eq!(std_spec["metadata"]["std"], true);
-        assert!(
-            std_spec
-                .pointer("/metadata/description")
-                .and_then(|value| value.as_str())
-                .is_some_and(|description| description.contains("musl identity"))
-        );
-        assert_eq!(std_spec["eh-frame-header"], false);
-        assert_eq!(std_spec["relro-level"], "off");
-        assert_eq!(std_spec["linker"], "rust-lld");
-        assert_eq!(std_spec["linker-flavor"], "gnu-lld");
-        assert_eq!(std_spec["panic-strategy"], "abort");
+        assert_eq!(spec["arch"], arch);
+        assert_eq!(spec["llvm-target"], llvm_target);
+        assert_eq!(spec["features"], features);
+        assert_eq!(spec["max-atomic-width"], max_atomic_width);
+        assert_eq!(spec["panic-strategy"], "abort");
+        assert_eq!(spec["metadata"]["std"], false);
+        assert!(spec.get("os").is_none());
+        assert!(spec.get("env").is_none());
+        assert!(spec.get("target-family").is_none());
     }
 
     let loongarch = serde_json::from_str::<serde_json::Value>(
         &fs::read_to_string(
             crate::context::workspace_root_path()
                 .unwrap()
-                .join(std_target_json_path("loongarch64-unknown-linux-musl")),
+                .join("scripts/targets/bare/loongarch64-unknown-none-softfloat.json"),
         )
         .unwrap(),
     )
     .unwrap();
+    assert_eq!(loongarch["abi"], "softfloat");
     assert_eq!(loongarch["llvm-abiname"], "lp64s");
-    assert_eq!(loongarch["features"], "-f,-d,-ual");
-}
-
-#[test]
-fn std_target_specs_do_not_import_linux_userspace_link_fields() {
-    for target in [
-        "x86_64-unknown-linux-musl",
-        "aarch64-unknown-linux-musl",
-        "riscv64gc-unknown-linux-musl",
-        "loongarch64-unknown-linux-musl",
-    ] {
-        let path = crate::context::workspace_root_path()
-            .unwrap()
-            .join(std_target_json_path(target));
-        assert!(path.exists(), "missing std target spec {}", path.display());
-
-        let spec: serde_json::Value =
-            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
-        assert!(spec.get("dynamic-linking").is_none());
-        assert!(spec.get("has-rpath").is_none());
-        assert!(spec.get("pre-link-objects-fallback").is_none());
-        assert!(spec.get("post-link-objects-fallback").is_none());
-        assert!(spec.get("crt-static-default").is_none());
-        assert!(spec.get("crt-static-respected").is_none());
-        assert!(spec.get("supported-split-debuginfo").is_none());
-        assert!(spec.get("supports-xray").is_none());
-    }
-}
-
-#[test]
-fn std_target_specs_embed_final_link_policy() {
-    let cases = [
-        ("x86_64-unknown-linux-musl", "_head", "-pie"),
-        ("aarch64-unknown-linux-musl", "_head", "-pie"),
-        ("riscv64gc-unknown-linux-musl", "_head", "-pie"),
-        ("loongarch64-unknown-linux-musl", "_head", "-pie"),
-    ];
-
-    for (target, entry, mode_arg) in cases {
-        let path = crate::context::workspace_root_path()
-            .unwrap()
-            .join(std_target_json_path(target));
-        let spec: serde_json::Value =
-            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
-        let link_args = gnu_lld_pre_link_args(&spec);
-
-        assert!(link_args.contains(&mode_arg));
-        assert!(link_args.contains(&"--gc-sections"));
-        assert!(link_args.contains(&"-znorelro"));
-        assert!(link_args.contains(&"-znostart-stop-gc"));
-        assert!(link_args.contains(&"-Tlinker.x"));
-        assert!(link_args.contains(&"-u"));
-        assert!(link_args.contains(&entry));
-        assert_eq!(spec["eh-frame-header"], false);
-        assert_eq!(spec["relro-level"], "off");
-
-        assert!(!link_args.contains(&"-static"));
-        assert!(!link_args.contains(&"-no-pie"));
-    }
-}
-
-#[test]
-fn riscv_target_specs_disable_global_pointer_relaxation() {
-    let workspace = crate::context::workspace_root_path().unwrap();
-
-    for relative_path in [
-        "scripts/targets/std/riscv64gc-unknown-linux-musl.json",
-        "scripts/targets/std/pie/riscv64gc-unknown-linux-musl.json",
-    ] {
-        let path = workspace.join(relative_path);
-        let spec: serde_json::Value =
-            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
-        let link_args = gnu_lld_pre_link_args(&spec);
-
-        assert!(
-            link_args.contains(&"--no-relax"),
-            "RISC-V target spec must disable GP relaxation: {}",
-            path.display()
-        );
-    }
 }

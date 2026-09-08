@@ -38,9 +38,9 @@ test-suit/axvisor/
 
 | 模式 | 命令 | 运行环境 | 适用场景 |
 |------|------|----------|----------|
-| `test qemu` | `cargo axvisor test qemu` | QEMU 虚拟机 | 常规功能验证（CI 主力） |
-| `test uboot` | `cargo axvisor test uboot`（**Axvisor 独有**） | 远程板卡 + U-Boot 引导 | 验证 hypervisor 在真实硬件 + U-Boot 链路上的行为 |
-| `test board` | `cargo axvisor test board` | 远程板卡 | 板级回归 |
+| `test qemu` | `cargo xtask axvisor test qemu` | QEMU 虚拟机 | 常规功能验证（CI 主力） |
+| `test uboot` | `cargo xtask axvisor test uboot`（**Axvisor 独有**） | 远程板卡 + U-Boot 引导 | 验证 hypervisor 在真实硬件 + U-Boot 链路上的行为 |
+| `test board` | `cargo xtask axvisor test board` | 远程板卡 | 板级回归 |
 
 ### 3.1 QEMU 测试
 
@@ -59,7 +59,7 @@ flowchart TD
     G --> H["逐 case：run_qemu_case"]
     H --> I["load_qemu_case_config<br/>注入 grouped runner + timeout"]
     I --> J["prepare_case_assets<br/>rootfs 副本/overlay"]
-    J --> K["patch_qemu_rootfs_path + snapshot"]
+    J --> K["patch_qemu_rootfs_path(Discard)"]
     K --> L["run_qemu_with_prepared_case_assets"]
     L --> M{"success_regex?"}
     M -->|是| N["ok: case_name"]
@@ -80,11 +80,11 @@ flowchart TD
 | grouped 校验 | `validate_grouped_qemu_commands()` | 检查 `test_commands` 无空命令 |
 | 结果判定 | `QemuTestSummary` | 收集所有 case 的 pass/fail，最终 `finish_with_total_detail()` 统一判定退出码 |
 
-单个 case 运行（`run_qemu_case` → `load_qemu_case_config`）：注入 grouped runner（marker 前缀 `AXVISOR`）、`apply_timeout_scale`、准备 rootfs 资产（走共享 `test/case/` 层）、patch rootfs 路径、UEFI 时改写 snapshot 为 per-drive。Axvisor 不启用 backtrace capture（`capture_backtrace = None`）。
+单个 case 运行（`run_qemu_case` → `load_qemu_case_config`）：注入 grouped runner（marker 前缀 `AXVISOR`）、`apply_timeout_scale`、准备 rootfs 资产（走共享 `test/case/` 层）、以 `RootfsWritePolicy::Discard` patch rootfs 路径。Axvisor 不启用 backtrace capture（`capture_backtrace = None`）。
 
 ### 3.2 U-Boot 测试
 
-Axvisor 是唯一支持 U-Boot 测试模式的子系统。`cargo axvisor test uboot --board <TYPE>` 在远程板卡上通过 U-Boot 引导 Axvisor 和 Guest。执行链位于 `axvisor/test/board.rs::test_uboot()`。
+Axvisor 是唯一支持 U-Boot 测试模式的子系统。`cargo xtask axvisor test uboot --board <TYPE>` 在远程板卡上通过 U-Boot 引导 Axvisor 和 Guest。执行链位于 `axvisor/test/board.rs::test_uboot()`。
 
 ```mermaid
 flowchart TD
@@ -146,3 +146,30 @@ Axvisor 测试的六种 pipeline 类型与 StarryOS 完全一致，因为两者�
 | Plain | 以上均不满足 | 最常见，纯 QEMU 启动验证 |
 
 pipeline 类型、检测优先级、资产准备、rootfs 缓存和 grouped runner 协议的完整说明见 [测试基础设施](../test_infra)。Axvisor 的 `prepare_staging_root` 钩子为空操作（`|_| Ok(())`），不做 StarryOS 那样的 DNS 注入和 APK 区域配置。
+
+## 5. x86 嵌套 OVMF/ACPI 验证
+
+`normal` 组提供两条对称的 x86 嵌套 OVMF 用例：
+
+```bash
+cargo xtask axvisor test qemu --arch x86_64 --test-group normal \
+  --test-case ovmf-acpi-vmx
+cargo xtask axvisor test qemu --arch x86_64 --test-group normal \
+  --test-case ovmf-acpi-svm
+```
+
+两者共用 `test-suit/axvisor/normal/qemu-acpi-ovmf/x86-linux-acpi-ovmf.toml`、同一 BusyBox initramfs 和同一 4 MiB guest firmware 输出。build config 不选择 `vmx` 或 `svm` Cargo feature；唯一的 backend 差异是外层 QEMU 的 `-cpu` 能力：VMX 暴露 EPT、unrestricted guest 和 flexpriority，SVM 暴露 SVM、NPT 和 NRIP save。因此应分别在 Intel/VMX 与 AMD/SVM KVM 宿主上运行对应 case。
+
+两个 case 均已加入 CI 运行：`ovmf-acpi-vmx` 在 self-hosted Intel/KVM 宿主上运行（见 `.github/workflows/ci.yml` 中 "Test axvisor x86_64 ACPI direct and OVMF boot (vmx)" 任务），`ovmf-acpi-svm` 在 self-hosted AMD/KVM 宿主上运行（见 "Test axvisor self-hosted x86_64 (svm smoke + ACPI)" 任务）。
+
+资产准备复用 Ostool 的 x86_64 OVMF 缓存，可先用以下命令确认来源路径：
+
+```bash
+cargo xtask ovmf --arch x86_64
+```
+
+Axvisor 测试构建日志会输出本次实际使用的 Ostool CODE、VARS 和最终 guest image 的路径、字节数及 SHA-256，同时说明布局是 `split CODE/VARS` 还是 `monolithic CODE`。对于 monolithic CODE，VARS 仍会记录来源证据，但明确标记为 `unused`；这些运行时摘要不固化到仓库。
+
+成功条件 `AXVISOR_X86_OVMF_ACPI_PASSED` 来自嵌套 Linux initramfs，而不是 QEMU 外层 OVMF。该 marker 只有在 OVMF 完成 kernel handoff、Linux 进入早期用户态，并且 Linux 能读取 DSDT、APIC、FACP、SPCR、发现 `ttyS0`、初始化 IOAPIC 且 online CPU 集合为 `0` 时才会输出。因此它同时证明当前 firmware handoff 和 guest-side ACPI 接受路径。
+
+当前用例仍由 fw_cfg 提供 Linux kernel、initramfs 和命令行。它不证明 OVMF 已枚举 Axvisor guest PCI 启动盘，也不证明 Linux 经 guest ESP 或 EFI stub 启动。

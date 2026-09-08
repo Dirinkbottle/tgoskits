@@ -13,8 +13,8 @@
 //! * `PERF_RECORD_FORK` / `EXIT` — task lifetime, at `clone` / `exit`.
 //!
 //! These are written from *process context* (syscall time), not the IRQ handler,
-//! via [`super::sampling::ring_write_process`] (which masks local IRQs to
-//! serialize against the overflow handler sharing the ring).
+//! via [`super::sampling::ring_write_process`]. The output's shared non-blocking
+//! producer gate serializes them with overflow IRQs, including across CPUs.
 //!
 //! ## `sample_id_all`
 //!
@@ -25,6 +25,9 @@
 //! [`push_trailer`] appends it when [`SidebandTarget::sample_id_all`] is set.
 
 use alloc::vec::Vec;
+
+use super::output::PerfRingOutput;
+use crate::task::{TgidNumber, TidNumber};
 
 /// `PERF_RECORD_COMM`.
 const PERF_RECORD_COMM: u32 = 3;
@@ -53,20 +56,18 @@ const COMM_MAX: usize = 15;
 /// Where a side-band record is written, plus the parameters of its
 /// `sample_id_all` trailer. Built per monitored event from its `PerTaskCounter`.
 pub struct SidebandTarget {
-    /// Kernel vaddr of the destination ring's header page (`0` ⇒ skip).
-    pub ring_vaddr: usize,
-    /// Total ring length in bytes.
-    pub ring_len: usize,
+    /// Destination geometry coupled to the reference that pins its pages.
+    pub(crate) ring: PerfRingOutput,
     /// `attr.sample_type` — selects which fields the trailer carries.
     pub sample_type: u64,
     /// Whether to append the `sample_id_all` trailer at all.
     pub sample_id_all: bool,
     /// Event id (for the trailer's `ID` / `IDENTIFIER` fields).
     pub id: u64,
-    /// Process id of the monitored task.
-    pub pid: u32,
-    /// Thread id of the monitored task.
-    pub tid: u32,
+    /// Process id of the monitored task in the event's captured view.
+    pub pid: TgidNumber,
+    /// Thread id of the monitored task in the event's captured view.
+    pub tid: TidNumber,
 }
 
 /// One executable mapping, for [`emit_mmap2`].
@@ -114,8 +115,8 @@ fn push_trailer(b: &mut Vec<u8>, t: &SidebandTarget) {
     }
     let st = t.sample_type;
     if st & PERF_SAMPLE_TID != 0 {
-        push_u32(b, t.pid);
-        push_u32(b, t.tid);
+        push_u32(b, t.pid.get());
+        push_u32(b, t.tid.get());
     }
     if st & PERF_SAMPLE_TIME != 0 {
         push_u64(b, ax_runtime::hal::time::monotonic_time_nanos());
@@ -145,22 +146,17 @@ fn finish_and_write(mut b: Vec<u8>, t: &SidebandTarget, type_: u32, misc: u16) {
     b[0..4].copy_from_slice(&type_.to_ne_bytes());
     b[4..6].copy_from_slice(&misc.to_ne_bytes());
     b[6..8].copy_from_slice(&size.to_ne_bytes());
-    if t.ring_vaddr == 0 {
-        return;
-    }
-    // SAFETY: the caller only builds a target with a non-zero `ring_vaddr` for a
-    // ring whose pages are pinned by the owning event for the duration of this
-    // call (the monitored task is the running task issuing the syscall, so the
-    // ring cannot be torn down concurrently on this single-core path).
-    unsafe { super::sampling::ring_write_process(t.ring_vaddr, t.ring_len, &b) };
+    // SAFETY: `SidebandTarget` owns the ring pin for the full write, independent
+    // of concurrent fd close, task exit, output redirect, or VMA teardown.
+    unsafe { super::sampling::ring_write_process(&t.ring, &b) };
 }
 
 /// Emit a `PERF_RECORD_COMM` for `comm` (truncated to `TASK_COMM_LEN`).
 pub fn emit_comm(t: &SidebandTarget, comm: &str, exec: bool) {
     let mut b = Vec::with_capacity(64);
     b.extend_from_slice(&[0u8; 8]); // header placeholder
-    push_u32(&mut b, t.pid);
-    push_u32(&mut b, t.tid);
+    push_u32(&mut b, t.pid.get());
+    push_u32(&mut b, t.tid.get());
     let name = comm.as_bytes();
     push_cstr_padded(&mut b, &name[..name.len().min(COMM_MAX)]);
     push_trailer(&mut b, t);
@@ -175,13 +171,20 @@ pub fn emit_comm(t: &SidebandTarget, comm: &str, exec: bool) {
 /// The `sample_id_all` trailer reflects the task whose context emits the record
 /// (the *parent* for `FORK`, the *exiting task* for `EXIT`) — encoded by the
 /// caller in `t.pid`/`t.tid` — matching Linux's `perf_event_header__init_id`.
-fn emit_task(t: &SidebandTarget, type_: u32, pid: u32, ppid: u32, tid: u32, ptid: u32) {
+fn emit_task(
+    t: &SidebandTarget,
+    type_: u32,
+    pid: TgidNumber,
+    ppid: Option<TgidNumber>,
+    tid: TidNumber,
+    ptid: Option<TidNumber>,
+) {
     let mut b = Vec::with_capacity(64);
     b.extend_from_slice(&[0u8; 8]); // header placeholder
-    push_u32(&mut b, pid);
-    push_u32(&mut b, ppid);
-    push_u32(&mut b, tid);
-    push_u32(&mut b, ptid);
+    push_u32(&mut b, pid.get());
+    push_u32(&mut b, ppid.map_or(0, TgidNumber::get));
+    push_u32(&mut b, tid.get());
+    push_u32(&mut b, ptid.map_or(0, TidNumber::get));
     push_u64(&mut b, ax_runtime::hal::time::monotonic_time_nanos());
     push_trailer(&mut b, t);
     // FORK/EXIT carry no cpu-mode misc bits (the task, not a sampled IP).
@@ -190,13 +193,25 @@ fn emit_task(t: &SidebandTarget, type_: u32, pid: u32, ppid: u32, tid: u32, ptid
 
 /// Emit a `PERF_RECORD_FORK` describing a newly-cloned child (`pid`/`tid`) of the
 /// monitored parent (`ppid`/`ptid`). `t` is built in the parent's context.
-pub fn emit_fork(t: &SidebandTarget, pid: u32, ppid: u32, tid: u32, ptid: u32) {
-    emit_task(t, PERF_RECORD_FORK, pid, ppid, tid, ptid);
+pub fn emit_fork(
+    t: &SidebandTarget,
+    pid: TgidNumber,
+    ppid: TgidNumber,
+    tid: TidNumber,
+    ptid: TidNumber,
+) {
+    emit_task(t, PERF_RECORD_FORK, pid, Some(ppid), tid, Some(ptid));
 }
 
 /// Emit a `PERF_RECORD_EXIT` for the exiting task (`pid`/`tid`) and its parent
 /// (`ppid`/`ptid`). `t` is built in the exiting task's context.
-pub fn emit_exit(t: &SidebandTarget, pid: u32, ppid: u32, tid: u32, ptid: u32) {
+pub fn emit_exit(
+    t: &SidebandTarget,
+    pid: TgidNumber,
+    ppid: Option<TgidNumber>,
+    tid: TidNumber,
+    ptid: Option<TidNumber>,
+) {
     emit_task(t, PERF_RECORD_EXIT, pid, ppid, tid, ptid);
 }
 
@@ -204,8 +219,8 @@ pub fn emit_exit(t: &SidebandTarget, pid: u32, ppid: u32, tid: u32, ptid: u32) {
 pub fn emit_mmap2(t: &SidebandTarget, m: &Mmap2Info) {
     let mut b = Vec::with_capacity(128);
     b.extend_from_slice(&[0u8; 8]); // header placeholder
-    push_u32(&mut b, t.pid);
-    push_u32(&mut b, t.tid);
+    push_u32(&mut b, t.pid.get());
+    push_u32(&mut b, t.tid.get());
     push_u64(&mut b, m.addr);
     push_u64(&mut b, m.len);
     push_u64(&mut b, m.pgoff);

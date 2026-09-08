@@ -7,6 +7,55 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.2](https://github.com/rcore-os/tgoskits/compare/somehal-v0.9.1...somehal-v0.9.2) - 2026-08-27
+
+### Added
+
+- *(loongarch-intc-driver)* extract OS-independent interrupt controllers ([#2174](https://github.com/rcore-os/tgoskits/pull/2174))
+
+## [0.9.1](https://github.com/rcore-os/tgoskits/compare/somehal-v0.9.0...somehal-v0.9.1) - 2026-08-25
+
+### Other
+
+- *(x86-apic-driver)* extract x86 interrupt controllers with rdif-intc support ([#2118](https://github.com/rcore-os/tgoskits/pull/2118))
+
+## [0.9.0](https://github.com/rcore-os/tgoskits/compare/somehal-v0.8.3...somehal-v0.9.0) - 2026-08-20
+
+### Added
+
+- *(dma-api)* [**breaking**] add device DMA coherency with uncached-alias remap ([#2106](https://github.com/rcore-os/tgoskits/pull/2106))
+- *(starry-nixos)* add Stage-2 NixOS userspace baseline ([#1923](https://github.com/rcore-os/tgoskits/pull/1923))
+
+### Fixed
+
+- *(arm-gic-driver)* handle implicit GICv2 uniprocessor targets ([#2007](https://github.com/rcore-os/tgoskits/pull/2007))
+- *(someboot)* [**breaking**] expose queryable secondary CPU startup ([#1981](https://github.com/rcore-os/tgoskits/pull/1981))
+
+### Other
+
+- *(axtest)* standardize Cargo and QEMU test flow ([#2088](https://github.com/rcore-os/tgoskits/pull/2088))
+- *(sync)* unify lock primitives in ax-sync ([#1956](https://github.com/rcore-os/tgoskits/pull/1956))
+
+### Changed
+
+- **Breaking:** re-export the queryable someboot secondary CPU startup handle in place of the
+  blocking `cpu_on()` API; timeout and polling policy now belong to the platform adapter.
+
+## [0.8.3](https://github.com/rcore-os/tgoskits/compare/somehal-v0.8.2...somehal-v0.8.3) - 2026-08-09
+
+### Added
+
+- *(axvisor)* support ROCK 4D guest boot ([#1880](https://github.com/rcore-os/tgoskits/pull/1880))
+
+### Fixed
+
+- *(arm-gic-driver)* use hardware CPU targets for GICv2 routing ([#1803](https://github.com/rcore-os/tgoskits/pull/1803))
+
+### Other
+
+- *(ax-ipi)* establish typed IPI publication transport ([#1916](https://github.com/rcore-os/tgoskits/pull/1916))
+- *(axvm)* unify guest devices and AArch64 timer ownership ([#1717](https://github.com/rcore-os/tgoskits/pull/1717))
+
 ## [0.8.2](https://github.com/rcore-os/tgoskits/compare/somehal-v0.8.1...somehal-v0.8.2) - 2026-08-03
 
 ### Fixed

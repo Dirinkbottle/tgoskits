@@ -1,7 +1,7 @@
 //! SpacemiT K3 GMAC 网卡驱动（Synopsys DWMAC 5.10a）。
 //!
 //! 从设备树 probe ethernet@xxx 节点，经 syscon glue 配置 APMU（接口模式 +
-//! DLINE 调相）后初始化 DWMAC5 核心（DMA/MAC/MTL），注册为 rd_net 网卡。
+//! DLINE 调相）后初始化 DWMAC5 核心（DMA/MAC/MTL），注册为 rdif-eth 网卡。
 //! 单队列实现（queue0/channel0），速率按设备树 `max-speed` 静态配置。
 
 mod core;
@@ -13,6 +13,7 @@ mod syscon;
 
 use alloc::format;
 
+use dma_api::{DmaConstraints, DmaDeviceInfo, DmaDomainId};
 use fdt_edit::Node;
 use log::info;
 use rdrive::{
@@ -74,7 +75,11 @@ fn probe(probe: ProbeFdt<'_>) -> Result<(), OnProbeError> {
 
     // 2. 映射 GMAC MMIO + 构造 DMA 设备
     let mmio_base = iomap(reg.address as usize, size)?;
-    let dma = axklib::dma::device_with_mask(DMA_MASK);
+    let dma = axklib::dma::device(DmaDeviceInfo::new(
+        DmaDomainId::Direct,
+        crate::binding_resolver::dma_coherency_from_fdt(&info),
+        DmaConstraints::new(DMA_MASK),
+    ));
 
     // 3. 解析 MAC 地址（DTS local-mac-address，缺失则按 reg 地址生成）
     let mac = parse_mac(node).unwrap_or_else(|| generated_mac(reg.address));
@@ -96,10 +101,9 @@ fn probe(probe: ProbeFdt<'_>) -> Result<(), OnProbeError> {
     })?);
 
     let binding = binding_info_from_fdt(&info)?;
-    let irq = plat_dev.register_net_with_info(DRIVER_NAME, net, binding);
+    plat_dev.register_net_with_info(DRIVER_NAME, net, dma, binding)?;
     info!(
-        "k3-gmac: registered {} mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} speed={}Mbps \
-         irq={irq:?}",
+        "k3-gmac: registered {} mac={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} speed={}Mbps",
         info.node.name(),
         mac[0],
         mac[1],

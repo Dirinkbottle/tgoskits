@@ -1,9 +1,6 @@
 use core::{arch::global_asm, fmt::Arguments, mem::offset_of};
 
-use loongArch64::register::{
-    ecfg::{self},
-    eentry, estat, tlbrentry,
-};
+use loongArch64::register::{eentry, estat};
 
 use crate::{
     arch::{context::TrapFrame, register::csr},
@@ -65,6 +62,7 @@ mod exccode {
 }
 
 const VECSIZE: usize = 0x200;
+const VECTOR_SPACING: usize = (VECSIZE / 4).ilog2() as usize;
 
 use super::register::irq as cpuintc;
 
@@ -142,47 +140,51 @@ unsafe extern "C" {
     fn __exception_vectors();
 }
 
-fn eentry_addr() -> usize {
-    sym_running_addr!(__exception_vectors)
-}
-
-fn tlbrentry_addr() -> usize {
-    virt_to_phys((eentry_addr() + 80 * VECSIZE) as *const u8)
-}
-
 pub fn per_cpu_trap_init(is_primary: bool) {
-    setup_vint_size();
     configure_exception_vector(is_primary);
 }
 
+#[cfg_attr(axtest_coverage, coverage(off))]
 pub(crate) fn init_entries_for_secondary() {
-    setup_vint_size();
-    eentry::set_eentry(eentry_addr());
-    tlbrentry::set_tlbrentry(tlbrentry_addr());
-}
-
-fn setup_vint_size() {
-    let n = (VECSIZE / 4).ilog2();
-    ecfg::set_vs(n as _);
+    let eentry_addr = sym_running_addr!(__exception_vectors);
+    let phys_mask = (1usize << super::addrspace::PABITS) - 1;
+    let tlbrentry_addr = (eentry_addr + 80 * VECSIZE) & phys_mask;
+    write_exception_entries(eentry_addr, tlbrentry_addr);
 }
 
 /// 配置异常向量
 fn configure_exception_vector(verbose: bool) {
-    let eentry_addr = eentry_addr();
+    let eentry_addr = sym_running_addr!(__exception_vectors);
+    let tlbrentry_addr = virt_to_phys((eentry_addr + 80 * VECSIZE) as *const u8);
+    write_exception_entries(eentry_addr, tlbrentry_addr);
     if verbose {
         println!("Setting EENTRY to {:#x}", eentry_addr);
-    }
-    eentry::set_eentry(eentry_addr);
-    let val = eentry::read().eentry();
-    if verbose {
+        let val = eentry::read().eentry();
         println!("EENTRY set to {:#x}", val);
-    }
-
-    let tlbrentry_addr = tlbrentry_addr();
-    if verbose {
         println!("Setting TLBRENTRY to {:#x}", tlbrentry_addr);
     }
-    tlbrentry::set_tlbrentry(tlbrentry_addr);
+}
+
+/// Writes the exception-vector CSRs without touching final-address data.
+#[cfg_attr(axtest_coverage, coverage(off))]
+fn write_exception_entries(eentry_addr: usize, tlbrentry_addr: usize) {
+    unsafe {
+        core::arch::asm!(
+            "csrrd {ecfg}, {csr_ecfg}",
+            "bstrins.d {ecfg}, {vector_spacing}, 18, 16",
+            "csrwr {ecfg}, {csr_ecfg}",
+            "csrwr {eentry}, {csr_eentry}",
+            "csrwr {tlbrentry}, {csr_tlbrentry}",
+            ecfg = out(reg) _,
+            vector_spacing = in(reg) VECTOR_SPACING,
+            eentry = in(reg) eentry_addr,
+            tlbrentry = in(reg) tlbrentry_addr,
+            csr_ecfg = const 0x4,
+            csr_eentry = const 0xc,
+            csr_tlbrentry = const 0x88,
+            options(nostack),
+        );
+    }
 }
 
 /// 处理向量中断
@@ -195,7 +197,7 @@ fn do_vint(_tf: &mut TrapFrame) {
 
 /// Page Fault 处理函数 (普通 TLB 异常: TLBL, TLBS, TLBI, TLBM, TLBNR, TLBNX, TLBPE)
 #[unsafe(no_mangle)]
-extern "C" fn do_page_fault(tf: &TrapFrame, write: usize, address: usize) -> ! {
+extern "C" fn do_page_fault(tf: &TrapFrame, access: usize, address: usize) -> ! {
     println!("do_page_fault called");
 
     let estat = estat::read();
@@ -213,7 +215,12 @@ extern "C" fn do_page_fault(tf: &TrapFrame, write: usize, address: usize) -> ! {
         _ => "Unknown Page Fault",
     };
 
-    let access_type = if write != 0 { "write" } else { "read" };
+    let access_type = match access {
+        0 => "read",
+        1 => "write",
+        2 => "execute",
+        _ => "unknown",
+    };
 
     panic_on_exception(
         "PAGE FAULT",
@@ -390,7 +397,7 @@ global_asm!(
     "csrrd   $t0, CSR_ERA",
     "st.d    $t0, $sp, TF_ERA",
     "move    $a0, $sp",             // TrapFrame 指针
-    "li.d    $a1, 0",               // write = 0 (读操作)
+    "li.d    $a1, 0",               // read access
     "csrrd   $a2, CSR_BADV",        // 错误地址
     "bl      do_page_fault",
     // do_page_fault 是 noreturn，不会返回
@@ -413,7 +420,7 @@ global_asm!(
     "csrrd   $t0, CSR_ERA",
     "st.d    $t0, $sp, TF_ERA",
     "move    $a0, $sp",
-    "li.d    $a1, 1",               // write = 1 (写操作)
+    "li.d    $a1, 1",               // write access
     "csrrd   $a2, CSR_BADV",
     "bl      do_page_fault",
 
@@ -435,7 +442,7 @@ global_asm!(
     "csrrd   $t0, CSR_ERA",
     "st.d    $t0, $sp, TF_ERA",
     "move    $a0, $sp",
-    "li.d    $a1, 0",
+    "li.d    $a1, 2",               // execute access
     "csrrd   $a2, CSR_BADV",
     "bl      do_page_fault",
 
@@ -479,7 +486,7 @@ global_asm!(
     "csrrd   $t0, CSR_ERA",
     "st.d    $t0, $sp, TF_ERA",
     "move    $a0, $sp",
-    "li.d    $a1, 0",
+    "li.d    $a1, 0",               // read access
     "csrrd   $a2, CSR_BADV",
     "bl      do_page_fault",
 
@@ -501,7 +508,7 @@ global_asm!(
     "csrrd   $t0, CSR_ERA",
     "st.d    $t0, $sp, TF_ERA",
     "move    $a0, $sp",
-    "li.d    $a1, 0",
+    "li.d    $a1, 2",               // execute access
     "csrrd   $a2, CSR_BADV",
     "bl      do_page_fault",
 
@@ -523,7 +530,7 @@ global_asm!(
     "csrrd   $t0, CSR_ERA",
     "st.d    $t0, $sp, TF_ERA",
     "move    $a0, $sp",
-    "li.d    $a1, 0",
+    "li.d    $a1, 3",               // access type is not encoded by TLBPE
     "csrrd   $a2, CSR_BADV",
     "bl      do_page_fault",
 
@@ -605,16 +612,28 @@ global_asm!(
     ".balign VECSIZE",
     ".Lsomeboot_handle_tlb_refill:",
     "
-    csrwr   $t0, 0x8B  // LOONGARCH_CSR_TLBRSAV - 保存 $t0
-    csrrd   $t0, 0x1b  // LA_CSR_PGD - 读取页表基址
-    lddir   $t0, $t0, 3    // PGD 级别: level 3 → DIR2 (base=39)
-    lddir   $t0, $t0, 2    // PUD 级别: level 2 → DIR1 (base=30)
-    lddir   $t0, $t0, 1    // PMD 级别: level 1 → DIR0 (base=21)
-    ldpte   $t0, 0         // PTE 级别: level 0 → PT (base=12)
-    ldpte   $t0, 1         // PTE 对
-    tlbfill                 // 填充 TLB
-    csrrd   $t0, 0x8B  // LOONGARCH_CSR_TLBRSAV - 恢复 $t0
-    ertn                    // 从异常返回
+    csrwr   $t0, 0x8B  // TLBRSAVE: preserve $t0
+    csrrd   $t0, 0x1B  // PGD: select the page-table root
+    lddir   $t0, $t0, 3
+    beqz    $t0, .Lsomeboot_tlb_invalid
+    lddir   $t0, $t0, 2
+    beqz    $t0, .Lsomeboot_tlb_invalid
+    lddir   $t0, $t0, 1
+    beqz    $t0, .Lsomeboot_tlb_invalid
+    ldpte   $t0, 0
+    ldpte   $t0, 1
+    b       .Lsomeboot_tlb_fill
+
+.Lsomeboot_tlb_invalid:
+    // Do not let a zero directory entry become a physical page-table
+    // address. Zero EntryLo values preserve the original access fault type.
+    csrwr   $r0, 0x8C  // TLBRELO0
+    csrwr   $r0, 0x8D  // TLBRELO1
+
+.Lsomeboot_tlb_fill:
+    tlbfill
+    csrrd   $t0, 0x8B  // TLBRSAVE: restore $t0
+    ertn
     ",
     // do_tlb_refill 是 noreturn，不会返回
 

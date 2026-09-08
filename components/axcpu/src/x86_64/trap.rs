@@ -146,9 +146,8 @@ impl core::fmt::Debug for KernelTrapFrame<'_> {
 core::arch::global_asm!(
     include_str!("trap.S"),
     trapframe_size = const core::mem::size_of::<TrapFrame>(),
-    user_fs_base_offset = const core::mem::size_of::<TrapFrame>(),
-    user_gs_base_offset = const core::mem::size_of::<TrapFrame>() + core::mem::size_of::<u64>(),
-    kernel_fs_base_offset = const core::mem::size_of::<TrapFrame>() + 2 * core::mem::size_of::<u64>(),
+    kernel_stack_pointer_offset = const core::mem::size_of::<TrapFrame>()
+        + 2 * core::mem::size_of::<u64>(),
     UDATA = const gdt::UDATA.0,
     UCODE64 = const gdt::UCODE64.0,
     SYSCALL_VECTOR = const LEGACY_SYSCALL_VECTOR,
@@ -162,6 +161,14 @@ fn handle_page_fault(tf: &mut KernelTrapFrame<'_>) {
     let access_flags = err_code_to_flags(tf.raw.error_code)
         .unwrap_or_else(|e| panic!("Invalid #PF error code: {:#x}", e));
     let vaddr = va!(unsafe { cr2() });
+    #[cfg(feature = "exception-table")]
+    {
+        let mut updated = tf.snapshot();
+        if updated.fixup_nofault_exception() {
+            tf.apply_registers(&updated);
+            return;
+        }
+    }
     if crate::trap::call_page_fault_handler_with_parent_irqs(
         vaddr,
         access_flags,
@@ -240,7 +247,7 @@ unsafe extern "C" fn x86_trap_handler(raw: *mut RawTrapFrame) {
             );
         }
         IRQ_VECTOR_START..=IRQ_VECTOR_END => {
-            crate::trap::dispatch_irq(tf.raw.vector as _);
+            crate::trap::dispatch_irq(tf.raw.vector as _, crate::trap::TrapOrigin::Kernel);
         }
         _ => {
             let snapshot = tf.snapshot();
@@ -256,6 +263,18 @@ unsafe extern "C" fn x86_trap_handler(raw: *mut RawTrapFrame) {
             );
         }
     }
+}
+
+#[unsafe(no_mangle)]
+unsafe extern "C" fn x86_double_fault_handler(raw: *mut RawTrapFrame) -> ! {
+    let fault_vaddr = unsafe { cr2() };
+    // SAFETY: vector 8 enters through its dedicated IST stack, builds the same
+    // register prefix as every other x86 trap, and never returns or aliases it.
+    let raw = unsafe { &*raw };
+    panic!(
+        "Fatal #DF @ {:#x}, fault_vaddr={:#x}, error_code={:#x}, cs={:#x}, rflags={:#x}",
+        raw.rip, fault_vaddr, raw.error_code, raw.cs, raw.rflags,
+    );
 }
 
 fn vec_to_str(vec: u64) -> &'static str {

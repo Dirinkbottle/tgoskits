@@ -8,7 +8,7 @@ use core::{
 use ax_memory_addr::VirtAddr;
 use x86_64::{
     registers::{
-        control::Cr2,
+        control::{Cr2, Cr4, Cr4Flags},
         model_specific::{Efer, EferFlags, LStar, SFMask, Star},
         rflags::RFlags,
     },
@@ -26,13 +26,23 @@ pub use crate::uspace_common::{ExceptionKind, ExceptionSyndrome, ReturnReason};
 #[repr(C, align(16))]
 pub struct UserContext {
     tf: TrapFrame,
-    /// FS Segment Base
+    /// User-owned FS segment base.
+    ///
+    /// `CR4.FSGSBASE` stays disabled, so userspace cannot modify this value
+    /// without an `arch_prctl`-style kernel operation updating this image.
     pub fs_base: u64,
-    /// GS Segment Base
+    /// User-owned GS segment base.
     pub gs_base: u64,
-    /// Kernel FS base saved and restored exclusively by `enter_user`.
-    kernel_fs_base: u64,
+    /// Kernel continuation stack saved while this context executes in ring 3.
+    kernel_stack_pointer: u64,
+    /// Explicitly initializes the tail bytes required by the 16-byte ABI alignment.
+    _reserved: u64,
 }
+
+// SAFETY: `TrapFrame` and every following field are integer-only, the explicit
+// tail word consumes the alignment padding, and the offset assertions below
+// pin that layout.
+unsafe impl bytemuck::NoUninit for UserContext {}
 
 const _: () = {
     // A privilege transition may align TSS.RSP0 down to 16 bytes before
@@ -45,8 +55,11 @@ const _: () = {
     assert!(offset_of!(UserContext, fs_base) == size_of::<TrapFrame>());
     assert!(offset_of!(UserContext, gs_base) == size_of::<TrapFrame>() + size_of::<u64>());
     assert!(
-        offset_of!(UserContext, kernel_fs_base) == size_of::<TrapFrame>() + 2 * size_of::<u64>()
+        offset_of!(UserContext, kernel_stack_pointer)
+            == size_of::<TrapFrame>() + 2 * size_of::<u64>()
     );
+    assert!(offset_of!(UserContext, _reserved) == size_of::<TrapFrame>() + 3 * size_of::<u64>());
+    assert!(size_of::<UserContext>() == size_of::<TrapFrame>() + 4 * size_of::<u64>());
 };
 
 impl UserContext {
@@ -66,7 +79,8 @@ impl UserContext {
             },
             fs_base: 0,
             gs_base: 0,
-            kernel_fs_base: 0,
+            kernel_stack_pointer: 0,
+            _reserved: 0,
         }
     }
 
@@ -104,21 +118,58 @@ impl UserContext {
         self.fs_base = tls_area as _;
     }
 
-    /// Enters user space.
+    /// Returns whether this register image can be restored as an interruptible
+    /// ring-3 context.
+    pub fn has_interruptible_user_return_mode(&self) -> bool {
+        let forbidden =
+            RFlags::IOPL_LOW | RFlags::IOPL_HIGH | RFlags::NESTED_TASK | RFlags::VIRTUAL_8086_MODE;
+        let flags = RFlags::from_bits_retain(self.tf.rflags);
+        self.tf.cs == gdt::UCODE64.0 as u64
+            && self.tf.ss == gdt::UDATA.0 as u64
+            && flags.contains(RFlags::INTERRUPT_FLAG)
+            && !flags.intersects(forbidden)
+    }
+
+    /// Enters user space without validating the runtime transition.
     ///
     /// It restores the user registers and jumps to the user entry point
     /// (saved in `rip`).
     ///
     /// This function returns when an exception or syscall occurs.
-    pub fn run(&mut self) -> ReturnReason {
+    ///
+    /// # Safety
+    ///
+    /// The caller must be the runtime's prepared user-entry boundary for the
+    /// current scheduler task. Its context-switch tail must be complete, no
+    /// IRQ/preemption guard or hard interrupt may be active, and local IRQs
+    /// must remain disabled after the final scheduler-work check. The active
+    /// logical address space, hardware root and CPU footprint must match this
+    /// task and keep every user address referenced by `self` valid. The saved
+    /// selectors and RFLAGS must describe an interruptible ring-3 return. No
+    /// code may run between those validations and this call.
+    ///
+    /// Safe code cannot invoke this raw boundary:
+    ///
+    /// ```compile_fail
+    /// fn bypass_runtime(context: &mut ax_cpu::uspace::UserContext) {
+    ///     context.run_unchecked();
+    /// }
+    /// ```
+    pub unsafe fn run_unchecked(&mut self) -> ReturnReason {
         unsafe extern "C" {
             fn enter_user(uctx: &mut UserContext);
         }
 
-        assert_eq!(self.cs, gdt::UCODE64.0 as _);
-        assert_eq!(self.ss, gdt::UDATA.0 as _);
+        assert!(
+            self.has_interruptible_user_return_mode(),
+            "raw user entry requires an interruptible ring-3 register image"
+        );
 
-        crate::asm::disable_irqs();
+        assert!(
+            !crate::asm::irqs_enabled(),
+            "raw user entry requires the prepared IRQ-off boundary"
+        );
+        super::local_state::install_current_user_tls(self.fs_base as _, self.gs_base as _);
 
         unsafe { enter_user(self) };
 
@@ -132,7 +183,7 @@ impl UserContext {
             }
             (LEGACY_SYSCALL_VECTOR, _) => ReturnReason::Syscall,
             (IRQ_VECTOR_START..=IRQ_VECTOR_END, _) => {
-                crate::trap::dispatch_irq(vector as _);
+                crate::trap::dispatch_irq(vector as _, crate::trap::TrapOrigin::User);
                 ReturnReason::Interrupt
             }
             _ => ReturnReason::Exception(ExceptionInfo {
@@ -146,6 +197,8 @@ impl UserContext {
         ret
     }
 }
+
+const _: unsafe fn(&mut UserContext) -> ReturnReason = UserContext::run_unchecked;
 
 impl Deref for UserContext {
     type Target = TrapFrame;
@@ -208,6 +261,11 @@ pub(super) fn init_syscall() {
         fn syscall_entry();
     }
 
+    assert!(
+        !Cr4::read().contains(Cr4Flags::FSGSBASE),
+        "LinuxCurrent user TLS requires trapping all FS/GS base changes"
+    );
+    super::local_state::initialize_cpu_user_tls();
     LStar::write(x86_64::VirtAddr::new_truncate(
         syscall_entry as *const () as usize as _,
     ));

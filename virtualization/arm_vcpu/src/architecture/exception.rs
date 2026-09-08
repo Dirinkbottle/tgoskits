@@ -12,8 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use aarch64_cpu::registers::{ESR_EL2, HCR_EL2, Readable, SCTLR_EL1, VTCR_EL2, VTTBR_EL2};
-use log::error;
+use aarch64_cpu::registers::{
+    ELR_EL2, ESR_EL2, FAR_EL2, HCR_EL2, Readable, SCTLR_EL1, SPSR_EL2, VTCR_EL2, VTTBR_EL2,
+};
 
 use super::{
     TrapFrame,
@@ -122,6 +123,8 @@ pub fn handle_exception_sync(ctx: &mut TrapFrame) -> ArmVcpuResult<ArmVmExit> {
             handle_data_abort(ctx)
         }
         Some(ESR_EL2::EC::Value::HVC64) => {
+            // HVC records the preferred return address (the instruction after
+            // `hvc`) in ELR_EL2, so the handlers must preserve this PC.
             // The `#imm` argument when triggering a hvc call, currently not used.
             let _hvc_arg_imm16 = ESR_EL2.read(ESR_EL2::ISS);
 
@@ -133,6 +136,9 @@ pub fn handle_exception_sync(ctx: &mut TrapFrame) -> ArmVcpuResult<ArmVmExit> {
         }
         Some(ESR_EL2::EC::Value::TrappedMsrMrs) => handle_system_register(ctx),
         Some(ESR_EL2::EC::Value::SMC64) => {
+            // An SMC trapped by HCR_EL2.TSC is a Trap exception, whose
+            // preferred return address is the `smc` itself. Advance past it
+            // before resuming the guest.
             let elr = ctx.exception_pc();
             let val = elr + exception_next_instruction_step();
             ctx.set_exception_pc(val);
@@ -164,14 +170,13 @@ fn handle_hvc_psci_version(ctx: &mut TrapFrame) -> Option<ArmVcpuResult<ArmVmExi
         return None;
     }
 
-    advance_aarch64_exception_pc(ctx);
     ctx.set_gpr(0, PSCI_VERSION_0_2);
     Some(Ok(ArmVmExit::Nothing))
 }
 
 fn handle_hvc64_exception(ctx: &mut TrapFrame) -> ArmVcpuResult<ArmVmExit> {
-    advance_aarch64_exception_pc(ctx);
-
+    // The low-level AArch64 trap entry already saves the guest return PC for
+    // HVC exits. Advancing it here would skip the instruction after `hvc`.
     // Is this a psci call?
     //
     // By convention, a psci call can use either the `hvc` or the `smc` instruction.
@@ -299,16 +304,23 @@ fn handle_psci_call(ctx: &TrapFrame) -> Option<ArmVcpuResult<ArmVmExit>> {
 /// This function will judge if the SMC call is a PSCI call, if so, it will handle it as a PSCI call.
 /// Otherwise, it will forward the SMC call to the ATF directly.
 fn handle_smc64_exception(ctx: &mut TrapFrame) -> ArmVcpuResult<ArmVmExit> {
+    const PSCI_VERSION_32: u64 = 0x8400_0000;
+
     // Is this a psci call?
-    if let Some(result) = handle_psci_call(ctx) {
-        result
-    } else {
-        // We just forward the SMC call to the ATF directly.
-        // The args are from lower EL, so it is safe to call the ATF.
-        (ctx.gpr[0], ctx.gpr[1], ctx.gpr[2], ctx.gpr[3]) =
-            unsafe { super::smc::smc_call(ctx.gpr[0], ctx.gpr[1], ctx.gpr[2], ctx.gpr[3]) };
-        Ok(ArmVmExit::Nothing)
+    // Keep virtual CPU lifecycle calls inside AxVisor, but expose the physical
+    // firmware's PSCI version to SMC guests. Linux uses that version to decide
+    // whether it may query the SMCCC version needed by SCMI.
+    if ctx.gpr[0] != PSCI_VERSION_32
+        && let Some(result) = handle_psci_call(ctx)
+    {
+        return result;
     }
+
+    // We just forward the SMC call to the ATF directly.
+    // The args are from lower EL, so it is safe to call the ATF.
+    (ctx.gpr[0], ctx.gpr[1], ctx.gpr[2], ctx.gpr[3]) =
+        unsafe { super::smc::smc_call(ctx.gpr[0], ctx.gpr[1], ctx.gpr[2], ctx.gpr[3]) };
+    Ok(ArmVmExit::Nothing)
 }
 
 /// Handles IRQ exceptions that occur from the current exception level.
@@ -328,12 +340,15 @@ fn current_el_sync_handler(tf: &mut TrapFrame) {
     let ec = ESR_EL2.read(ESR_EL2::EC);
     let iss = ESR_EL2.read(ESR_EL2::ISS);
 
-    error!("ESR_EL2: {:#x}", esr.get());
-    error!("Exception Class: {ec:#x}");
-    error!("Instruction Specific Syndrome: {iss:#x}");
-
     panic!(
-        "Unhandled synchronous exception from current EL: {:#x?}",
+        "Unhandled synchronous exception from current EL:\nESR_EL2: {:#x}\nException Class: \
+         {ec:#x}\nInstruction Specific Syndrome: {iss:#x}\nFAR_EL2: {:#x}\nELR_EL2: \
+         {:#x}\nSPSR_EL2: {:#x}\nHCR_EL2: {:#x}\nTrap frame: {:#x?}",
+        esr.get(),
+        FAR_EL2.get(),
+        ELR_EL2.get(),
+        SPSR_EL2.get(),
+        HCR_EL2.get(),
         tf
     );
 }
@@ -410,25 +425,22 @@ mod tests {
     const TEST_PC: usize = 0x8020_0000;
 
     #[test]
-    fn hvc_psci_exit_advances_exception_pc() {
+    fn hvc_psci_version_preserves_exception_pc() {
         let mut ctx = TrapFrame::default();
         ctx.set_exception_pc(TEST_PC);
         ctx.set_gpr(0, PSCI_VERSION_32 as usize);
 
-        let exit = handle_hvc64_exception(&mut ctx).expect("PSCI HVC should produce VM exit");
+        let exit = handle_hvc_psci_version(&mut ctx)
+            .expect("PSCI version HVC should produce a result")
+            .expect("PSCI version HVC should be handled");
 
-        assert_eq!(ctx.exception_pc(), TEST_PC + AARCH64_EXCEPTION_INSN_SIZE);
-        assert!(matches!(
-            exit,
-            ArmVmExit::Hypercall {
-                nr: PSCI_VERSION_32,
-                ..
-            }
-        ));
+        assert_eq!(ctx.exception_pc(), TEST_PC);
+        assert_eq!(ctx.gpr[0], 0x2);
+        assert!(matches!(exit, ArmVmExit::Nothing));
     }
 
     #[test]
-    fn generic_hvc_exit_advances_exception_pc() {
+    fn generic_hvc_exit_preserves_exception_pc() {
         let mut ctx = TrapFrame::default();
         ctx.set_exception_pc(TEST_PC);
         ctx.set_gpr(0, GENERIC_HVC_NR as usize);
@@ -437,7 +449,7 @@ mod tests {
 
         let exit = handle_hvc64_exception(&mut ctx).expect("generic HVC should produce VM exit");
 
-        assert_eq!(ctx.exception_pc(), TEST_PC + AARCH64_EXCEPTION_INSN_SIZE);
+        assert_eq!(ctx.exception_pc(), TEST_PC);
         assert!(matches!(
             exit,
             ArmVmExit::Hypercall {

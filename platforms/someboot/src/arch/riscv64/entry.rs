@@ -25,12 +25,10 @@ pub unsafe extern "C" fn _head() -> ! {
     naked_asm!(
         ".option push",
         ".option norvc",
-        // Linux RISC-V boot image header starts with 4-byte code0 and
-        // 4-byte reserved code1; keep the following fields at Linux/U-Boot
-        // offsets. Reference: Linux 5.4
-        // arch/riscv/kernel/head.S:24-45 and arch/riscv/include/asm/image.h:51-62.
-        "j {raw_entry}",
-        ".word 0",
+        ".option norelax",
+        // The RISC-V Image header reserves exactly 8 bytes for code0/code1.
+        "2: auipc t0, %pcrel_hi({kernel_entry})",
+        "jalr zero, %pcrel_lo(2b)(t0)",
         ".option pop",
         // text_offset
         ".quad {text_offset}",

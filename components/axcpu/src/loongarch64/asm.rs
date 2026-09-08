@@ -2,15 +2,87 @@
 
 use core::arch::asm;
 
-use ax_memory_addr::{PhysAddr, VirtAddr};
+use ax_memory_addr::{PAGE_SIZE_4K, PhysAddr, VirtAddr};
 use loongArch64::register::{
-    crmd,
+    asid, crmd,
     ecfg::{self, LineBasedInterrupt},
     eentry, pgdh, pgdl,
 };
 
+const INVTLB_ADDR_GTRUE_OR_ASID: usize = 0x06;
+const TLB_PAIR_SIZE: usize = PAGE_SIZE_4K * 2;
+
 #[cfg(feature = "tls")]
 use crate::KernelTlsBase;
+#[cfg(feature = "uspace")]
+use crate::{InstalledAddressSpace, InstalledAddressSpaceMode};
+
+/// Returns the number of LoongArch ASIDs, including reserved ASID 0.
+pub fn address_space_tag_capacity(_cpu_count: usize) -> u32 {
+    // The generic installed identity stores a u16 tag. Preserve every ASID bit
+    // representable by that contract instead of imposing an arbitrary 10-bit
+    // software limit.
+    let width = asid::read().asid_width().min(u16::BITS as usize);
+    1u32.checked_shl(width as u32).unwrap_or(1).max(1)
+}
+
+#[cfg(feature = "uspace")]
+fn flush_tlb_asid(tag: u16) {
+    // op 0x4 invalidates every non-global entry matching the supplied ASID.
+    unsafe {
+        asm!(
+            "dbar 0; invtlb 0x04, {asid}, $r0",
+            asid = in(reg) usize::from(tag),
+        )
+    }
+}
+
+/// Installs one complete userspace identity into PGDL and CSR.ASID.
+///
+/// Incoming tagged contexts are invalidated before their root becomes usable;
+/// the full-flush path installs ASID 0 and discards every local translation.
+/// This is a conservative version of Linux's per-CPU ASID/version protocol:
+/// tags may be globally allocated, but stale per-CPU state is never reused.
+///
+/// # Safety
+///
+/// The caller must own the current CPU with interrupts disabled and the root
+/// must remain alive for the complete activation lease.
+#[cfg(feature = "uspace")]
+pub unsafe fn install_user_address_space(address_space: InstalledAddressSpace) {
+    address_space.validate_architecture_support();
+    let tagged = matches!(address_space.mode(), InstalledAddressSpaceMode::Tagged)
+        && u32::from(address_space.hardware_tag()) < address_space_tag_capacity(1);
+    if tagged {
+        flush_tlb_asid(address_space.hardware_tag());
+        // Linux writes PGDL before ASID so the new tag cannot name the old
+        // page-table root. Scheduling is IRQ-disabled across both CSR writes.
+        pgdl::set_base(address_space.root().as_usize() as _);
+        asid::set_asid(usize::from(address_space.hardware_tag()));
+    } else {
+        pgdl::set_base(address_space.root().as_usize() as _);
+        asid::set_asid(0);
+        flush_tlb(None);
+    }
+}
+
+core::arch::global_asm!(
+    ".balign 16",
+    ".global __axcpu_wait_for_irqs_disabled",
+    ".global __axcpu_loongarch_idle_start",
+    ".global __axcpu_loongarch_idle_exit",
+    "__axcpu_wait_for_irqs_disabled:",
+    "__axcpu_loongarch_idle_start:",
+    "ori $t0, $zero, 4",
+    "csrxchg $t0, $t0, 0x0",
+    "idle 0",
+    "__axcpu_loongarch_idle_exit:",
+    "ret",
+);
+
+unsafe extern "C" {
+    fn __axcpu_wait_for_irqs_disabled();
+}
 
 /// Allows the current CPU to respond to interrupts.
 #[inline]
@@ -54,6 +126,21 @@ fn set_local_irq_line_enabled(line: LineBasedInterrupt, enabled: bool) {
 #[inline]
 pub fn wait_for_irqs() {
     unsafe { asm!("idle 0", options(nomem, nostack)) }
+}
+
+/// Waits for an interrupt after the caller masks local IRQ delivery.
+///
+/// LoongArch requires `CRMD.IE` to be set when `IDLE` executes. The assembly
+/// window updates `CRMD.IE` immediately before `IDLE`; the trap path
+/// fast-forwards an interrupt inside that window to its exit label. The
+/// function returns with local IRQs enabled.
+#[inline]
+pub fn wait_for_irqs_disabled() {
+    debug_assert!(!irqs_enabled());
+    // SAFETY: the caller has masked local IRQ delivery. The assembly routine
+    // only updates CRMD.IE, executes IDLE, and returns after the trap path has
+    // preserved or fast-forwarded its continuation.
+    unsafe { __axcpu_wait_for_irqs_disabled() }
 }
 
 /// Halt the current CPU.
@@ -129,17 +216,35 @@ pub fn flush_tlb(vaddr: Option<VirtAddr>) {
             //
             // formats: invtlb op, asid, addr
             //
-            // op 0x5: Clear all page table entries with G=0 and ASID equal to the
-            // register specified ASID, and VA equal to the register specified VA.
-            //
-            // When the operation indicated by op does not require an ASID, the
-            // general register rj should be set to r0.
-            asm!("dbar 0; invtlb 0x05, $r0, {reg}", reg = in(reg) vaddr.as_usize());
+            // LoongArch TLB entries map an even/odd page pair. Match Linux's
+            // local_flush_tlb_one() by invalidating from the pair base and by
+            // including global entries; op 0x5 would leave a stale kernel
+            // translation installed. Supplying the live ASID also makes the
+            // same operation valid for current user-space mappings.
+            let pair_base = vaddr.as_usize() & !(TLB_PAIR_SIZE - 1);
+            let current_asid = asid::read().asid();
+            asm!(
+                "dbar 0; invtlb {op}, {asid}, {addr}",
+                op = const INVTLB_ADDR_GTRUE_OR_ASID,
+                asid = in(reg) current_asid,
+                addr = in(reg) pair_base,
+            );
         } else {
             // op 0x0: Clear all page table entries
             asm!("dbar 0; invtlb 0x00, $r0, $r0");
         }
     }
+}
+
+/// Makes a page-table entry installed by the local page-fault handler visible
+/// before retrying the faulting instruction.
+///
+/// The software refill path may cache an invalid entry for a missing page-table
+/// level. Invalidate that local entry so the retry refills from the newly
+/// installed PTE.
+#[inline]
+pub fn update_mmu_cache(vaddr: VirtAddr) {
+    flush_tlb(Some(vaddr));
 }
 
 /// Writes the Exception Entry Base Address register (`EENTRY`).
@@ -232,7 +337,11 @@ pub fn enable_lasx() {
 }
 
 #[cfg(feature = "uspace")]
-core::arch::global_asm!(include_asm_macros!(), include_str!("user_copy.S"));
+core::arch::global_asm!(
+    include_asm_macros!(),
+    include_str!("user_copy.S"),
+    include_str!("user_atomic.S"),
+);
 
 #[cfg(feature = "uspace")]
 unsafe extern "C" {
@@ -246,4 +355,19 @@ unsafe extern "C" {
     /// Returns the number of bytes not copied. This means 0 indicates success,
     /// while a value > 0 indicates failure.
     pub fn user_copy(dst: *mut u8, src: *const u8, size: usize) -> usize;
+}
+
+/// Lock-free EL0/user access probe. No hardware address-translation probe is
+/// wired up on this architecture yet, so always report a present-page probe miss
+/// and let the caller take the locked slow path (correctness preserved).
+///
+/// # Safety
+///
+/// No precondition — this stub reads nothing and always returns `false`. It is
+/// `unsafe` only to share the signature of the aarch64 EL1 probe (which requires
+/// IRQs-off), so callers can use one `unsafe` block across all targets.
+#[cfg(feature = "uspace")]
+#[inline]
+pub unsafe fn user_access_ok_page(_vaddr: usize, _access: crate::UserAccessType) -> bool {
+    false
 }

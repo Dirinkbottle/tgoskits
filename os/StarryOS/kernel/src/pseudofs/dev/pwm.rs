@@ -1,12 +1,14 @@
 use alloc::{borrow::Cow, boxed::Box, format, sync::Arc, vec, vec::Vec};
 
-use ax_sync::Mutex;
+use ax_lazyinit::LazyLock;
 use axfs_ng_vfs::{NodePermission, VfsError, VfsResult};
-use spin::LazyLock;
 
-use crate::pseudofs::{
-    DirMaker, DirectRwFsFileOps, NodeOpsMux, RwFile, SimpleDir, SimpleDirOps, SimpleFile,
-    SimpleFileOperation, SimpleFileOps, SimpleFs, SpecialFsFile,
+use crate::{
+    pseudofs::{
+        DirMaker, DirectRwFsFileOps, NodeOpsMux, RwFile, SimpleDir, SimpleDirOps, SimpleFile,
+        SimpleFileOperation, SimpleFileOps, SimpleFs, SpecialFsFile,
+    },
+    sync::PiMutex,
 };
 
 mod platform;
@@ -59,8 +61,8 @@ impl PwmSysfsState {
     }
 }
 
-static PWM_SYSFS_STATE: LazyLock<Mutex<PwmSysfsState>> =
-    LazyLock::new(|| Mutex::new(PwmSysfsState::new()));
+static PWM_SYSFS_STATE: LazyLock<PiMutex<PwmSysfsState>> =
+    LazyLock::new(|| PiMutex::new(PwmSysfsState::new()));
 
 impl PwmAttrFile {
     fn new(ops: impl SimpleFileOps) -> Self {

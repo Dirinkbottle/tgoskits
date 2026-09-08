@@ -20,8 +20,8 @@ use crate::{
 };
 
 pub trait CoreOp: Send + 'static {
-    /// 初始化后端
-    fn init<'a>(&'a mut self) -> BoxFuture<'a, Result<(), USBError>>;
+    /// Prepares and starts the controller while keeping its IRQ source masked.
+    fn prepare_controller<'a>(&'a mut self) -> BoxFuture<'a, Result<(), USBError>>;
 
     fn root_hub(&mut self) -> Box<dyn HubOp>;
 
@@ -32,13 +32,9 @@ pub trait CoreOp: Send + 'static {
 
     fn create_event_handler(&mut self) -> Box<dyn EventHandlerOp>;
 
-    fn enable_irq(&mut self) -> Result<(), USBError> {
-        Err(USBError::NotSupported)
-    }
+    fn enable_irq(&mut self) -> Result<(), USBError>;
 
-    fn disable_irq(&mut self) -> Result<(), USBError> {
-        Err(USBError::NotSupported)
-    }
+    fn disable_irq(&mut self) -> Result<(), USBError>;
 
     fn dwc2_transfer_stats(&self) -> Option<crate::Dwc2TransferStats> {
         None
@@ -53,6 +49,7 @@ pub struct Core {
     pub(crate) backend: Box<dyn CoreOp>,
     hubs: BTreeMap<HubId, Hub>,
     root_hub: Option<HubId>,
+    pending_root_hub: Option<Box<dyn HubOp>>,
     topology: BTreeMap<(HubId, u8), TopologyDevice>,
     inited_devices: BTreeMap<usize, Box<dyn DeviceOp>>,
     next_hub_id: usize,
@@ -69,6 +66,7 @@ impl Core {
     pub(crate) fn new(backend: impl CoreOp) -> Self {
         Self {
             root_hub: None,
+            pending_root_hub: None,
             backend: Box::new(backend),
             hubs: BTreeMap::new(),
             topology: BTreeMap::new(),
@@ -103,59 +101,23 @@ impl Core {
         let mut disconnected = Vec::new();
 
         let hub_ids = self.hubs.keys().copied().collect::<Vec<_>>();
-        trace!("[usb-probe] enter: hubs={}", hub_ids.len());
 
         for id in hub_ids {
-            if !self.hubs.contains_key(&id) {
-                continue;
-            }
-            trace!("[usb-probe] hub {id:?}: changed_ports begin");
-            let events = self.hub_changed_ports(id).await.map_err(|error| {
-                trace!("[usb-probe] hub {id:?}: changed_ports failed: {error:?}");
-                error
-            })?;
-            if events.is_empty() {
-                trace!("[usb-probe] hub {id:?}: changed_ports complete, changes=0");
-            } else {
-                trace!(
-                    "[usb-probe] hub {id:?}: changed_ports complete, changes={}",
-                    events.len()
-                );
-            }
+            let events = self.hub_changed_ports(id).await?;
             for event in events {
                 match event {
-                    PortEvent::Connected(addr_info) => {
-                        trace!(
-                            "[usb-probe] address device begin: root_port={}, parent={id:?}, \
-                             port={}, speed={:?}",
-                            addr_info.root_port_id, addr_info.port_id, addr_info.port_speed
-                        );
-                        let (device, added_hub) = self.connect_port(id, addr_info).await?;
+                    PortEvent::Connected(info) => {
+                        let (device, added_hub) = self.connect_port(id, info).await?;
                         connected.push(device);
                         is_have_new_hub |= added_hub;
                     }
                     PortEvent::Disconnected { port_id } => {
-                        trace!("[usb-probe] disconnect begin: parent={id:?}, port={port_id}");
-                        let mut removed = self.disconnect_port(id, port_id).await?;
-                        trace!(
-                            "[usb-probe] disconnect complete: parent={id:?}, port={port_id}, \
-                             devices={removed:?}"
-                        );
-                        disconnected.append(&mut removed);
+                        disconnected.extend(self.disconnect_port(id, port_id).await?);
                     }
                 }
             }
         }
 
-        if connected.is_empty() && disconnected.is_empty() {
-            trace!("[usb-probe] pass complete: no topology changes");
-        } else {
-            trace!(
-                "[usb-probe] pass complete: new_hub={is_have_new_hub}, discovered={}, removed={}",
-                connected.len(),
-                disconnected.len()
-            );
-        }
         Ok((
             is_have_new_hub,
             ProbeChangesOp {
@@ -171,7 +133,7 @@ impl Core {
         address: PortChangeInfo,
     ) -> Result<(ProbedDeviceInfoOp, bool), USBError> {
         if self.topology.contains_key(&(parent_hub, address.port_id)) {
-            return Err(USBError::from("USB topology port is already occupied"));
+            return Err(USBError::InterfaceBroken);
         }
         let parent_slot_id = self
             .hubs
@@ -188,20 +150,8 @@ impl Core {
                 port_id: address.port_id,
                 infos: self.hub_infos(),
             })
-            .await
-            .map_err(|error| {
-                trace!(
-                    "[usb-probe] address device failed: root_port={}, parent={parent_hub:?}, \
-                     port={}, speed={:?}, error={error:?}",
-                    address.root_port_id, address.port_id, address.port_speed
-                );
-                error
-            })?;
+            .await?;
         let device_id = self.allocate_device_id();
-        trace!(
-            "[usb-probe] address device complete: logical_id={device_id}, backend_id={}",
-            device.id()
-        );
         let desc = device.descriptor().clone();
         let configs = device.configuration_descriptors().to_vec();
 
@@ -232,7 +182,10 @@ impl Core {
                     child_hub: Some(hub_id),
                 },
             );
-            trace!("[usb-probe] added external hub {hub_id:?}, device_id={device_id}");
+            info!(
+                "Added USB hub {hub_id:?} on {parent_hub:?}:{}",
+                address.port_id
+            );
             Ok((
                 ProbedDeviceInfoOp::Hub(Box::new(DeviceInfo::new(device_id, desc, &configs))),
                 true,
@@ -258,42 +211,38 @@ impl Core {
         parent_hub: HubId,
         port_id: u8,
     ) -> Result<Vec<usize>, USBError> {
-        let root_key = (parent_hub, port_id);
-        let Some(root) = self.topology.get(&root_key).copied() else {
+        let Some(root) = self.topology.remove(&(parent_hub, port_id)) else {
             return Ok(Vec::new());
         };
-
-        let mut subtree = vec![(root_key, root)];
-        let mut cursor = 0;
-        while cursor < subtree.len() {
-            if let Some(child_hub) = subtree[cursor].1.child_hub {
-                let children = self
-                    .topology
-                    .iter()
-                    .filter_map(|(key @ (owner, _), device)| {
-                        (*owner == child_hub).then_some((*key, *device))
-                    })
-                    .collect::<Vec<_>>();
-                subtree.extend(children);
-            }
-            cursor += 1;
-        }
-
-        let mut disconnected = Vec::with_capacity(subtree.len());
-        for (key, device) in subtree.into_iter().rev() {
-            if let Some(hub_id) = device.child_hub {
-                if let Some(hub) = self.hubs.get_mut(&hub_id) {
-                    hub.backend.disconnect().await?;
+        let mut devices = vec![root];
+        let mut hub_queue = root.child_hub.into_iter().collect::<Vec<_>>();
+        let mut hubs = Vec::new();
+        while let Some(hub_id) = hub_queue.pop() {
+            hubs.push(hub_id);
+            let ports = self
+                .topology
+                .keys()
+                .filter_map(|(owner, port)| (*owner == hub_id).then_some(*port))
+                .collect::<Vec<_>>();
+            for port in ports {
+                if let Some(device) = self.topology.remove(&(hub_id, port)) {
+                    hub_queue.extend(device.child_hub);
+                    devices.push(device);
                 }
-                self.hubs.remove(&hub_id);
-            } else if let Some(unopened) = self.inited_devices.get_mut(&device.device_id) {
-                unopened.disconnect().await?;
-                self.inited_devices.remove(&device.device_id);
             }
-            self.topology.remove(&key);
-            disconnected.push(device.device_id);
         }
-        Ok(disconnected)
+
+        for hub_id in hubs.into_iter().rev() {
+            if let Some(mut hub) = self.hubs.remove(&hub_id) {
+                hub.backend.disconnect().await?;
+            }
+        }
+        for device in &devices {
+            if let Some(mut unopened) = self.inited_devices.remove(&device.device_id) {
+                unopened.disconnect().await?;
+            }
+        }
+        Ok(devices.into_iter().map(|device| device.device_id).collect())
     }
 
     async fn hub_changed_ports(&mut self, hub_id: HubId) -> Result<Vec<PortEvent>, USBError> {
@@ -322,9 +271,25 @@ impl Core {
 impl BackendOp for Core {
     fn init<'a>(&'a mut self) -> BoxFuture<'a, Result<(), USBError>> {
         async {
-            self.backend.init().await?;
-            let mut root_hub = Hub::new(self.backend.root_hub(), &self.hub_infos(), 0, None);
-            let info = root_hub.backend.init(root_hub.info.clone()).await?;
+            self.backend.prepare_controller().await?;
+            if let Err(error) = self.backend.enable_irq() {
+                let _rollback_result = self.backend.disable_irq();
+                return Err(error);
+            }
+
+            let root_hub_backend = self
+                .pending_root_hub
+                .take()
+                .unwrap_or_else(|| self.backend.root_hub());
+            let mut root_hub = Hub::new(root_hub_backend, &self.hub_infos(), 0, None);
+            let info = match root_hub.backend.init(root_hub.info.clone()).await {
+                Ok(info) => info,
+                Err(error) => {
+                    self.pending_root_hub = Some(root_hub.backend);
+                    let _rollback_result = self.backend.disable_irq();
+                    return Err(error);
+                }
+            };
             root_hub.info = info;
 
             let id = self.allocate_hub_id();
@@ -404,5 +369,163 @@ impl DeviceInfoOp for DeviceInfo {
 
     fn configuration_descriptors(&self) -> &[ConfigurationDescriptor] {
         &self.config_desc
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    extern crate std;
+
+    use alloc::{sync::Arc, vec, vec::Vec};
+    use core::{
+        future::Future,
+        pin::Pin,
+        ptr,
+        task::{Context, Poll, RawWaker, RawWakerVTable, Waker},
+    };
+    use std::sync::Mutex;
+
+    use futures::FutureExt;
+
+    use super::*;
+    use crate::backend::ty::{Event, EventHandlerOp};
+
+    struct TestCore {
+        calls: Arc<Mutex<Vec<&'static str>>>,
+        fail_root_hub: bool,
+    }
+
+    impl CoreOp for TestCore {
+        fn prepare_controller<'a>(&'a mut self) -> BoxFuture<'a, Result<(), USBError>> {
+            self.calls.lock().unwrap().push("prepare");
+            async { Ok(()) }.boxed()
+        }
+
+        fn root_hub(&mut self) -> Box<dyn HubOp> {
+            Box::new(TestRootHub {
+                calls: self.calls.clone(),
+                fail_init: self.fail_root_hub,
+            })
+        }
+
+        fn new_addressed_device<'a>(
+            &'a mut self,
+            _addr: DeviceAddressInfo,
+        ) -> BoxFuture<'a, Result<Box<dyn DeviceOp>, USBError>> {
+            async { Err(USBError::NotSupported) }.boxed()
+        }
+
+        fn create_event_handler(&mut self) -> Box<dyn EventHandlerOp> {
+            Box::new(TestEventHandler)
+        }
+
+        fn enable_irq(&mut self) -> Result<(), USBError> {
+            self.calls.lock().unwrap().push("enable");
+            Ok(())
+        }
+
+        fn disable_irq(&mut self) -> Result<(), USBError> {
+            self.calls.lock().unwrap().push("disable");
+            Ok(())
+        }
+
+        fn kernel(&self) -> &Kernel {
+            unreachable!("the lifecycle test does not probe devices")
+        }
+    }
+
+    struct TestRootHub {
+        calls: Arc<Mutex<Vec<&'static str>>>,
+        fail_init: bool,
+    }
+
+    impl HubOp for TestRootHub {
+        fn init<'a>(&'a mut self, info: HubInfo) -> BoxFuture<'a, Result<HubInfo, USBError>> {
+            self.calls.lock().unwrap().push("root-hub-init");
+            async move {
+                if self.fail_init {
+                    Err(USBError::NotInitialized)
+                } else {
+                    Ok(info)
+                }
+            }
+            .boxed()
+        }
+
+        fn changed_ports<'a>(&'a mut self) -> BoxFuture<'a, Result<Vec<PortEvent>, USBError>> {
+            async { Ok(Vec::new()) }.boxed()
+        }
+
+        fn slot_id(&self) -> u8 {
+            0
+        }
+    }
+
+    struct TestEventHandler;
+
+    impl EventHandlerOp for TestEventHandler {
+        fn acknowledge_irq(&self) -> bool {
+            false
+        }
+
+        fn drain_event(&self) -> Event {
+            Event::Nothing
+        }
+
+        fn rearm_irq(&self) {}
+    }
+
+    fn block_on_ready<F: Future>(mut future: F) -> F::Output {
+        let waker = noop_waker();
+        let mut context = Context::from_waker(&waker);
+        match unsafe { Pin::new_unchecked(&mut future) }.poll(&mut context) {
+            Poll::Ready(output) => output,
+            Poll::Pending => panic!("test future unexpectedly pending"),
+        }
+    }
+
+    fn noop_waker() -> Waker {
+        unsafe fn clone(_: *const ()) -> RawWaker {
+            RawWaker::new(ptr::null(), &VTABLE)
+        }
+        unsafe fn wake(_: *const ()) {}
+        unsafe fn wake_by_ref(_: *const ()) {}
+        unsafe fn drop(_: *const ()) {}
+
+        static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, wake, wake_by_ref, drop);
+
+        unsafe { Waker::from_raw(RawWaker::new(ptr::null(), &VTABLE)) }
+    }
+
+    #[test]
+    fn core_arms_irq_before_root_hub_commands() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut core = Core::new(TestCore {
+            calls: calls.clone(),
+            fail_root_hub: false,
+        });
+
+        block_on_ready(core.init()).unwrap();
+
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec!["prepare", "enable", "root-hub-init"]
+        );
+    }
+
+    #[test]
+    fn root_hub_failure_masks_controller_once() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mut core = Core::new(TestCore {
+            calls: calls.clone(),
+            fail_root_hub: true,
+        });
+
+        assert!(block_on_ready(core.init()).is_err());
+
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec!["prepare", "enable", "root-hub-init", "disable"]
+        );
     }
 }

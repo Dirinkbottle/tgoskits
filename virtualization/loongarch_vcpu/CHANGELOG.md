@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.17](https://github.com/rcore-os/tgoskits/compare/loongarch_vcpu-v0.5.16...loongarch_vcpu-v0.5.17) - 2026-08-27
+
+### Other
+
+- *(axvm)* unify host timer ownership ([#2190](https://github.com/rcore-os/tgoskits/pull/2190))
+
+## [0.5.16](https://github.com/rcore-os/tgoskits/compare/loongarch_vcpu-v0.5.15...loongarch_vcpu-v0.5.16) - 2026-08-20
+
+### Other
+
+- *(sync)* unify lock primitives in ax-sync ([#1956](https://github.com/rcore-os/tgoskits/pull/1956))
+
+## [0.5.15](https://github.com/rcore-os/tgoskits/compare/loongarch_vcpu-v0.5.14...loongarch_vcpu-v0.5.15) - 2026-08-09
+
+### Other
+
+- *(axvm)* unify guest devices and AArch64 timer ownership ([#1717](https://github.com/rcore-os/tgoskits/pull/1717))
+
 ## [0.5.14](https://github.com/rcore-os/tgoskits/compare/loongarch_vcpu-v0.5.13...loongarch_vcpu-v0.5.14) - 2026-08-03
 
 ### Other

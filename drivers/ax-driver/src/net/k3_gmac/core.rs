@@ -4,7 +4,7 @@ use alloc::collections::VecDeque;
 use core::ptr::NonNull;
 
 use dma_api::{ContiguousArray, DeviceDma, DmaDirection, DmaOp};
-use rd_net::{DmaBuffer, Event, NetError};
+use rd_net::{DmaBuffer, NetError, NetIrqSnapshot, RxCompletion, SubmitError};
 
 use super::{desc, desc::DmaDesc, mdio::Mdio, regs};
 
@@ -31,8 +31,8 @@ const CHANNEL: u32 = 0;
 /// 1_000_000 次 ≈ 1 秒，留充分余量。
 const RESET_TIMEOUT: usize = 1_000_000;
 
-/// 共享核心状态（包在 `Arc<SpinNoIrq<..>>` 里供 Interface/Queue/IRQ 共享）。
-pub type SharedCore = alloc::sync::Arc<ax_kspin::SpinNoIrq<K3GmacCore>>;
+/// 共享核心状态（包在 `Arc<SpinLock<..>>` 里供 Interface/Queue/IRQ 共享）。
+pub type SharedCore = alloc::sync::Arc<ax_sync::SpinLock<K3GmacCore>>;
 
 /// GMAC 驱动配置（从设备树解析 + 默认值）。
 #[derive(Debug, Clone, Copy)]
@@ -75,19 +75,19 @@ pub struct K3GmacCore {
     rx_next: usize,
     /// RX 环：下一个待预填的描述符索引（与 rx_next 同步推进，保留语义对称）。
     rx_fill: usize,
-    /// TX in-flight 缓冲追踪：`Some(bus_addr)` 表示该槽位已提交 DMA、尚未回收。
-    tx_buffers: [Option<u64>; QUEUE_SIZE],
-    /// RX in-flight 缓冲追踪：`Some(bus_addr)` 表示该槽位已预填 DMA、尚未回收。
-    rx_buffers: [Option<u64>; QUEUE_SIZE],
-    /// TX 已完成缓冲队列（由 reclaim_tx 推入，由上层 reclaim_tx_buffer 弹出）。
-    tx_done: VecDeque<u64>,
-    /// RX 已完成缓冲队列：(bus_addr, len)，由 reclaim_rx 推入，由上层弹出。
-    rx_done: VecDeque<(u64, usize)>,
+    /// TX in-flight 缓冲追踪：持有设备尚未回收的 DMA ownership token。
+    tx_buffers: [Option<DmaBuffer>; QUEUE_SIZE],
+    /// RX in-flight 缓冲追踪：持有设备尚未回收的 DMA ownership token。
+    rx_buffers: [Option<DmaBuffer>; QUEUE_SIZE],
+    /// TX 已完成缓冲队列（由 reclaim_tx 推入，由上层 reclaim 弹出）。
+    tx_done: VecDeque<DmaBuffer>,
+    /// RX 已完成缓冲队列（由 reclaim_rx 推入，由上层 reclaim 弹出）。
+    rx_done: VecDeque<RxCompletion>,
     irq_enabled: bool,
 }
 
 // SAFETY: K3GmacCore 持有 MMIO 指针和 DMA 内存句柄；本身无可变共享状态，
-// 并发安全由外层 SpinNoIrq 保证。
+// 并发安全由外层 SpinLock 保证。
 unsafe impl Send for K3GmacCore {}
 
 impl K3GmacCore {
@@ -126,8 +126,8 @@ impl K3GmacCore {
             tx_clean: 0,
             rx_next: 0,
             rx_fill: 0,
-            tx_buffers: [None; QUEUE_SIZE],
-            rx_buffers: [None; QUEUE_SIZE],
+            tx_buffers: core::array::from_fn(|_| None),
+            rx_buffers: core::array::from_fn(|_| None),
             tx_done: VecDeque::with_capacity(QUEUE_SIZE),
             rx_done: VecDeque::with_capacity(QUEUE_SIZE),
             irq_enabled: false,
@@ -158,53 +158,76 @@ impl K3GmacCore {
         self.irq_enabled
     }
 
-    /// 中断处理：读 DMA 通道状态、清中断、回收已完成的 TX/RX，返回事件位图。
-    /// 由 IRQ handler（try_lock 上下文）和轮询路径共用。
-    pub fn handle_irq(&mut self) -> Event {
-        let status = self.mmio.read(regs::dma_chan_status(CHANNEL));
-        // 快速短路：NIS|AIS 均未置位说明无任何收发/异常事件（可能是共享 IRQ 的
-        // 其他设备触发），直接返回，跳过 reclaim 与日志开销。
-        if status & (regs::DMA_CHAN_STATUS_NIS | regs::DMA_CHAN_STATUS_AIS) == 0 {
-            return Event::none();
+    /// 中断处理：在硬中断上半部读取并清除状态，同时屏蔽本通道 IRQ。
+    /// 描述符回收留给固定 owner 的 task-context 队列轮询。
+    pub fn handle_irq(&mut self) -> NetIrqSnapshot {
+        let snapshot = self.read_irq_snapshot();
+        if snapshot != NetIrqSnapshot::empty() {
+            self.disable_irq();
         }
-        // write-to-clear：回写清中断
+        snapshot
+    }
+
+    /// 读取并确认当前 IRQ 状态，但不改变 IRQ enable 位。
+    fn read_irq_snapshot(&mut self) -> NetIrqSnapshot {
+        let status = self.mmio.read(regs::dma_chan_status(CHANNEL));
+        // 快速短路：NIS|AIS 均未置位说明无任何收发/异常事件。
+        if status & (regs::DMA_CHAN_STATUS_NIS | regs::DMA_CHAN_STATUS_AIS) == 0 {
+            return NetIrqSnapshot::empty();
+        }
+        // write-to-clear：回写清中断。
         self.mmio.write(regs::dma_chan_status(CHANNEL), status);
-        // 仅 fatal bus error 上报告警，普通事件降到 trace 避免刷屏
+        // 仅 fatal bus error 上报告警，普通事件降到 trace 避免刷屏。
         if status & regs::DMA_CHAN_STATUS_FBE != 0 {
             log::warn!("k3-gmac: DMA fatal bus error, status={status:#x}");
         } else {
             log::trace!("k3-gmac: DMA channel status={status:#x}");
         }
-        self.reclaim_tx();
-        self.reclaim_rx();
+        let mut snapshot = NetIrqSnapshot::empty();
+        if (status & (regs::DMA_CHAN_STATUS_TI | regs::DMA_CHAN_STATUS_TBU)) != 0 {
+            snapshot = snapshot.union(NetIrqSnapshot::TX);
+        }
+        if (status & (regs::DMA_CHAN_STATUS_RI | regs::DMA_CHAN_STATUS_RBU)) != 0 {
+            snapshot = snapshot.union(NetIrqSnapshot::RX);
+        }
+        if status & regs::DMA_CHAN_STATUS_FBE != 0 || snapshot == NetIrqSnapshot::empty() {
+            snapshot = snapshot.union(NetIrqSnapshot::ERROR);
+        }
+        snapshot
+    }
 
-        let mut event = Event::none();
-        if (status & (regs::DMA_CHAN_STATUS_TI | regs::DMA_CHAN_STATUS_TBU)) != 0
-            || !self.tx_done.is_empty()
-        {
-            event.tx_queue.insert(QUEUE_ID);
+    /// 固定 owner 在重新打开 IRQ 前后检查一次状态窗口。
+    pub fn rearm_and_snapshot(&mut self) -> NetIrqSnapshot {
+        let before = self.read_irq_snapshot();
+        self.enable_irq();
+        let after = self.read_irq_snapshot();
+        let pending = before.union(after);
+        if pending != NetIrqSnapshot::empty() {
+            self.disable_irq();
         }
-        if (status & (regs::DMA_CHAN_STATUS_RI | regs::DMA_CHAN_STATUS_RBU)) != 0
-            || !self.rx_done.is_empty()
-        {
-            event.rx_queue.insert(QUEUE_ID);
-        }
-        event
+        pending
+    }
+
+    /// Stop the DMA engine before the runtime releases queue ownership.
+    pub fn shutdown(&mut self) -> Result<(), NetError> {
+        self.disable_irq();
+        self.stop_dma();
+        self.reset_dma()
     }
 
     // --- TX ---
 
-    pub fn submit_tx(&mut self, buffer: DmaBuffer) -> Result<(), NetError> {
+    pub fn submit_tx(&mut self, buffer: DmaBuffer) -> Result<(), SubmitError> {
         self.reclaim_tx();
         let index = self.tx_next;
         if self.tx_buffers[index].is_some() || desc::tx_owned(self.tx_desc(index)) {
-            return Err(NetError::Retry);
+            return Err(SubmitError::new(buffer, NetError::Retry));
         }
 
-        let len = buffer.len.min(BUFFER_SIZE);
+        let len = buffer.len().min(BUFFER_SIZE);
         let checksum = self.checksum_offload;
-        desc::prepare_tx(self.tx_desc_mut(index), buffer.bus_addr, len, checksum);
-        self.tx_buffers[index] = Some(buffer.bus_addr);
+        desc::prepare_tx(self.tx_desc_mut(index), buffer.bus_addr(), len, checksum);
+        self.tx_buffers[index] = Some(buffer);
         self.tx_next = next(index);
         // K3 非一致性：clean 描述符 cache line，让 DMA 看到 OWN 位和地址
         self.flush_tx_desc(index);
@@ -218,21 +241,21 @@ impl K3GmacCore {
         Ok(())
     }
 
-    pub fn reclaim_tx_buffer(&mut self) -> Option<u64> {
+    pub fn reclaim_tx_buffer(&mut self) -> Option<DmaBuffer> {
         self.reclaim_tx();
         self.tx_done.pop_front()
     }
 
     // --- RX ---
 
-    pub fn submit_rx(&mut self, buffer: DmaBuffer) -> Result<(), NetError> {
+    pub fn submit_rx(&mut self, buffer: DmaBuffer) -> Result<(), SubmitError> {
         let index = self.rx_fill;
         if self.rx_buffers[index].is_some() || desc::rx_owned(self.rx_desc(index)) {
-            return Err(NetError::Retry);
+            return Err(SubmitError::new(buffer, NetError::Retry));
         }
 
-        desc::prepare_rx(self.rx_desc_mut(index), buffer.bus_addr);
-        self.rx_buffers[index] = Some(buffer.bus_addr);
+        desc::prepare_rx(self.rx_desc_mut(index), buffer.bus_addr());
+        self.rx_buffers[index] = Some(buffer);
         self.rx_fill = next(index);
         // K3 非一致性：clean 描述符 cache line，让 DMA 看到 OWN|BUF1V|IOC
         self.flush_rx_desc(index);
@@ -246,7 +269,7 @@ impl K3GmacCore {
         Ok(())
     }
 
-    pub fn reclaim_rx_buffer(&mut self) -> Option<(u64, usize)> {
+    pub fn reclaim_rx_buffer(&mut self) -> Option<RxCompletion> {
         self.reclaim_rx();
         self.rx_done.pop_front()
     }
@@ -558,10 +581,10 @@ impl K3GmacCore {
             .update(regs::dma_chan_tx_control(CHANNEL), 0, regs::DMA_CONTROL_ST);
     }
 
-    /// 回收已完成的 TX 描述符：DMA 清 OWN 后，将缓冲地址推入 `tx_done`。
-    /// 由 `handle_irq`（IRQ 上下文）和 `submit_tx`/`reclaim_tx_buffer`（数据面）调用。
+    /// 回收已完成的 TX 描述符：DMA 清 OWN 后，将完整 DMA token 推入 `tx_done`。
+    /// 只在 task context 的 submit/reclaim 路径调用。
     fn reclaim_tx(&mut self) {
-        while let Some(bus_addr) = self.tx_buffers[self.tx_clean] {
+        while self.tx_buffers[self.tx_clean].is_some() {
             // K3 非一致性：读 DMA 回写状态前 invalidate，丢弃 CPU 侧脏 cache
             self.inval_tx_desc(self.tx_clean);
             if desc::tx_owned(self.tx_desc(self.tx_clean)) {
@@ -574,16 +597,18 @@ impl K3GmacCore {
                 );
             }
             desc::clear(self.tx_desc_mut(self.tx_clean));
-            self.tx_buffers[self.tx_clean] = None;
-            self.tx_done.push_back(bus_addr);
+            let buffer = self.tx_buffers[self.tx_clean]
+                .take()
+                .expect("TX buffer disappeared after descriptor completion");
+            self.tx_done.push_back(buffer);
             self.tx_clean = next(self.tx_clean);
         }
     }
 
-    /// 回收已完成的 RX 描述符：DMA 填入数据并清 OWN 后，将 (bus_addr, len) 推入 `rx_done`。
-    /// 由 `handle_irq`（IRQ 上下文）和 `reclaim_rx_buffer`（数据面）调用。
+    /// 回收已完成的 RX 描述符：DMA 填入数据并清 OWN 后，将 DMA token 和长度推入 `rx_done`。
+    /// 只在 task context 的 reclaim 路径调用。
     fn reclaim_rx(&mut self) {
-        while let Some(submitted) = self.rx_buffers[self.rx_next] {
+        while self.rx_buffers[self.rx_next].is_some() {
             // K3 非一致性：读 DMA 回写状态前 invalidate，丢弃 CPU 侧脏 cache
             self.inval_rx_desc(self.rx_next);
             if desc::rx_owned(self.rx_desc(self.rx_next)) {
@@ -604,9 +629,14 @@ impl K3GmacCore {
             };
 
             desc::clear(self.rx_desc_mut(self.rx_next));
-            self.rx_buffers[self.rx_next] = None;
-            // 无论成功/出错都归还缓冲（出错时 len=0），上层重新投递
-            self.rx_done.push_back((submitted, len));
+            let buffer = self.rx_buffers[self.rx_next]
+                .take()
+                .expect("RX buffer disappeared after descriptor completion");
+            // 无论成功/出错都归还缓冲（出错时 len=0），上层重新投递。
+            self.rx_done.push_back(RxCompletion {
+                buffer,
+                packet_len: len,
+            });
             self.rx_next = next(self.rx_next);
         }
     }

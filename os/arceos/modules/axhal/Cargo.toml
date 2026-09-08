@@ -1,6 +1,6 @@
 [package]
 name = "ax-hal"
-version = "0.5.30"
+version = "0.6.2"
 repository = "https://github.com/rcore-os/tgoskits"
 edition.workspace = true
 authors = ["Yuekai Jia <equation618@gmail.com>"]
@@ -11,11 +11,6 @@ license.workspace = true
 smp = [
     "axplat-dyn/smp",
     "ax-plat/smp",
-]
-irq = [
-    "ax-plat/irq",
-    "axplat-dyn/irq",
-    "dep:ax-kspin",
 ]
 fp-simd = [
     "ax-cpu/fp-simd",
@@ -30,33 +25,36 @@ paging = [
 tls = ["ax-cpu/tls", "cpu-local/tls", "axplat-dyn/tls"]
 uspace = ["paging", "ax-cpu/uspace", "axplat-dyn/uspace"]
 hv = [
-    "paging",
-    "ax-cpu/arm-el2",
-    "ax-cpu/exception-table",
-    "axplat-dyn/hv",
+  "paging",
+  "ax-cpu/exception-table",
+  "axplat-dyn/hv",
 ]
-host-test = ["cpu-local/host-test", "ax-cpu/host-test", "ax-percpu/host-test"]
-
+host-test = [
+    "cpu-local/host-test",
+    "ax-cpu/host-test",
+    "ax-percpu/host-test",
+    "ax-sync/host-test",
+]
 default = []
-ipi = ["irq"]
+ipi = []
 
 [dependencies]
 ax-alloc = { workspace = true, optional = true }
 ax-cpu.workspace = true
 cpu-local.workspace = true
-ax-kspin = { workspace = true, optional = true }
 ax-plat.workspace = true
+ax-lazyinit.workspace = true
 cfg-if.workspace = true
 fdt-parser = "0.4"
 heapless = "0.9"
-ax-kernel-guard.workspace = true
+ax-sync.workspace = true
 log.workspace = true
 ax-memory-addr.workspace = true
 ax-percpu.workspace = true
 axplat-dyn = { workspace = true, default-features = false }
 page-table-generic = { workspace = true, optional = true }
 rdrive.workspace = true
-spin.workspace = true
+thiserror.workspace = true
 
 [build-dependencies]
 quote = { workspace = true }
