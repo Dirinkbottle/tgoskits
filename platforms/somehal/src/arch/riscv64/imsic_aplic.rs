@@ -8,9 +8,9 @@
 use alloc::{format, vec::Vec};
 use core::num::NonZeroU32;
 
-use ax_kspin::SpinNoIrq;
 use ax_riscv_aplic::{Aplic, MsiConfig, MsiTarget, SourceTrigger};
 use ax_riscv_imsic::{self, ImsicGeometry};
+use ax_sync::SpinLock as SpinNoIrq;
 use kernutil::StaticCell;
 use rdif_intc::Interface;
 use rdif_msi::{
@@ -57,7 +57,7 @@ impl EidAllocator {
     }
 
     fn allocate(&self) -> Option<u32> {
-        let mut bmp = self.bitmap.lock();
+        let mut bmp = self.bitmap.lock_irqsave();
         // Fast path: scan from next_hint to max.
         for eid in bmp.next_hint..self.max {
             let (word, bit) = (eid as usize / 64, 1u64 << (eid % 64));
@@ -83,7 +83,7 @@ impl EidAllocator {
         if eid == 0 || eid >= self.max {
             return;
         }
-        let mut bmp = self.bitmap.lock();
+        let mut bmp = self.bitmap.lock_irqsave();
         let (word, bit) = (eid as usize / 64, 1u64 << (eid % 64));
         bmp.bits[word] &= !bit;
         if eid < bmp.next_hint {
@@ -370,7 +370,7 @@ impl Interface for RiscvAplicDriver {
             .copied()
             .and_then(SourceTrigger::from_fdt_interrupt_spec);
         if let Some(trigger) = trigger {
-            self.source_trigger.lock()[source as usize] = Some(trigger);
+            self.source_trigger.lock_irqsave()[source as usize] = Some(trigger);
         }
         Ok(rdif_intc::ControllerIrqTranslation::new(HwIrq(source)))
     }
@@ -397,7 +397,7 @@ impl Interface for RiscvAplicDriver {
 
             // Allocate an EID from the unified IMSIC pool on first enable.
             let eid = {
-                let mut guard = self.source_eid.lock();
+                let mut guard = self.source_eid.lock_irqsave();
                 match guard[idx] {
                     Some(existing) => existing,
                     None => {
@@ -420,7 +420,7 @@ impl Interface for RiscvAplicDriver {
             // QEMU virt GPIO 模型下，所有中断源 assert 时 level=1（raise）、deassert
             // 时 level=0（lower），因此 LevelHigh 是正确的缺省值。
             let trigger = {
-                let guard = self.source_trigger.lock();
+                let guard = self.source_trigger.lock_irqsave();
                 guard[source.get() as usize]
             };
             let trigger = trigger.unwrap_or(SourceTrigger::LevelHigh);

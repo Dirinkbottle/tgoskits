@@ -72,7 +72,7 @@ static KERNEL_PAGE_TABLE_ADDR: AtomicUsize = AtomicUsize::new(0);
 static TIMEBASE_FREQ: AtomicUsize = AtomicUsize::new(0);
 
 #[cfg(feature = "thead-mae")]
-fn pte_memory_type_bits(mem_attr: MemAttributes) -> usize {
+fn thead_mae_pte_bits(mem_attr: MemAttributes) -> usize {
     match mem_attr {
         MemAttributes::Device => PTE_THEAD_IO,
         MemAttributes::Uncached => PTE_THEAD_NOCACHE,
@@ -81,7 +81,7 @@ fn pte_memory_type_bits(mem_attr: MemAttributes) -> usize {
 }
 
 #[cfg(all(not(feature = "thead-mae"), feature = "svpbmt"))]
-fn pte_memory_type_bits(mem_attr: MemAttributes) -> usize {
+fn thead_mae_pte_bits(mem_attr: MemAttributes) -> usize {
     match mem_attr {
         MemAttributes::Device => PTE_PBMT_IO,
         MemAttributes::Uncached => PTE_PBMT_NC,
@@ -90,12 +90,12 @@ fn pte_memory_type_bits(mem_attr: MemAttributes) -> usize {
 }
 
 #[cfg(not(any(feature = "thead-mae", feature = "svpbmt")))]
-fn pte_memory_type_bits(_mem_attr: MemAttributes) -> usize {
+fn thead_mae_pte_bits(_mem_attr: MemAttributes) -> usize {
     0
 }
 
 #[cfg(feature = "thead-mae")]
-fn pte_memory_type(bits: usize) -> MemAttributes {
+fn thead_mae_mem_attr(bits: usize) -> MemAttributes {
     match bits & PTE_THEAD_MT_MASK {
         PTE_THEAD_IO => MemAttributes::Device,
         PTE_THEAD_NOCACHE => MemAttributes::Uncached,
@@ -104,7 +104,7 @@ fn pte_memory_type(bits: usize) -> MemAttributes {
 }
 
 #[cfg(all(not(feature = "thead-mae"), feature = "svpbmt"))]
-fn pte_memory_type(bits: usize) -> MemAttributes {
+fn thead_mae_mem_attr(bits: usize) -> MemAttributes {
     match bits & PTE_PBMT_MASK {
         PTE_PBMT_IO => MemAttributes::Device,
         PTE_PBMT_NC => MemAttributes::Uncached,
@@ -113,7 +113,7 @@ fn pte_memory_type(bits: usize) -> MemAttributes {
 }
 
 #[cfg(not(any(feature = "thead-mae", feature = "svpbmt")))]
-fn pte_memory_type(_bits: usize) -> MemAttributes {
+fn thead_mae_mem_attr(_bits: usize) -> MemAttributes {
     MemAttributes::Normal
 }
 

@@ -2,7 +2,7 @@ use core::mem::size_of;
 
 #[cfg(not(feature = "tls"))]
 use cpu_local::EXECUTION_CONTEXT_CPU_BASE_OFFSET;
-#[cfg(feature = "fp-simd")]
+#[cfg(any(feature = "fp-simd", feature = "vector"))]
 use riscv::register::sstatus;
 #[cfg(feature = "vector")]
 use riscv::register::sstatus::VS;

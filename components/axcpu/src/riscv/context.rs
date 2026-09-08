@@ -6,7 +6,7 @@ use core::{
 
 use ax_memory_addr::VirtAddr;
 use cpu_local::{ExecutionContextHeader, PreparedContextSwitch};
-use riscv::register::sstatus::{self, FS};
+use riscv::register::sstatus::{self, FS, VS};
 
 use crate::{KernelTlsBase, TaskLocalState};
 

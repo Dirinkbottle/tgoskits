@@ -47,7 +47,7 @@ pub unsafe extern "C" fn _head() -> ! {
         ".word 0",
         ".global _efi_header_end",
         "_efi_header_end:",
-        raw_entry = sym riscv64_raw_entry,
+        kernel_entry = sym kernel_entry,
         text_offset = const RISCV_LINUX_IMAGE_TEXT_OFFSET,
         flags = const RISCV_LINUX_IMAGE_FLAGS,
         version = const RISCV_LINUX_IMAGE_VERSION,
