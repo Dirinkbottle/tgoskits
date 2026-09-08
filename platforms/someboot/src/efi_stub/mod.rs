@@ -1,4 +1,4 @@
-#[cfg(target_arch = "x86_64")]
+#[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
 use core::arch::naked_asm;
 use core::{
     ffi::c_void,
@@ -80,7 +80,41 @@ pub unsafe extern "C" fn __x86_64_efi_pe_entry() -> Status {
     )
 }
 
-unsafe extern "C" fn efi_pe_entry_main(
+/// RISC-V EFI ABI wrapper that establishes the image global pointer before
+/// executing Rust and preserves the firmware's callee state on error return.
+#[cfg(target_arch = "riscv64")]
+#[unsafe(naked)]
+#[unsafe(no_mangle)]
+#[unsafe(link_section = ".text")]
+pub unsafe extern "efiapi" fn __riscv64_efi_pe_entry() -> Status {
+    naked_asm!(
+        "addi sp, sp, -48",
+        "sd ra, 40(sp)",
+        "sd s0, 32(sp)",
+        "sd s1, 24(sp)",
+        "sd gp, 16(sp)",
+        "mv s0, a0",
+        "mv s1, a1",
+        ".option push",
+        ".option norelax",
+        "lla gp, __global_pointer$",
+        ".option pop",
+        "call {relocate}",
+        "mv a0, s0",
+        "mv a1, s1",
+        "call {entry}",
+        "ld gp, 16(sp)",
+        "ld s1, 24(sp)",
+        "ld s0, 32(sp)",
+        "ld ra, 40(sp)",
+        "addi sp, sp, 48",
+        "ret",
+        relocate = sym relocate,
+        entry = sym efi_pe_entry_main,
+    )
+}
+
+pub(crate) unsafe extern "C" fn efi_pe_entry_main(
     image_handle: Handle,
     system_table: *const ::core::ffi::c_void,
 ) -> Status {
@@ -95,12 +129,13 @@ unsafe extern "C" fn efi_pe_entry_main(
         if Arch::efi_enter_kernel(system_table) {
             Status::SUCCESS
         } else {
-            unreachable!()
+            println!("UEFI architecture handoff is unsupported.");
+            Status::UNSUPPORTED
         }
     }
 }
 
-#[cfg(not(target_arch = "x86_64"))]
+#[cfg(not(any(target_arch = "x86_64", target_arch = "riscv64")))]
 #[unsafe(export_name = "efi_pe_entry")]
 #[unsafe(link_section = ".text")]
 pub unsafe extern "efiapi" fn efi_pe_entry(

@@ -23,6 +23,9 @@
 
 ## 快速开始
 
+SpacemiT K3 COM260 IFX 开发板通过现有 GRUB2/UEFI 启动 StarryOS 的打包、部署与
+回退步骤见 [K3 GRUB2/UEFI 启动指南](docs/k3-grub2-uefi.md)。
+
 ```bash
 # 进入工作区目录
 cd os/StarryOS

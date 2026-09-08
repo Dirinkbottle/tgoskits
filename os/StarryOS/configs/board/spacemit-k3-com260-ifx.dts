@@ -7946,8 +7946,8 @@
 	};
 
 	chosen {
-		bootargs = "console=ttyS0,115200 earlycon=sbi root=PARTLABEL=rootfs rw";
-		boot-hartid = <0x00>;
+		bootargs = "console=ttyS0,115200 earlycon=sbi root=PARTLABEL=writable bootfs=PARTUUID=3ae56870-fdf8-4df5-acc0-6d0edc70637a rw";
+		boot-hartid = <0>;
 		stdout-path = "serial0:115200";
 	};
 

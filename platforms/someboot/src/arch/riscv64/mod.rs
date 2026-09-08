@@ -4,6 +4,8 @@ mod _macros;
 mod addrspace;
 mod boot;
 mod console;
+#[cfg(efi)]
+mod efi;
 mod entry;
 pub(crate) mod irq;
 mod paging;
@@ -473,8 +475,26 @@ impl ArchTrait for Arch {
         }
     }
 
-    unsafe fn efi_enter_kernel(_system_table: *const ::core::ffi::c_void) -> bool {
-        false
+    unsafe fn efi_enter_kernel(system_table: *const ::core::ffi::c_void) -> bool {
+        #[cfg(efi)]
+        {
+            crate::efi_stub::setup_service(system_table);
+            let Some(hart_id) = efi::boot_hart_id() else {
+                println!("Failed to get RISC-V UEFI boot hart ID.");
+                return false;
+            };
+            println!("RISC-V UEFI boot hart ID: {hart_id}.");
+            let Some(fdt_addr) = crate::fdt::fdt_addr_phys() else {
+                println!("RISC-V UEFI did not provide a valid FDT.");
+                return false;
+            };
+            unsafe { crate::arch::entry::enter_from_efi(hart_id, fdt_addr) }
+        }
+        #[cfg(not(efi))]
+        {
+            let _ = system_table;
+            false
+        }
     }
 }
 

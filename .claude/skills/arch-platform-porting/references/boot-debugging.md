@@ -162,6 +162,38 @@ Use this order when auditing an early boot port:
 - Keep FDT `reg` hart IDs as firmware CPU IDs and map them onto dense logical CPU IDs separately. On VisionFive2, `cpu@0` is a disabled S7 management hart while the usable U74 cores are `cpu@1` through `cpu@4`; full-core boot should therefore start from hart 1 and bring up harts 2-4, not fall back to single-core mode.
 - If a RISC-V board traps when secondaries are released, dump `/cpus` from the boot FDT before changing `max_cpu_num`; disabled or non-OS CPU nodes are a common cause of `cpu_on` targeting the wrong hart.
 
+## RISC-V GRUB/UEFI Hybrid Image Notes
+
+- GRUB's RISC-V EFI `linux` path requires a PE32+ EFI application; a valid
+  Linux Image header alone is not enough. For an EFI-enabled `someboot` image,
+  verify both contracts: `MZ` at offset zero, PE header offset at `0x3c`,
+  RISC-V64 machine `0x5064`, EFI Application subsystem, and the ordinary
+  RISC-V image magic/text offset fields.
+- The two bytes spelling `MZ` are an executable `c.li s4, -13`. The following
+  non-compressed jump must still reach the direct SBI trampoline so the exact
+  same image can boot through QEMU `-kernel` or another Linux-image loader.
+- RISC-V EFI entry must establish `gp` in naked position-independent assembly
+  before calling Rust. Preserve the firmware image handle and system table,
+  apply relative relocations exactly once, then use an EFI-only continuation;
+  do not re-enter the direct path that clears BSS and overwrites FDT state.
+- Select the boot hart from `RISCV_EFI_BOOT_PROTOCOL` revision `0x00010000`.
+  If the protocol is unavailable or its callback fails, accept only a valid
+  32-bit or 64-bit `/chosen/boot-hartid` from the firmware FDT. If neither is
+  available, return an explicit EFI error instead of guessing hart zero.
+- After `ExitBootServices`, keep the EFI memory map authoritative. Do not add
+  the FDT's whole RAM range a second time: it overlaps firmware reservations
+  and the PE-loaded kernel. An EFI-enabled image entered directly through SBI
+  still has no EFI table and must continue to build its memory map from FDT.
+- EFI guarantees page alignment for the loaded PE image, not huge-page
+  alignment. GRUB may place the DTB exactly at `image_base + SizeOfImage`, so
+  reserve and high-map only the page-rounded image extent. Rounding the
+  physical end or mapping length to 2 MiB can claim or alias the adjacent DTB
+  and make the first post-`VM Load Offset` memory-map transition hang.
+- Run both OVMF and direct-image QEMU cases after changing the header or entry
+  wrapper. Artifact inspection alone cannot prove that firmware state survives
+  `ExitBootServices`, while an OVMF-only test cannot prove the Linux-image
+  jump remains executable.
+
 ## RK3576 ROCK 4D Board Notes
 
 The maintained ROCK 4D path uses the repository DTB and a U-Boot/firmware stack

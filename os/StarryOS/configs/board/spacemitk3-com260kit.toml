@@ -5,11 +5,19 @@ features = [
   "ax-driver/k3-pxa-uart",
   "ax-driver/k3-ufs",
   "ax-driver/k3-usb",
-  "ax-driver/k3-gmac",
   "ax-driver/k3-pinctrl",
   "ax-driver/zicbom",
   "axplat-dyn/zicbom",
+  "axplat-dyn/svpbmt",
+  "axplat-dyn/efi",
   "starry-kernel/vector",
 ]
 log = "Info"
 target = "riscv64gc-unknown-none-elf"
+
+[grub]
+dts = "spacemit-k3-com260-ifx.dts"
+install_dir = "/boot/starryos"
+root_label = "writable"
+menu_id = "starryos-k3-com260-ifx"
+menu_title = "StarryOS (SpacemiT K3 COM260 IFX)"

@@ -19,6 +19,7 @@ mod args;
 pub mod board;
 pub mod build;
 pub mod config;
+pub mod grub;
 pub mod kmod;
 pub mod perf;
 pub mod quick_start;
@@ -54,6 +55,7 @@ impl Starry {
             Command::Test(args) => self.test(args).await,
             Command::App(args) => self.app_command(args).await,
             Command::Kmod(args) => self.kmod(args).await,
+            Command::Grub(args) => grub::execute(self, args).await,
         }
     }
 

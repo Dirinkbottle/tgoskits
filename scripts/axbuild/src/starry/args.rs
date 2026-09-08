@@ -2,7 +2,7 @@ use std::{fmt, path::PathBuf};
 
 use clap::{Args, Subcommand, ValueEnum};
 
-use super::{app, kmod, quick_start, rootfs, test};
+use super::{app, grub, kmod, quick_start, rootfs, test};
 use crate::context::StarryCliArgs;
 
 /// StarryOS subcommands
@@ -33,6 +33,8 @@ pub enum Command {
     Board(ArgsBoard),
     /// Build StarryOS loadable kernel modules (`.ko`)
     Kmod(kmod::ArgsKmod),
+    /// Package StarryOS for GRUB2/UEFI
+    Grub(grub::ArgsGrub),
 }
 
 #[derive(Args, Clone)]

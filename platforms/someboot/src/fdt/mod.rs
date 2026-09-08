@@ -57,6 +57,24 @@ fn fdt_base() -> Option<fdt_raw::Fdt<'static>> {
     Some(fdt)
 }
 
+#[cfg(all(efi, target_arch = "riscv64"))]
+pub(crate) fn boot_hart_id() -> Option<usize> {
+    boot_hart_id_from_fdt(fdt_base()?)
+}
+
+#[cfg(any(all(efi, target_arch = "riscv64"), test))]
+fn boot_hart_id_from_fdt(fdt: fdt_raw::Fdt<'_>) -> Option<usize> {
+    let property = fdt.find_by_path("/chosen")?.find_property("boot-hartid")?;
+    match property.len() {
+        4 => property
+            .as_u32_iter()
+            .next()
+            .map(|hart_id| hart_id as usize),
+        8 => usize::try_from(property.as_u64()?).ok(),
+        _ => None,
+    }
+}
+
 pub(crate) fn init_with_alloc() -> Option<()> {
     let fdt_addr = fdt_addr()?;
     // SAFETY: the global FDT address points to firmware memory or the saved
@@ -260,6 +278,35 @@ mod tests {
     }
 
     #[test]
+    fn boot_hart_id_accepts_exact_u32_and_u64_properties() {
+        for cells in [&[7][..], &[0, 9][..]] {
+            let fdt = fdt_with_boot_hart_property(prop_u32s("boot-hartid", cells));
+            let encoded = fdt.encode();
+            let raw = fdt_raw::Fdt::from_bytes(encoded.as_ref()).expect("parse boot-hart FDT");
+
+            assert_eq!(
+                boot_hart_id_from_fdt(raw),
+                Some(cells[cells.len() - 1] as usize)
+            );
+        }
+    }
+
+    #[test]
+    fn boot_hart_id_rejects_missing_or_malformed_properties() {
+        let without_chosen = minimal_cpu_fdt().encode();
+        let raw =
+            fdt_raw::Fdt::from_bytes(without_chosen.as_ref()).expect("parse FDT without chosen");
+        assert_eq!(boot_hart_id_from_fdt(raw), None);
+
+        for bytes in [vec![0, 0, 1], vec![0, 0, 0, 0, 0, 1]] {
+            let fdt = fdt_with_boot_hart_property(Property::new("boot-hartid", bytes));
+            let encoded = fdt.encode();
+            let raw = fdt_raw::Fdt::from_bytes(encoded.as_ref()).expect("parse malformed FDT");
+            assert_eq!(boot_hart_id_from_fdt(raw), None);
+        }
+    }
+
+    #[test]
     fn platform_name_prefers_root_model() {
         let mut fdt = minimal_cpu_fdt();
         let root = fdt.root_id();
@@ -308,6 +355,13 @@ mod tests {
         add_cpu(&mut fdt, cpus, 3, Some("ok"), true);
         add_cpu(&mut fdt, cpus, 4, None, true);
         add_cpu(&mut fdt, cpus, 5, None, false);
+        fdt
+    }
+
+    fn fdt_with_boot_hart_property(property: Property) -> Fdt {
+        let mut fdt = minimal_cpu_fdt();
+        let chosen = fdt.add_node(fdt.root_id(), Node::new("chosen"));
+        fdt.node_mut(chosen).unwrap().set_property(property);
         fdt
     }
 

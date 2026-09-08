@@ -1,0 +1,9 @@
+features = [
+  "ax-runtime/rtc",
+  "ax-driver/serial",
+  "ax-driver/nvme",
+  "axplat-dyn/efi",
+]
+max_cpu_num = 4
+log = "Info"
+target = "riscv64gc-unknown-none-elf"

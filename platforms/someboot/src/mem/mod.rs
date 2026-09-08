@@ -18,8 +18,6 @@ use crate::{ArchTrait, DCacheOp, arch::Arch, smp::cpu_area_region};
 pub const KB: usize = 1024;
 pub const MB: usize = 1024 * KB;
 pub const GB: usize = 1024 * MB;
-pub const KIMAGE_MAP_ALIGN: usize = 2 * MB;
-
 static mut VM_LOAD_OFFSET: isize = 0;
 static MEMORY_MAP: StaticCell<MemoryMap> = StaticCell::new(MemoryMap::new());
 
@@ -39,10 +37,17 @@ pub(crate) fn setup_entry(
 ) {
     unsafe {
         KIMAGE_START = Some(kernel_start);
-        KIMAGE_END = kernel_end.as_usize().align_up(KIMAGE_MAP_ALIGN).into();
+        KIMAGE_END = kernel_image_end(kernel_end.as_usize(), page_size()).into();
 
         VM_LOAD_OFFSET = kernel_start.as_usize() as isize - kernel_start_link.as_usize() as isize;
     }
+}
+
+fn kernel_image_end(kernel_end: usize, page_size: usize) -> usize {
+    // EFI may place boot data immediately after SizeOfImage. Reserving to a
+    // huge-page boundary would claim that firmware-owned data whenever the PE
+    // image base is only page aligned.
+    kernel_end.align_up(page_size)
 }
 
 pub fn stack_size() -> usize {
@@ -124,9 +129,6 @@ pub(crate) fn mem_constants_and_cache_line_rules_hold_for_test() -> bool {
     assert!(MB == 1024 * KB);
     assert!(GB == 1024 * MB);
 
-    // KIMAGE_MAP_ALIGN
-    assert!(KIMAGE_MAP_ALIGN == 2 * MB);
-
     // cache_line_range: valid inputs
     let result = cache_line_range(0x1000, 64, 64).unwrap();
     assert!(result.0 == 0x1000); // aligned down
@@ -177,6 +179,15 @@ pub(crate) fn _fixmap_io(paddr: usize) -> *mut u8 {
 }
 
 pub(crate) fn early_init() {
+    // EFI has already published its authoritative memory map after
+    // ExitBootServices. Re-adding the FDT's whole RAM range would overlap
+    // firmware reservations and the PE-loaded image. The same EFI-enabled
+    // binary still takes this FDT path when entered directly through SBI.
+    #[cfg(efi)]
+    if !crate::efi_stub::is_uefi_available() {
+        crate::fdt::init_memory_map();
+    }
+    #[cfg(not(efi))]
     crate::fdt::init_memory_map();
 
     let kernel_range = kimage_range();
@@ -305,6 +316,17 @@ mod tests {
         assert_eq!(cache_line_range(0x1000, 1, 63), None);
         assert_eq!(cache_line_range(usize::MAX, 2, 64), None);
     }
+
+    #[test]
+    fn efi_image_range_does_not_claim_an_adjacent_fdt() {
+        let image_start = 0x2_f697_9000;
+        let image_end = 0x2_f8f9_6000;
+        let fdt_start = image_end;
+        let image_range = image_start..kernel_image_end(image_end, 0x1000);
+
+        assert_eq!(image_range.end, image_end);
+        assert!(!image_range.contains(&fdt_start));
+    }
 }
 
 #[cfg(all(axtest, feature = "axtest"))]
@@ -313,8 +335,6 @@ pub(crate) fn mem_constants_and_types_hold_for_test() -> bool {
     assert_eq!(KB, 1024);
     assert_eq!(MB, 1024 * 1024);
     assert_eq!(GB, 1024 * 1024 * 1024);
-    assert_eq!(KIMAGE_MAP_ALIGN, 2 * MB);
-
     // Test MemoryMap capacity
     assert_eq!(MEMORY_MAP_CAPACITY, 512);
 
