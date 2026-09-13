@@ -10,13 +10,15 @@
 //!     - `smp`: Enable SMP (symmetric multiprocessing) support.
 //!     - `fp-simd`: Enable floating point and SIMD support.
 //! - Interrupts:
-//!     - Interrupt handling is always available.
+//!     - `irq`: Enable interrupt handling support.
 //! - Memory
 //!     - `alloc`: Enable dynamic memory allocation.
 //!     - `paging`: Enable page table manipulation.
 //!     - `tls`: Enable thread-local storage.
 //! - Task management
-//!     - Multi-threading and timer-driven scheduling are always available.
+//!     - `multitask`: Enable multi-threading support.
+//!     - `sched-rr`: Use the Round-robin preemptive scheduler.
+//!     - `sched-cfs`: Use the Completely Fair Scheduler (CFS) preemptive scheduler.
 //! - Upperlayer stacks
 //!     - `fs`: Enable file system support.
 //!     - `ext4fs`: Enable the ext4 filesystem.
@@ -43,9 +45,6 @@ pub use core::{arch, cell, cmp, hint, marker, mem, ops, ptr, slice, str};
 
 #[macro_use]
 mod macros;
-mod error;
-
-pub use error::{StdError, StdResult};
 
 pub mod env;
 pub mod io;

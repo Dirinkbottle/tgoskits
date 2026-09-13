@@ -5,6 +5,7 @@ features = [
   "ax-driver/k3-pxa-uart",
   "ax-driver/k3-ufs",
   "ax-driver/k3-usb",
+  "ax-driver/usb-serial",
   "ax-driver/k3-pinctrl",
   "ax-driver/zicbom",
   "axplat-dyn/zicbom",

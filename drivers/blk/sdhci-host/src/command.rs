@@ -45,7 +45,7 @@ pub(crate) enum CommandState {
 }
 
 impl Sdhci {
-    pub(crate) fn advance_command_response(&mut self) -> Result<CommandResponseProgress, Error> {
+    pub fn advance_command_response(&mut self) -> Result<CommandResponseProgress, Error> {
         match self.advance_command() {
             Ok(CommandPoll::Pending) => Ok(CommandResponseProgress::Pending),
             Ok(CommandPoll::Complete) => self
@@ -59,7 +59,7 @@ impl Sdhci {
 
     /// Program the command register and leave completion to
     /// [`Sdhci::advance_command`].
-    pub(crate) fn submit_command(&mut self, cmd: &Command) -> Result<(), Error> {
+    pub fn submit_command(&mut self, cmd: &Command) -> Result<(), Error> {
         self.submit_command_in_generation(cmd, true, None, false)
     }
 
@@ -105,7 +105,7 @@ impl Sdhci {
     }
 
     /// Advance the currently submitted command without blocking.
-    pub(crate) fn advance_command(&mut self) -> Result<CommandPoll, Error> {
+    pub fn advance_command(&mut self) -> Result<CommandPoll, Error> {
         match self.command_state {
             CommandState::WaitingInhibit {
                 cmd,
@@ -156,17 +156,7 @@ impl Sdhci {
         };
 
         let (normal, error) = self.take_command_irq_status();
-        if normal & NORMAL_INT_ERROR != 0 {
-            self.log_status("command wait failed", cmd.index);
-            self.write_interrupt_status(NORMAL_INT_CLEAR_ALL, ERROR_INT_CLEAR_ALL);
-            let _ = self.reset_cmd();
-            if data_line {
-                let _ = self.reset_dat();
-            }
-            let err = self.translate_error_bits(error, cmd.index);
-            self.command_state = CommandState::Failed { error: err };
-            Err(err)
-        } else if normal & NORMAL_INT_CMD_COMPLETE != 0 {
+        if normal & NORMAL_INT_CMD_COMPLETE != 0 {
             let response = match decode_response(self, cmd.response) {
                 Ok(r) => r,
                 Err(err) => {
@@ -184,6 +174,17 @@ impl Sdhci {
             }
             self.command_state = CommandState::Complete { response };
             Ok(CommandPoll::Complete)
+        } else if normal & NORMAL_INT_ERROR != 0 {
+            self.log_status("command wait failed", cmd.index);
+            self.write_u16(REG_NORMAL_INT_STATUS, NORMAL_INT_CLEAR_ALL);
+            self.write_u16(REG_ERROR_INT_STATUS, ERROR_INT_CLEAR_ALL);
+            let _ = self.reset_cmd();
+            if data_line {
+                let _ = self.reset_dat();
+            }
+            let err = self.translate_error_bits(error & ERROR_INT_CMD_LINE_MASK, cmd.index);
+            self.command_state = CommandState::Failed { error: err };
+            Err(err)
         } else {
             if polls >= COMMAND_WAIT_POLLS {
                 self.log_status("command response timeout", cmd.index);
@@ -210,12 +211,13 @@ impl Sdhci {
         response: Response,
         polls: u32,
     ) -> Result<CommandPoll, Error> {
-        let (normal, error) = self.take_busy_irq_status();
+        let (normal, error) = self.take_command_irq_status();
         if normal & NORMAL_INT_ERROR != 0 {
-            self.write_interrupt_status(NORMAL_INT_CLEAR_ALL, ERROR_INT_CLEAR_ALL);
+            self.write_u16(REG_NORMAL_INT_STATUS, NORMAL_INT_CLEAR_ALL);
+            self.write_u16(REG_ERROR_INT_STATUS, ERROR_INT_CLEAR_ALL);
             let _ = self.reset_cmd();
             let _ = self.reset_dat();
-            let err = self.translate_error_bits(error, cmd.index);
+            let err = self.translate_error_bits(error & ERROR_INT_DATA_LINE_MASK, cmd.index);
             self.command_state = CommandState::Failed { error: err };
             return Err(err);
         }
@@ -239,11 +241,15 @@ impl Sdhci {
     }
 
     fn take_command_irq_status(&mut self) -> (u16, u16) {
-        self.take_owned_irq_status(NORMAL_INT_CMD_COMPLETE, ERROR_INT_CMD_LINE_MASK)
-    }
-
-    fn take_busy_irq_status(&mut self) -> (u16, u16) {
-        self.take_owned_irq_status(0, ERROR_INT_DATA_LINE_MASK)
+        let normal = self
+            .irq
+            .state
+            .take_normal(NORMAL_INT_CMD_COMPLETE | NORMAL_INT_ERROR);
+        let error = self.irq.state.take_error_all();
+        if error != 0 {
+            self.irq.state.clear_normal(NORMAL_INT_ERROR);
+        }
+        (normal, error)
     }
 
     /// Reports whether the active command can advance from register state
@@ -293,7 +299,8 @@ impl Sdhci {
     }
 
     pub(crate) fn abort_command(&mut self) -> Result<(), Error> {
-        self.write_interrupt_status(NORMAL_INT_CLEAR_ALL, ERROR_INT_CLEAR_ALL);
+        self.write_u16(REG_NORMAL_INT_STATUS, NORMAL_INT_CLEAR_ALL);
+        self.write_u16(REG_ERROR_INT_STATUS, ERROR_INT_CLEAR_ALL);
         self.clear_cached_irq_status();
         self.reset_cmd()?;
         self.reset_dat()?;
@@ -303,22 +310,20 @@ impl Sdhci {
     }
 
     pub(crate) fn take_data_irq_status(&mut self) -> (u16, u16) {
-        self.take_owned_irq_status(NORMAL_INT_XFER_COMPLETE, ERROR_INT_DATA_OR_ADMA_MASK)
-    }
-
-    fn take_owned_irq_status(&mut self, normal_mask: u16, error_mask: u16) -> (u16, u16) {
-        let normal = self.irq.state.take_normal(normal_mask);
-        let error = self.irq.state.take_error(error_mask);
-        let normal = if error != 0 {
-            normal | NORMAL_INT_ERROR
-        } else {
-            normal
-        };
+        let normal = self
+            .irq
+            .state
+            .take_normal(NORMAL_INT_XFER_COMPLETE | NORMAL_INT_ERROR);
+        let error = self.irq.state.take_error_all();
+        if error != 0 {
+            self.irq.state.clear_normal(NORMAL_INT_ERROR);
+        }
         (normal, error)
     }
 
     fn prepare_irq_for_request(&mut self) {
-        self.write_interrupt_status(NORMAL_INT_CLEAR_ALL, ERROR_INT_CLEAR_ALL);
+        self.write_u16(REG_NORMAL_INT_STATUS, NORMAL_INT_CLEAR_ALL);
+        self.write_u16(REG_ERROR_INT_STATUS, ERROR_INT_CLEAR_ALL);
         self.irq.state.begin_request();
     }
 
@@ -337,14 +342,17 @@ impl Sdhci {
 
     pub(crate) fn log_status(&self, reason: &str, cmd_index: u8) {
         let present = self.read_u32(REG_PRESENT_STATE);
-        let (normal, error) = self.read_interrupt_status();
+        let normal = self.read_u16(REG_NORMAL_INT_STATUS);
+        let error = self.read_u16(REG_ERROR_INT_STATUS);
         let clock = self.read_u16(REG_CLOCK_CONTROL);
         let power = self.read_u8(REG_POWER_CONTROL);
         let host1 = self.read_u8(REG_HOST_CONTROL1);
         let host2 = self.read_u16(REG_HOST_CONTROL2);
         let reset = self.read_u8(REG_SOFTWARE_RESET);
-        let (normal_status_enable, error_status_enable) = self.read_interrupt_status_enable();
-        let (normal_signal_enable, error_signal_enable) = self.read_interrupt_signal_enable();
+        let normal_status_enable = self.read_u16(REG_NORMAL_INT_STATUS_ENABLE);
+        let error_status_enable = self.read_u16(REG_ERROR_INT_STATUS_ENABLE);
+        let normal_signal_enable = self.read_u16(REG_NORMAL_INT_SIGNAL_ENABLE);
+        let error_signal_enable = self.read_u16(REG_ERROR_INT_SIGNAL_ENABLE);
 
         if reason == "issued" {
             log::debug!(
@@ -421,7 +429,8 @@ impl Sdhci {
         let data_line = command_uses_data_line(cmd, has_data);
 
         if !preserve_irq_generation {
-            self.write_interrupt_status(NORMAL_INT_CLEAR_ALL, ERROR_INT_CLEAR_ALL);
+            self.write_u16(REG_NORMAL_INT_STATUS, NORMAL_INT_CLEAR_ALL);
+            self.write_u16(REG_ERROR_INT_STATUS, ERROR_INT_CLEAR_ALL);
             // Keep the active request generation alive while dropping status
             // from the previous request.
             self.irq.state.clear_all();

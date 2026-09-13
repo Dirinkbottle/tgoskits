@@ -31,15 +31,12 @@ impl DeviceRuntimeBuilder {
         };
         let bundle = {
             let claims = plan.claim_device(node.id().as_str())?;
-            let mut context = DeviceBuildContext::planned(
-                self.runtime.interrupt_registry(),
-                claims,
-                node.pci_host_topology(),
-            );
+            let mut context =
+                DeviceBuildContext::planned(self.runtime.interrupt_registry(), claims);
             let bundle = model.build(&mut context)?;
             context.finish(bundle)?
         };
-        self.runtime.register_graph_bundle(node, bundle)
+        self.runtime.register_bundle(bundle)
     }
 
     /// Verifies all claims, seals the topology, and returns the runtime.

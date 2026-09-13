@@ -14,7 +14,7 @@ pub mod arceos {
 
     /// Guards for ArceOS interrupt and preemption contexts.
     pub mod guard {
-        pub use ax_runtime::sync::{IrqSaveGuard, PreemptGuard, PreemptIrqSaveGuard};
+        pub use ax_kernel_guard::{IrqSave, NoOp, NoPreempt, NoPreemptIrqSave};
     }
 
     /// Lower-level ArceOS module facade for system components.
@@ -29,74 +29,30 @@ pub mod arceos {
 
     /// Non-sleeping synchronization for ArceOS kernel contexts.
     pub mod sync {
-        pub use ax_runtime::sync::*;
-
         /// A mutex that disables preemption and local interrupts while held.
-        #[repr(transparent)]
-        pub struct IrqSafeMutex<T: ?Sized>(ax_runtime::sync::SpinLock<T>);
-
-        impl<T> IrqSafeMutex<T> {
-            /// Creates an unlocked IRQ-safe mutex.
-            #[track_caller]
-            pub const fn new(value: T) -> Self {
-                Self(ax_runtime::sync::SpinLock::new(value))
-            }
-
-            /// Acquires the lock after saving and disabling local interrupts.
-            #[track_caller]
-            pub fn lock(&self) -> IrqSafeMutexGuard<'_, T> {
-                self.0.lock_irqsave()
-            }
-
-            /// Attempts to acquire the lock with IRQ-save semantics.
-            #[track_caller]
-            pub fn try_lock(&self) -> Option<IrqSafeMutexGuard<'_, T>> {
-                self.0.try_lock_irqsave()
-            }
-        }
-
-        impl<T: Default> Default for IrqSafeMutex<T> {
-            fn default() -> Self {
-                Self::new(T::default())
-            }
-        }
-
-        impl<T: core::fmt::Debug> core::fmt::Debug for IrqSafeMutex<T> {
-            fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-                self.0.fmt(formatter)
-            }
-        }
-
+        pub type IrqSafeMutex<T> = ax_kspin::SpinNoIrq<T>;
         /// A guard returned by [`IrqSafeMutex::lock`].
-        pub type IrqSafeMutexGuard<'a, T> = ax_runtime::sync::SpinLockIrqSaveGuard<'a, T>;
+        pub type IrqSafeMutexGuard<'a, T> = ax_kspin::SpinNoIrqGuard<'a, T>;
 
         /// A mutex that disables preemption while held.
         ///
         /// Callers must ensure the lock is not used by an interrupt handler.
-        pub type NoPreemptMutex<T> = ax_runtime::sync::SpinLock<T>;
+        pub type NoPreemptMutex<T> = ax_kspin::SpinNoPreempt<T>;
         /// A guard returned by [`NoPreemptMutex::lock`].
-        pub type NoPreemptMutexGuard<'a, T> = ax_runtime::sync::SpinLockGuard<'a, T>;
+        pub type NoPreemptMutexGuard<'a, T> = ax_kspin::SpinNoPreemptGuard<'a, T>;
 
         /// A raw spin lock that does not alter interrupt or preemption state.
         ///
         /// Callers must disable preemption and local interrupts before taking
         /// this lock, or prove that interrupt handlers never acquire it.
-        pub type RawSpinLock<T> = ax_runtime::sync::SpinLock<T>;
-        /// A guard returned by [`RawSpinLock::lock_raw`].
-        pub type RawSpinLockGuard<'a, T> = ax_runtime::sync::RawSpinLockGuard<'a, T>;
-    }
-
-    /// OS-independent task scheduler types and ArceOS runtime operations.
-    pub mod task {
-        pub use ax_runtime::task::*;
+        pub type RawSpinLock<T> = ax_kspin::SpinRaw<T>;
+        /// A guard returned by [`RawSpinLock::lock`].
+        pub type RawSpinLockGuard<'a, T> = ax_kspin::SpinRawGuard<'a, T>;
     }
 }
 
 #[cfg(feature = "std-compat")]
 pub mod libc_compat;
-
-#[cfg(any(feature = "std-compat", all(test, feature = "host-test")))]
-mod futex;
 
 #[cfg(all(test, feature = "host-test"))]
 mod tests {
@@ -110,10 +66,10 @@ mod tests {
     fn special_locks_support_const_initialization_and_try_lock() {
         *IRQ_SAFE.lock() += 1;
         *NO_PREEMPT.lock() += 1;
-        *unsafe { RAW.lock_raw() } += 1;
+        *RAW.lock() += 1;
 
         assert_eq!(*IRQ_SAFE.try_lock().unwrap(), 1);
         assert_eq!(*NO_PREEMPT.try_lock().unwrap(), 1);
-        assert_eq!(*unsafe { RAW.try_lock_raw() }.unwrap(), 1);
+        assert_eq!(*RAW.try_lock().unwrap(), 1);
     }
 }

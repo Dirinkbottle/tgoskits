@@ -1,8 +1,9 @@
 use core::ffi::c_int;
 
-use ax_hal::time::monotonic_time;
+use ax_errno::{LinuxError, LinuxResult};
+use ax_hal::time::wall_time;
 
-use crate::{PosixError, PosixResult, ctypes, imp::fd_ops::get_file_like};
+use crate::{ctypes, imp::fd_ops::get_file_like};
 
 const FD_SETSIZE: usize = 1024;
 const BITS_PER_USIZE: usize = usize::BITS as usize;
@@ -50,7 +51,7 @@ impl FdSets {
         res_read_fds: *mut ctypes::fd_set,
         res_write_fds: *mut ctypes::fd_set,
         res_except_fds: *mut ctypes::fd_set,
-    ) -> PosixResult<usize> {
+    ) -> LinuxResult<usize> {
         let mut read_bits_ptr = self.bits.as_ptr();
         let mut write_bits_ptr = unsafe { read_bits_ptr.add(FD_SETSIZE_USIZES) };
         let mut execpt_bits_ptr = unsafe { read_bits_ptr.add(FD_SETSIZE_USIZES * 2) };
@@ -120,10 +121,10 @@ pub unsafe fn sys_select(
     );
     syscall_body!(sys_select, {
         if nfds < 0 {
-            return Err(PosixError::EINVAL);
+            return Err(LinuxError::EINVAL);
         }
         let nfds = (nfds as usize).min(FD_SETSIZE);
-        let deadline = unsafe { timeout.as_ref().map(|t| monotonic_time() + (*t).into()) };
+        let deadline = unsafe { timeout.as_ref().map(|t| wall_time() + (*t).into()) };
         let fd_sets = FdSets::from(nfds, readfds, writefds, exceptfds);
 
         unsafe {
@@ -140,7 +141,7 @@ pub unsafe fn sys_select(
                 return Ok(res);
             }
 
-            if deadline.is_some_and(|ddl| monotonic_time() >= ddl) {
+            if deadline.is_some_and(|ddl| wall_time() >= ddl) {
                 debug!("    timeout!");
                 return Ok(0);
             }

@@ -5,13 +5,10 @@ extern crate alloc;
 use alloc::boxed::Box;
 use core::time::Duration;
 
-use crate::{LoongArchHostPhysAddr, LoongArchHostVirtAddr, LoongArchVcpuResult};
+use crate::{LoongArchHostPhysAddr, LoongArchHostVirtAddr};
 
 /// Host operations required by LoongArch virtualization code.
 pub trait LoongArchHostOps {
-    /// Opaque ownership token for one host timer registration.
-    type TimerHandle: Copy;
-
     /// Convert a host virtual address to a host physical address.
     fn virt_to_phys(vaddr: LoongArchHostVirtAddr) -> LoongArchHostPhysAddr;
 
@@ -25,10 +22,10 @@ pub trait LoongArchHostOps {
     fn register_timer(
         deadline: Duration,
         callback: Box<dyn FnOnce(Duration) + Send + 'static>,
-    ) -> LoongArchVcpuResult<Self::TimerHandle>;
+    ) -> usize;
 
     /// Cancel a guest timer callback.
-    fn cancel_timer(handle: Self::TimerHandle) -> LoongArchVcpuResult;
+    fn cancel_timer(token: usize);
 
     /// Queue an interrupt for a vCPU.
     fn inject_interrupt(vm_id: usize, vcpu_id: usize, vector: usize);

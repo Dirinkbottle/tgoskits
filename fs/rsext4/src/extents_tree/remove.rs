@@ -7,13 +7,12 @@ impl<'a> ExtentTree<'a> {
     /// extents, then walks the tree again to free blocks and rewrite touched
     /// leaf/index nodes, and finally collapses degenerate root states back into
     /// the inode-inline form when possible.
-    pub fn remove_extent<B: BlockIo>(
+    pub fn remove_extent<B: BlockDevice>(
         &mut self,
         fs: &mut Ext4FileSystem,
         deleted_ext: Ext4Extent,
         block_dev: &mut Jbd2Dev<B>,
     ) -> Ext4Result<()> {
-        self.bind_geometry(&fs.superblock);
         let del_start = deleted_ext.ee_block;
         let del_len = deleted_ext.len();
         if del_len == 0 {
@@ -102,15 +101,22 @@ impl<'a> ExtentTree<'a> {
             }
 
             // Recursively search the next child that could satisfy the requested logical block.
-            fn pre_step<'t, B: BlockIo>(
-                tree: &ExtentTree<'t>,
+            fn pre_step<B: BlockDevice>(
                 dev: &mut Jbd2Dev<B>,
                 node: &ExtentNode,
                 cur_lbn: u32,
             ) -> Ext4Result<PreRes> {
                 match node {
                     ExtentNode::Leaf { entries, .. } => Ok(pre_leaf_step(entries, cur_lbn)),
-                    ExtentNode::Index { header, entries } => {
+                    ExtentNode::Index { entries, .. } => {
+                        if entries.is_empty() {
+                            return Ok(PreRes {
+                                kind: PreKind::NoMore,
+                                can_take: 0,
+                                next_lbn: cur_lbn,
+                            });
+                        }
+
                         let mut search_lbn = cur_lbn;
                         let mut idx_pos = {
                             let pp = entries.partition_point(|idx| idx.ei_block <= search_lbn);
@@ -118,10 +124,15 @@ impl<'a> ExtentTree<'a> {
                         };
 
                         while idx_pos < entries.len() {
-                            let child =
-                                tree.read_child_node(dev, &entries[idx_pos], header.eh_depth - 1)?;
+                            let child_phy = AbsoluteBN::new(
+                                ((entries[idx_pos].ei_leaf_hi as u64) << 32)
+                                    | (entries[idx_pos].ei_leaf_lo as u64),
+                            );
+                            dev.read_block(child_phy)?;
+                            let child = ExtentTree::parse_node_from_bytes(dev.buffer())
+                                .ok_or(Ext4Error::corrupted())?;
 
-                            let r = pre_step(tree, dev, &child, search_lbn)?;
+                            let r = pre_step(dev, &child, search_lbn)?;
                             match r.kind {
                                 PreKind::Have | PreKind::HoleSkip => return Ok(r),
                                 PreKind::NoMore => {
@@ -144,13 +155,15 @@ impl<'a> ExtentTree<'a> {
                 }
             }
 
-            let pre_root = self.load_root_from_inode()?;
-            self.validate_node(&pre_root, None, None, block_dev.total_blocks(), true)?;
+            let pre_root = match self.load_root_from_inode() {
+                Some(node) => node,
+                None => return Err(Ext4Error::corrupted()),
+            };
 
             let mut need = del_len;
             let mut cur = del_start;
             while need > 0 {
-                let r = pre_step(self, block_dev, &pre_root, cur)?;
+                let r = pre_step(block_dev, &pre_root, cur)?;
                 match r.kind {
                     PreKind::Have => {
                         let take = core::cmp::min(need, r.can_take);
@@ -169,8 +182,20 @@ impl<'a> ExtentTree<'a> {
         }
 
         // Phase 2: perform the actual deletion and rewrite touched nodes on unwind.
-        let mut root = self.load_root_from_inode()?;
-        self.validate_node(&root, None, None, block_dev.total_blocks(), true)?;
+        let mut root = match self.load_root_from_inode() {
+            Some(node) => node,
+            None => return Err(Ext4Error::corrupted()),
+        };
+
+        fn inline_eh_max_for_node(node: &ExtentNode) -> u16 {
+            let inline_bytes = 15usize * 4;
+            let hdr_size = Ext4ExtentHeader::disk_size();
+            let entry_size = match node {
+                ExtentNode::Leaf { .. } => Ext4Extent::disk_size(),
+                ExtentNode::Index { .. } => Ext4ExtentIdx::disk_size(),
+            };
+            (inline_bytes.saturating_sub(hdr_size) / entry_size) as u16
+        }
 
         fn extent_start_phys(e: &Ext4Extent) -> u64 {
             ((e.ee_start_hi as u64) << 32) | (e.ee_start_lo as u64)
@@ -208,7 +233,7 @@ impl<'a> ExtentTree<'a> {
         }
 
         #[allow(clippy::too_many_arguments)]
-        fn leaf_step<'t, B: BlockIo>(
+        fn leaf_step<'t, B: BlockDevice>(
             tree: &mut ExtentTree<'t>,
             fs: &mut Ext4FileSystem,
             dev: &mut Jbd2Dev<B>,
@@ -295,10 +320,15 @@ impl<'a> ExtentTree<'a> {
             let cut_len = core::cmp::min(remaining, can_take);
             let seg_end = seg_start.saturating_add(cut_len);
 
-            let physical_start = extent_start_phys(&e)
-                .checked_add(u64::from(within_off))
-                .ok_or_else(Ext4Error::overflow)?;
-            tree.can_sub_inode_sectors_for_blocks(fs, u64::from(cut_len))?;
+            {
+                // Free physical blocks first so allocation bitmaps stay consistent with the extent edit.
+                let base = extent_start_phys(&e);
+                let off = within_off as u64;
+                for j in 0..(cut_len as u64) {
+                    fs.free_block(dev, AbsoluteBN::new(base + off + j))?;
+                    tree.sub_inode_sectors_for_block();
+                }
+            }
 
             // Rewrite the matching extent as delete, trim-left, trim-right, or split-in-two.
             if seg_start == e_start && seg_end == e_end {
@@ -348,17 +378,6 @@ impl<'a> ExtentTree<'a> {
                 tree.write_node_to_block(dev, block_id, &disk_node)?;
             }
 
-            // Never release a block while durable extent metadata still refers
-            // to it. A later bitmap failure may leak an unreachable block, but
-            // it cannot turn a referenced block into free space.
-            for offset in 0..u64::from(cut_len) {
-                let block = physical_start
-                    .checked_add(offset)
-                    .ok_or_else(Ext4Error::overflow)?;
-                fs.free_block(dev, AbsoluteBN::new(block))?;
-                tree.sub_inode_sectors_for_block(fs)?;
-            }
-
             Ok(StepRes {
                 kind: StepKind::Deleted,
                 deleted: cut_len,
@@ -369,7 +388,7 @@ impl<'a> ExtentTree<'a> {
         }
 
         // Descend to the child covering the current logical block and repair parent keys while unwinding.
-        fn step_recursive<'t, B: BlockIo>(
+        fn step_recursive<'t, B: BlockDevice>(
             tree: &mut ExtentTree<'t>,
             fs: &mut Ext4FileSystem,
             dev: &mut Jbd2Dev<B>,
@@ -383,6 +402,16 @@ impl<'a> ExtentTree<'a> {
                     tree, fs, dev, header, entries, cur_lbn, remaining, phy_block,
                 ),
                 ExtentNode::Index { header, entries } => {
+                    if entries.is_empty() {
+                        return Ok(StepRes {
+                            kind: StepKind::NoMoreExtent,
+                            deleted: 0,
+                            next_lbn: cur_lbn,
+                            empty: true,
+                            first_key: 0,
+                        });
+                    }
+
                     let mut search_lbn = cur_lbn;
                     let mut idx_pos = {
                         let pp = entries.partition_point(|idx| idx.ei_block <= search_lbn);
@@ -394,8 +423,10 @@ impl<'a> ExtentTree<'a> {
                             ((entries[idx_pos].ei_leaf_hi as u64) << 32)
                                 | (entries[idx_pos].ei_leaf_lo as u64),
                         );
-                        let mut child_node =
-                            tree.read_child_node(dev, &entries[idx_pos], header.eh_depth - 1)?;
+                        dev.read_block(child_phy)?;
+                        let child_bytes = dev.buffer();
+                        let mut child_node = ExtentTree::parse_node_from_bytes(child_bytes)
+                            .ok_or(Ext4Error::corrupted())?;
 
                         let child_res = step_recursive(
                             tree,
@@ -410,12 +441,10 @@ impl<'a> ExtentTree<'a> {
                         match child_res.kind {
                             StepKind::Deleted => {
                                 if child_res.empty {
-                                    tree.can_sub_inode_sectors_for_blocks(fs, 1)?;
                                     entries.remove(idx_pos);
                                     header.eh_entries = entries.len() as u16;
-                                    dev.forget_detached_metadata(child_phy)?;
                                     fs.free_block(dev, child_phy)?;
-                                    tree.sub_inode_sectors_for_block(fs)?;
+                                    tree.sub_inode_sectors_for_block();
                                 } else {
                                     entries[idx_pos].ei_block = child_res.first_key;
                                 }
@@ -502,12 +531,13 @@ impl<'a> ExtentTree<'a> {
         }
 
         // Phase 3: store the updated root, collapsing one-child index roots back into the inode when legal.
-        let en_max = self.inline_eh_max_for_node(&root);
+        let en_max = inline_eh_max_for_node(&root);
         match &mut root {
             ExtentNode::Leaf { header, entries } => {
                 header.eh_entries = entries.len() as u16;
                 header.eh_max = en_max;
-                self.store_root_to_inode(&root)
+                self.store_root_to_inode(&root);
+                Ok(())
             }
             ExtentNode::Index { header, entries } => {
                 if entries.is_empty() {
@@ -521,26 +551,56 @@ impl<'a> ExtentTree<'a> {
                         header: hdr,
                         entries: Vec::new(),
                     };
-                    return self.store_root_to_inode(&empty_root);
+                    self.store_root_to_inode(&empty_root);
+                    return Ok(());
                 }
 
                 if entries.len() == 1 {
                     let child_phy = AbsoluteBN::new(
                         ((entries[0].ei_leaf_hi as u64) << 32) | (entries[0].ei_leaf_lo as u64),
                     );
-                    let child_node =
-                        self.read_child_node(block_dev, &entries[0], header.eh_depth - 1)?;
+                    block_dev.read_block(child_phy)?;
+                    let child_bytes = block_dev.buffer();
+                    let mut child_node = ExtentTree::parse_node_from_bytes(child_bytes)
+                        .ok_or(Ext4Error::corrupted())?;
 
-                    if self.collapse_external_root_child(fs, block_dev, child_phy, child_node)? {
+                    let inline_max = inline_eh_max_for_node(&child_node) as usize;
+                    let child_entries_len = match &child_node {
+                        ExtentNode::Leaf { entries, .. } => entries.len(),
+                        ExtentNode::Index { entries, .. } => entries.len(),
+                    };
+
+                    if child_entries_len <= inline_max {
+                        *child_node.header_mut() = {
+                            let mut h = *child_node.header();
+                            h.eh_max = inline_eh_max_for_node(&child_node);
+                            h
+                        };
+
+                        self.store_root_to_inode(&child_node);
+
+                        fs.free_block(block_dev, child_phy)?;
+                        self.sub_inode_sectors_for_block();
                         return Ok(());
                     }
                 }
 
                 header.eh_entries = entries.len() as u16;
                 header.eh_max = en_max;
-                self.store_root_to_inode(&root)
+                self.store_root_to_inode(&root);
+                Ok(())
             }
         }
+    }
+
+    /// Removes an allocated logical extent range using the original misspelled API name.
+    pub fn remove_extend<B: BlockDevice>(
+        &mut self,
+        fs: &mut Ext4FileSystem,
+        deleted_ext: Ext4Extent,
+        block_dev: &mut Jbd2Dev<B>,
+    ) -> Ext4Result<()> {
+        self.remove_extent(fs, deleted_ext, block_dev)
     }
 }
 
@@ -553,13 +613,11 @@ mod tests {
 
     use super::*;
     use crate::{
-        blockdev::{BlockIo, Jbd2Dev},
+        blockdev::{BlockDevice, Jbd2Dev},
         bmalloc::AbsoluteBN,
         cache::bitmap::CacheKey,
-        config::BLOCK_SIZE,
         error::{Ext4Error, Ext4Result},
-        ext4::{Ext4FileSystem, mkfs},
-        superblock::Ext4Superblock,
+        ext4::{mkfs, mount},
     };
 
     struct MemBlockDev {
@@ -579,13 +637,8 @@ mod tests {
         }
     }
 
-    impl BlockIo for MemBlockDev {
-        fn write(
-            &mut self,
-            buffer: &[u8],
-            block_id: crate::io::SectorId,
-            count: u32,
-        ) -> Ext4Result<()> {
+    impl BlockDevice for MemBlockDev {
+        fn write(&mut self, buffer: &[u8], block_id: AbsoluteBN, count: u32) -> Ext4Result<()> {
             let block_size = BLOCK_SIZE;
             let required = block_size * count as usize;
             if buffer.len() < required {
@@ -603,12 +656,7 @@ mod tests {
             Ok(())
         }
 
-        fn read(
-            &mut self,
-            buffer: &mut [u8],
-            block_id: crate::io::SectorId,
-            count: u32,
-        ) -> Ext4Result<()> {
+        fn read(&mut self, buffer: &mut [u8], block_id: AbsoluteBN, count: u32) -> Ext4Result<()> {
             let block_size = BLOCK_SIZE;
             let required = block_size * count as usize;
             if buffer.len() < required {
@@ -626,27 +674,23 @@ mod tests {
             Ok(())
         }
 
-        fn geometry(&self) -> crate::io::DeviceGeometry {
-            crate::io::DeviceGeometry::new(BLOCK_SIZE as u32, self.total_blocks)
-        }
-
-        fn capabilities(&self) -> crate::io::DeviceCapabilities {
-            crate::io::DeviceCapabilities {
-                read_only: { false },
-
-                flush: true,
-
-                ..crate::io::DeviceCapabilities::default()
-            }
-        }
-
-        fn flush(&mut self) -> crate::Ext4Result<()> {
+        fn open(&mut self) -> Ext4Result<()> {
             Ok(())
         }
-    }
 
-    impl crate::runtime::Clock for MemBlockDev {
-        fn now(&self) -> Ext4Result<Ext4Timestamp> {
+        fn close(&mut self) -> Ext4Result<()> {
+            Ok(())
+        }
+
+        fn total_blocks(&self) -> u64 {
+            self.total_blocks
+        }
+
+        fn block_size(&self) -> u32 {
+            BLOCK_SIZE as u32
+        }
+
+        fn current_time(&self) -> Ext4Result<Ext4Timestamp> {
             let sec = self.now.get();
             self.now.set(sec + 1);
             Ok(Ext4Timestamp::new(sec, 0))
@@ -657,7 +701,7 @@ mod tests {
         let dev = MemBlockDev::new(total_blocks);
         let mut jbd = Jbd2Dev::initial_jbd2dev(0, dev, false);
         mkfs(&mut jbd).unwrap();
-        let fs = Ext4FileSystem::mount(&mut jbd).unwrap();
+        let fs = mount(&mut jbd).unwrap();
         (jbd, fs)
     }
 
@@ -668,31 +712,14 @@ mod tests {
         inode
     }
 
-    fn alloc_data_block<B: BlockIo>(fs: &mut Ext4FileSystem, dev: &mut Jbd2Dev<B>) -> AbsoluteBN {
+    fn alloc_data_block<B: BlockDevice>(
+        fs: &mut Ext4FileSystem,
+        dev: &mut Jbd2Dev<B>,
+    ) -> AbsoluteBN {
         fs.alloc_block(dev).unwrap()
     }
 
-    fn insert_data_extent<B: BlockIo>(
-        fs: &mut Ext4FileSystem,
-        dev: &mut Jbd2Dev<B>,
-        inode: &mut Ext4Inode,
-        extent: Ext4Extent,
-    ) {
-        let data_blocks = u64::from(extent.len());
-        ExtentTree::new(inode, BLOCK_SIZE)
-            .insert_extent(fs, extent, dev)
-            .unwrap();
-        let huge_file_feature = fs
-            .superblock
-            .has_feature_ro_compat(Ext4Superblock::EXT4_FEATURE_RO_COMPAT_HUGE_FILE);
-        let current = inode.blocks_count(BLOCK_SIZE as u32, huge_file_feature);
-        let data_sectors = data_blocks * (BLOCK_SIZE as u64 / 512);
-        inode
-            .set_blocks_count(current + data_sectors, BLOCK_SIZE as u32, huge_file_feature)
-            .unwrap();
-    }
-
-    fn bitmap_block_is_allocated<B: BlockIo>(
+    fn bitmap_block_is_allocated<B: BlockDevice>(
         fs: &mut Ext4FileSystem,
         dev: &mut Jbd2Dev<B>,
         global_block: AbsoluteBN,
@@ -715,24 +742,25 @@ mod tests {
         ((byte >> (idx % 8)) & 1) == 1
     }
 
-    fn insert_n_extents_with_phys_gaps<B: BlockIo>(
+    fn insert_n_extents_with_phys_gaps<B: BlockDevice>(
         fs: &mut Ext4FileSystem,
         dev: &mut Jbd2Dev<B>,
         inode: &mut Ext4Inode,
         n: u32,
     ) -> std::vec::Vec<Ext4Extent> {
+        let mut tree = ExtentTree::new(inode);
         let mut out = std::vec::Vec::new();
         for lbn in 0..n {
             let phys = alloc_data_block(fs, dev);
             let _gap = alloc_data_block(fs, dev);
             let ext = Ext4Extent::new(lbn, phys.raw(), 1);
-            insert_data_extent(fs, dev, inode, ext);
+            tree.insert_extent(fs, ext, dev).unwrap();
             out.push(ext);
         }
         out
     }
 
-    fn alloc_contiguous<B: BlockIo>(
+    fn alloc_contiguous<B: BlockDevice>(
         fs: &mut Ext4FileSystem,
         dev: &mut Jbd2Dev<B>,
         count: u32,
@@ -748,11 +776,11 @@ mod tests {
         first
     }
 
-    fn collect_extents_from_inode<B: BlockIo>(
+    fn collect_extents_from_inode<B: BlockDevice>(
         inode: &mut Ext4Inode,
         dev: &mut Jbd2Dev<B>,
     ) -> std::vec::Vec<Ext4Extent> {
-        fn walk<B: BlockIo>(
+        fn walk<B: BlockDevice>(
             dev: &mut Jbd2Dev<B>,
             node: &ExtentNode,
             out: &mut std::vec::Vec<Ext4Extent>,
@@ -771,7 +799,7 @@ mod tests {
             }
         }
 
-        let tree = ExtentTree::new(inode, BLOCK_SIZE);
+        let tree = ExtentTree::new(inode);
         let root = tree.load_root_from_inode().unwrap();
         let mut out = std::vec::Vec::new();
         walk(dev, &root, &mut out);
@@ -786,11 +814,11 @@ mod tests {
 
         let exts = insert_n_extents_with_phys_gaps(&mut fs, &mut dev, &mut inode, 2);
         {
-            let mut tree = ExtentTree::new(&mut inode, BLOCK_SIZE);
+            let mut tree = ExtentTree::new(&mut inode);
             tree.remove_extent(&mut fs, exts[0], &mut dev).unwrap();
         }
 
-        let tree = ExtentTree::new(&mut inode, BLOCK_SIZE);
+        let tree = ExtentTree::new(&mut inode);
         let root = tree.load_root_from_inode().unwrap();
         match root {
             ExtentNode::Leaf { header, entries } => {
@@ -803,38 +831,17 @@ mod tests {
     }
 
     #[test]
-    fn extent_metadata_accounting_preserves_huge_file_units() {
-        let (mut dev, mut fs) = setup_fs(32 * 1024);
-        let mut inode = new_extent_inode();
-        fs.superblock.s_feature_ro_compat |= Ext4Superblock::EXT4_FEATURE_RO_COMPAT_HUGE_FILE;
-        let initial_sectors = (1_u64 << 48) + 8;
-        inode
-            .set_blocks_count(initial_sectors, BLOCK_SIZE as u32, true)
-            .unwrap();
-
-        insert_n_extents_with_phys_gaps(&mut fs, &mut dev, &mut inode, 5);
-
-        let metadata_blocks = ExtentTree::new(&mut inode, BLOCK_SIZE)
-            .external_node_blocks(&mut dev)
-            .unwrap()
-            .len() as u64;
-        let expected = initial_sectors + (5 + metadata_blocks) * (BLOCK_SIZE as u64 / 512);
-        assert_eq!(inode.blocks_count(BLOCK_SIZE as u32, true), expected);
-        assert_ne!(inode.i_flags & Ext4Inode::EXT4_HUGE_FILE_FL, 0);
-    }
-
-    #[test]
     fn remove_extent_root_leaf_degeneration_to_empty() {
         let (mut dev, mut fs) = setup_fs(16 * 1024);
         let mut inode = new_extent_inode();
 
         let exts = insert_n_extents_with_phys_gaps(&mut fs, &mut dev, &mut inode, 1);
         {
-            let mut tree = ExtentTree::new(&mut inode, BLOCK_SIZE);
+            let mut tree = ExtentTree::new(&mut inode);
             tree.remove_extent(&mut fs, exts[0], &mut dev).unwrap();
         }
 
-        let tree = ExtentTree::new(&mut inode, BLOCK_SIZE);
+        let tree = ExtentTree::new(&mut inode);
         let root = tree.load_root_from_inode().unwrap();
         match root {
             ExtentNode::Leaf { header, entries } => {
@@ -853,7 +860,7 @@ mod tests {
         let exts = insert_n_extents_with_phys_gaps(&mut fs, &mut dev, &mut inode, 5);
 
         {
-            let tree = ExtentTree::new(&mut inode, BLOCK_SIZE);
+            let tree = ExtentTree::new(&mut inode);
             let root = tree.load_root_from_inode().unwrap();
             match root {
                 ExtentNode::Index { header, .. } => assert!(header.eh_depth > 0),
@@ -862,13 +869,13 @@ mod tests {
         }
 
         {
-            let mut tree = ExtentTree::new(&mut inode, BLOCK_SIZE);
+            let mut tree = ExtentTree::new(&mut inode);
             tree.remove_extent(&mut fs, exts[2], &mut dev).unwrap();
             tree.remove_extent(&mut fs, exts[3], &mut dev).unwrap();
             tree.remove_extent(&mut fs, exts[4], &mut dev).unwrap();
         }
 
-        let tree = ExtentTree::new(&mut inode, BLOCK_SIZE);
+        let tree = ExtentTree::new(&mut inode);
         let root = tree.load_root_from_inode().unwrap();
         match root {
             ExtentNode::Leaf { header, entries } => {
@@ -888,14 +895,14 @@ mod tests {
         let exts = insert_n_extents_with_phys_gaps(&mut fs, &mut dev, &mut inode, 5);
 
         for ext in exts {
-            let mut tree = ExtentTree::new(&mut inode, BLOCK_SIZE);
+            let mut tree = ExtentTree::new(&mut inode);
             tree.remove_extent(&mut fs, ext, &mut dev).unwrap();
 
-            let tree2 = ExtentTree::new(&mut inode, BLOCK_SIZE);
-            assert!(tree2.load_root_from_inode().is_ok());
+            let tree2 = ExtentTree::new(&mut inode);
+            assert!(tree2.load_root_from_inode().is_some());
         }
 
-        let tree = ExtentTree::new(&mut inode, BLOCK_SIZE);
+        let tree = ExtentTree::new(&mut inode);
         let root = tree.load_root_from_inode().unwrap();
         match root {
             ExtentNode::Leaf { header, entries } => {
@@ -915,37 +922,17 @@ mod tests {
         assert!(bitmap_block_is_allocated(&mut fs, &mut dev, phys));
 
         let ext = Ext4Extent::new(0, phys.raw(), 1);
-        insert_data_extent(&mut fs, &mut dev, &mut inode, ext);
+        {
+            let mut tree = ExtentTree::new(&mut inode);
+            tree.insert_extent(&mut fs, ext, &mut dev).unwrap();
+        }
 
         {
-            let mut tree = ExtentTree::new(&mut inode, BLOCK_SIZE);
+            let mut tree = ExtentTree::new(&mut inode);
             tree.remove_extent(&mut fs, ext, &mut dev).unwrap();
         }
 
         assert!(!bitmap_block_is_allocated(&mut fs, &mut dev, phys));
-    }
-
-    #[test]
-    fn remove_extent_rejects_underaccounted_inode_before_freeing_data() {
-        let (mut dev, mut fs) = setup_fs(16 * 1024);
-        let mut inode = new_extent_inode();
-        let phys = alloc_data_block(&mut fs, &mut dev);
-        let extent = Ext4Extent::new(0, phys.raw(), 1);
-        ExtentTree::new(&mut inode, BLOCK_SIZE)
-            .insert_extent(&mut fs, extent, &mut dev)
-            .unwrap();
-
-        let error = ExtentTree::new(&mut inode, BLOCK_SIZE)
-            .remove_extent(&mut fs, extent, &mut dev)
-            .unwrap_err();
-
-        assert!(error.is_corruption());
-        assert!(bitmap_block_is_allocated(&mut fs, &mut dev, phys));
-        let extents = collect_extents_from_inode(&mut inode, &mut dev);
-        assert_eq!(extents.len(), 1);
-        assert_eq!(extents[0].ee_block, extent.ee_block);
-        assert_eq!(extents[0].ee_len, extent.ee_len);
-        assert_eq!(extents[0].start_block(), extent.start_block());
     }
 
     #[test]
@@ -955,11 +942,14 @@ mod tests {
 
         let base = alloc_contiguous(&mut fs, &mut dev, 4);
         let ext = Ext4Extent::new(0, base.raw(), 4);
-        insert_data_extent(&mut fs, &mut dev, &mut inode, ext);
+        {
+            let mut tree = ExtentTree::new(&mut inode);
+            tree.insert_extent(&mut fs, ext, &mut dev).unwrap();
+        }
 
         let del = Ext4Extent::new(1, 0, 2);
         {
-            let mut tree = ExtentTree::new(&mut inode, BLOCK_SIZE);
+            let mut tree = ExtentTree::new(&mut inode);
             tree.remove_extent(&mut fs, del, &mut dev).unwrap();
         }
 
@@ -1003,11 +993,14 @@ mod tests {
 
         let base = alloc_contiguous(&mut fs, &mut dev, 2);
         let ext = Ext4Extent::new(0, base.raw(), 2);
-        insert_data_extent(&mut fs, &mut dev, &mut inode, ext);
+        {
+            let mut tree = ExtentTree::new(&mut inode);
+            tree.insert_extent(&mut fs, ext, &mut dev).unwrap();
+        }
 
         let del = Ext4Extent::new(0, 0, 2);
         {
-            let mut tree = ExtentTree::new(&mut inode, BLOCK_SIZE);
+            let mut tree = ExtentTree::new(&mut inode);
             tree.remove_extent(&mut fs, del, &mut dev).unwrap();
         }
 
@@ -1031,22 +1024,17 @@ mod tests {
         let _gap2 = alloc_data_block(&mut fs, &mut dev);
         let base2 = alloc_contiguous(&mut fs, &mut dev, 2);
 
-        insert_data_extent(
-            &mut fs,
-            &mut dev,
-            &mut inode,
-            Ext4Extent::new(0, base1.raw(), 2),
-        );
-        insert_data_extent(
-            &mut fs,
-            &mut dev,
-            &mut inode,
-            Ext4Extent::new(4, base2.raw(), 2),
-        );
+        {
+            let mut tree = ExtentTree::new(&mut inode);
+            tree.insert_extent(&mut fs, Ext4Extent::new(0, base1.raw(), 2), &mut dev)
+                .unwrap();
+            tree.insert_extent(&mut fs, Ext4Extent::new(4, base2.raw(), 2), &mut dev)
+                .unwrap();
+        }
 
         // delete 3 allocated blocks starting at lbn=1: deletes lbn=1, then skips hole [2..4), then deletes lbn=4 and lbn=5
         {
-            let mut tree = ExtentTree::new(&mut inode, BLOCK_SIZE);
+            let mut tree = ExtentTree::new(&mut inode);
             tree.remove_extent(&mut fs, Ext4Extent::new(1, 0, 3), &mut dev)
                 .unwrap();
         }
@@ -1081,18 +1069,13 @@ mod tests {
 
         let base1 = alloc_contiguous(&mut fs, &mut dev, 2);
         let base2 = alloc_contiguous(&mut fs, &mut dev, 1);
-        insert_data_extent(
-            &mut fs,
-            &mut dev,
-            &mut inode,
-            Ext4Extent::new(0, base1.raw(), 2),
-        );
-        insert_data_extent(
-            &mut fs,
-            &mut dev,
-            &mut inode,
-            Ext4Extent::new(10, base2.raw(), 1),
-        );
+        {
+            let mut tree = ExtentTree::new(&mut inode);
+            tree.insert_extent(&mut fs, Ext4Extent::new(0, base1.raw(), 2), &mut dev)
+                .unwrap();
+            tree.insert_extent(&mut fs, Ext4Extent::new(10, base2.raw(), 1), &mut dev)
+                .unwrap();
+        }
 
         let before_exts = collect_extents_from_inode(&mut inode, &mut dev);
         assert!(bitmap_block_is_allocated(&mut fs, &mut dev, base1));
@@ -1104,7 +1087,7 @@ mod tests {
         assert!(bitmap_block_is_allocated(&mut fs, &mut dev, base2));
 
         let res = {
-            let mut tree = ExtentTree::new(&mut inode, BLOCK_SIZE);
+            let mut tree = ExtentTree::new(&mut inode);
             tree.remove_extent(&mut fs, Ext4Extent::new(0, 0, 10), &mut dev)
         };
         assert!(res.is_err());

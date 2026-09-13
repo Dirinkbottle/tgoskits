@@ -44,6 +44,7 @@ fn map_region_batches_tlb_flushes() {
             |vaddr| PhysAddr::from_usize(vaddr.as_usize() + 0x20_0000),
             2 * CountingMeta::PAGE_SIZE,
             (MappingFlags::READ | MappingFlags::WRITE).into(),
+            false,
         )
         .unwrap();
 
@@ -60,6 +61,7 @@ fn map_region_batches_tlb_flushes() {
             |vaddr| PhysAddr::from_usize(vaddr.as_usize() + 0x20_0000),
             128 * CountingMeta::PAGE_SIZE,
             (MappingFlags::READ | MappingFlags::WRITE).into(),
+            false,
         )
         .unwrap();
 

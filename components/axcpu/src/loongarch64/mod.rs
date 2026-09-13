@@ -2,7 +2,6 @@
 mod macros;
 
 mod context;
-mod irq;
 mod trap;
 mod unaligned;
 

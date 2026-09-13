@@ -11,7 +11,7 @@ use core::{
 };
 
 use arm_gic_driver::v3::{Affinity, GITS_TRANSLATER_OFFSET, Its, ItsCommand, ItsTableType};
-use ax_sync::{RawSpinLockGuard, SpinLock};
+use ax_kspin::SpinRaw as Mutex;
 use irq_framework::{HwIrq, IrqError, IrqId};
 use rdif_msi::{
     Interface, Msi, MsiAllocation, MsiDeviceId, MsiEventId, MsiMessage, MsiProviderId, MsiRequest,
@@ -34,14 +34,8 @@ const MAX_DEVICE_ID_BITS: u8 = 16;
 const DEFAULT_COLLECTION_ID: u16 = 0;
 const INVALID_DEVICE_ID: u64 = u64::MAX;
 
-static LPI_OWNER: SpinLock<BTreeMap<u32, DeviceId>> = SpinLock::new(BTreeMap::new());
+static LPI_OWNER: Mutex<BTreeMap<u32, DeviceId>> = Mutex::new(BTreeMap::new());
 static PRIMARY_ITS: AtomicU64 = AtomicU64::new(INVALID_DEVICE_ID);
-
-fn lpi_owners() -> RawSpinLockGuard<'static, BTreeMap<u32, DeviceId>> {
-    // SAFETY: ITS management preserves the legacy raw-lock contract and is
-    // serialized against same-CPU re-entry by the interrupt-controller path.
-    unsafe { LPI_OWNER.lock_raw() }
-}
 
 module_driver!(
     name: "GICv3 ITS",
@@ -98,7 +92,8 @@ fn with_gic<R>(
 }
 
 pub(super) fn set_lpi_enabled(irq: IrqId, enabled: bool) -> Result<(), IrqError> {
-    let owner = lpi_owners()
+    let owner = LPI_OWNER
+        .lock()
         .get(&irq.hwirq.0)
         .copied()
         .or_else(|| match PRIMARY_ITS.load(Ordering::Acquire) {
@@ -118,7 +113,8 @@ pub(super) fn set_lpi_affinity(
     irq: IrqId,
     affinity: crate::irq::IrqAffinity,
 ) -> Result<(), IrqError> {
-    let owner = lpi_owners()
+    let owner = LPI_OWNER
+        .lock()
         .get(&irq.hwirq.0)
         .copied()
         .or_else(|| match PRIMARY_ITS.load(Ordering::Acquire) {
@@ -416,7 +412,7 @@ impl Interface for GicItsProvider {
                     collection: DEFAULT_COLLECTION_ID,
                 },
             );
-            lpi_owners().insert(lpi, self.owner);
+            LPI_OWNER.lock().insert(lpi, self.owner);
             vectors.push(MsiVector::with_parent(
                 MsiVectorIndex(index),
                 event,
@@ -461,7 +457,7 @@ impl Interface for GicItsProvider {
             self.set_lpi_enabled_by_intid(intid, false)?;
             crate::irq::unmap_irq_route(vector.parent_irq, vector.irq)?;
             self.lpis.remove(&intid);
-            lpi_owners().remove(&intid);
+            LPI_OWNER.lock().remove(&intid);
         }
         Ok(())
     }

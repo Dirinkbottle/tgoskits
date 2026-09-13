@@ -3,8 +3,10 @@ use core::{
     time::Duration,
 };
 
+use ax_errno::LinuxError;
+
 use crate::{
-    PosixError, ctypes,
+    ctypes,
     ctypes::{CLOCK_MONOTONIC, CLOCK_REALTIME},
 };
 
@@ -42,14 +44,14 @@ impl From<Duration> for ctypes::timeval {
 pub unsafe fn sys_clock_gettime(clk: ctypes::clockid_t, ts: *mut ctypes::timespec) -> c_int {
     syscall_body!(sys_clock_gettime, {
         if ts.is_null() {
-            return Err(PosixError::EFAULT);
+            return Err(LinuxError::EFAULT);
         }
         let now = match clk as _ {
             CLOCK_REALTIME => ax_hal::time::wall_time().into(),
             CLOCK_MONOTONIC => ax_hal::time::monotonic_time().into(),
             _ => {
                 warn!("Called sys_clock_gettime for unsupported clock {clk}");
-                return Err(PosixError::EINVAL);
+                return Err(LinuxError::EINVAL);
             }
         };
         unsafe { *ts = now };
@@ -66,7 +68,7 @@ pub unsafe fn sys_nanosleep(req: *const ctypes::timespec, rem: *mut ctypes::time
     syscall_body!(sys_nanosleep, {
         unsafe {
             if req.is_null() || (*req).tv_nsec < 0 || (*req).tv_nsec > 999999999 {
-                return Err(PosixError::EINVAL);
+                return Err(LinuxError::EINVAL);
             }
         }
 
@@ -76,7 +78,11 @@ pub unsafe fn sys_nanosleep(req: *const ctypes::timespec, rem: *mut ctypes::time
         };
 
         let now = ax_hal::time::monotonic_time();
-        ax_runtime::task::sleep(dur);
+
+        #[cfg(feature = "multitask")]
+        ax_task::sleep(dur);
+        #[cfg(not(feature = "multitask"))]
+        ax_hal::time::busy_wait(dur);
 
         let after = ax_hal::time::monotonic_time();
         let actual = after - now;
@@ -85,7 +91,7 @@ pub unsafe fn sys_nanosleep(req: *const ctypes::timespec, rem: *mut ctypes::time
             if !rem.is_null() {
                 unsafe { (*rem) = diff.into() };
             }
-            return Err(PosixError::EINTR);
+            return Err(LinuxError::EINTR);
         }
         Ok(0)
     })

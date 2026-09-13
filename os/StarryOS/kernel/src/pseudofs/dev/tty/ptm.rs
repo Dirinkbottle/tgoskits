@@ -1,12 +1,10 @@
 use alloc::sync::Arc;
 use core::any::Any;
 
-use axfs_ng_vfs::{DeviceId, NodeType, VfsResult};
+use ax_errno::AxResult;
+use axfs_ng_vfs::{DeviceId, NodeType};
 
-use crate::{
-    StarryResult,
-    pseudofs::{Device, DeviceOps, SimpleFs, dev::tty::pts::PtsInstance},
-};
+use crate::pseudofs::{Device, DeviceOps, SimpleFs, dev::tty::pts::PtsInstance};
 
 pub struct Ptmx {
     fs: Arc<SimpleFs>,
@@ -18,7 +16,7 @@ impl Ptmx {
         Self { fs, instance }
     }
 
-    pub fn create_pty(&self) -> StarryResult<(Arc<Device>, u32)> {
+    pub fn create_pty(&self) -> AxResult<(Arc<Device>, u32)> {
         let (master, slave) = super::pty::create_pty_pair();
         self.instance.add_slave(self.fs.clone(), slave)?;
         let pty_number = master.pty_number();
@@ -35,20 +33,15 @@ impl Ptmx {
 // This is implemented as null-ops since opening `Ptmx` would result in a new
 // tty file and these implementations wouldn't actually be used
 impl DeviceOps for Ptmx {
-    fn read_at(&self, _buf: &mut [u8], _offset: u64) -> VfsResult<usize> {
+    fn read_at(&self, _buf: &mut [u8], _offset: u64) -> AxResult<usize> {
         unreachable!()
     }
 
-    fn write_at(&self, _buf: &[u8], _offset: u64) -> VfsResult<usize> {
+    fn write_at(&self, _buf: &[u8], _offset: u64) -> AxResult<usize> {
         unreachable!()
     }
 
-    fn ioctl(
-        &self,
-        _current: &crate::task::UserTaskRef,
-        _cmd: u32,
-        _arg: usize,
-    ) -> VfsResult<usize> {
+    fn ioctl(&self, _cmd: u32, _arg: usize) -> AxResult<usize> {
         unreachable!()
     }
 

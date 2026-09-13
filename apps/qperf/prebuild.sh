@@ -2,11 +2,4 @@
 set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-workspace="$(cd "$script_dir/../.." && pwd)"
-
-if [[ $# -gt 0 ]]; then
-    cd "$workspace"
-    exec "$@"
-fi
-
-printf '%s\n' "$workspace"
+exec "$script_dir/../common/prebuild-harness-kit.sh" "$@"

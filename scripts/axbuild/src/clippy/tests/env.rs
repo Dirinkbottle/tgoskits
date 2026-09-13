@@ -1,6 +1,9 @@
 use crate::clippy::{
     AXSTD_STD_CLIPPY_FEATURES, AXSTD_STD_CLIPPY_TARGET, AXSTD_STD_DEFAULT_FEATURE,
-    AXSTD_STD_PACKAGE, check::ClippyCheckKind, expand::expand_clippy_checks,
+    AXSTD_STD_PACKAGE,
+    check::{ClippyCheckKind, ClippyDepsMode},
+    expand::expand_clippy_checks,
+    selection::SelectedClippyPackage,
 };
 
 #[test]
@@ -13,7 +16,14 @@ fn axstd_default_config_is_passed_as_clippy_env() {
         .cloned()
         .expect("ax-std package should be in workspace metadata");
 
-    let checks = expand_clippy_checks(&[package], &metadata).unwrap();
+    let checks = expand_clippy_checks(
+        &[SelectedClippyPackage {
+            package,
+            deps_mode: ClippyDepsMode::NoDeps,
+        }],
+        &metadata,
+    )
+    .unwrap();
 
     assert!(
         checks[0].env.is_empty(),

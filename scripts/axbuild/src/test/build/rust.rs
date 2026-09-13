@@ -6,7 +6,16 @@ pub(crate) fn case_rust_source_dir(case: &TestQemuCase) -> PathBuf {
 
 /// Maps a StarryOS arch name to the corresponding Rust musl target triple.
 pub(super) fn rust_musl_target(arch: &str) -> anyhow::Result<&'static str> {
-    Ok(cross_compile_spec(arch)?.rust_musl_target)
+    match arch {
+        "aarch64" => Ok("aarch64-unknown-linux-musl"),
+        "riscv64" => Ok("riscv64gc-unknown-linux-musl"),
+        "x86_64" => Ok("x86_64-unknown-linux-musl"),
+        "loongarch64" => Ok("loongarch64-unknown-linux-musl"),
+        _ => bail!(
+            "Rust-based QEMU test cases are only supported on aarch64, riscv64, x86_64, and \
+             loongarch64, but got `{arch}`"
+        ),
+    }
 }
 
 fn rust_case_rustflags(arch: &str) -> &'static str {

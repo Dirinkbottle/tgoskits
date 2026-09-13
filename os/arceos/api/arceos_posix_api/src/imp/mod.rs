@@ -18,4 +18,5 @@ pub mod io_mpx;
 pub mod net;
 #[cfg(feature = "pipe")]
 pub mod pipe;
+#[cfg(feature = "multitask")]
 pub mod pthread;

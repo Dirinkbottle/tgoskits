@@ -5,11 +5,11 @@
 use alloc::{borrow::Cow, sync::Arc};
 use core::fmt::Debug;
 
+use ax_errno::{AxError, AxResult};
 use axpoll::Pollable;
 use kbpf_basic::{preprocessor::EbpfPreProcessor, prog::BpfProgMeta};
 
 use crate::{
-    StarryError, StarryResult,
     ebpf::{KernelRawMutex, map::BpfMap, transform::EbpfKernelAuxiliary},
     file::FileLike,
 };
@@ -64,25 +64,21 @@ impl Pollable for BpfProg {
         axpoll::IoEvents::empty()
     }
 
-    unsafe fn register_shared(
-        &self,
-        _sink: &mut dyn axpoll::SharedRegistrationSink,
-        _events: axpoll::IoEvents,
-    ) {
+    fn register(&self, _context: &mut core::task::Context<'_>, _events: axpoll::IoEvents) {
         // No poll semantics on bpf prog fds.
     }
 }
 
 impl FileLike for BpfProg {
-    fn read(&self, _dst: &mut crate::file::IoDst) -> StarryResult<usize> {
-        Err(StarryError::Unsupported)
+    fn read(&self, _dst: &mut crate::file::IoDst) -> AxResult<usize> {
+        Err(AxError::Unsupported)
     }
 
-    fn write(&self, _src: &mut crate::file::IoSrc) -> StarryResult<usize> {
-        Err(StarryError::Unsupported)
+    fn write(&self, _src: &mut crate::file::IoSrc) -> AxResult<usize> {
+        Err(AxError::Unsupported)
     }
 
-    fn stat(&self) -> StarryResult<crate::file::Kstat> {
+    fn stat(&self) -> AxResult<crate::file::Kstat> {
         Ok(crate::file::Kstat::default())
     }
 

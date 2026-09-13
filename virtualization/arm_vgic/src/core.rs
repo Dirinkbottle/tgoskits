@@ -2,7 +2,7 @@
 
 use alloc::{collections::BTreeMap, sync::Arc};
 
-use ax_sync::{RawSpinLockGuard, SpinLock};
+use ax_kspin::SpinRaw;
 use axdevice_base::{
     ControllerInputId, InterruptControllerId, InterruptEndpoint, InterruptTrigger, IrqError,
     IrqResult, ItsId, LpiId as EndpointLpiId, MessageInterruptController, MessageInterruptSink,
@@ -21,7 +21,7 @@ use crate::{
 pub struct VgicCore {
     config: ArmVgicConfig,
     controller: VgicController,
-    inputs: SpinLock<BTreeMap<ControllerInputId, WiredIrqInput>>,
+    inputs: SpinRaw<BTreeMap<ControllerInputId, WiredIrqInput>>,
     sink: Arc<VgicWiredSink>,
     message_sink: Arc<VgicMessageSink>,
 }
@@ -52,14 +52,8 @@ impl VgicCore {
                 id,
             }),
             controller,
-            inputs: SpinLock::new(BTreeMap::new()),
+            inputs: SpinRaw::new(BTreeMap::new()),
         })
-    }
-
-    fn inputs(&self) -> RawSpinLockGuard<'_, BTreeMap<ControllerInputId, WiredIrqInput>> {
-        // SAFETY: input opening is serialized by the VM device graph and
-        // excludes same-vCPU re-entry.
-        unsafe { self.inputs.lock_raw() }
     }
 
     /// Returns the immutable configuration used for construction and firmware.
@@ -241,7 +235,7 @@ impl VgicCore {
         input: ControllerInputId,
         trigger: InterruptTrigger,
     ) -> IrqResult<WiredIrqInput> {
-        if let Some(existing) = self.inputs().get(&input).cloned() {
+        if let Some(existing) = self.inputs.lock().get(&input).cloned() {
             return validate_existing_input(existing, trigger);
         }
         let spi = SpiId::new(input.value() as u32)
@@ -250,7 +244,7 @@ impl VgicCore {
             .configure_spi_input(spi, trigger_mode(trigger))
             .map_err(|error| irq_backend_error(self.id(), input, "configure SPI input", error))?;
         let opened = WiredIrqInput::new(self.id(), input, trigger, self.sink.clone());
-        let mut inputs = self.inputs();
+        let mut inputs = self.inputs.lock();
         if let Some(existing) = inputs.get(&input).cloned() {
             return validate_existing_input(existing, trigger);
         }
@@ -314,7 +308,7 @@ impl core::fmt::Debug for VgicCore {
         formatter
             .debug_struct("VgicCore")
             .field("config", &self.config)
-            .field("opened_inputs", &self.inputs().len())
+            .field("opened_inputs", &self.inputs.lock().len())
             .finish_non_exhaustive()
     }
 }

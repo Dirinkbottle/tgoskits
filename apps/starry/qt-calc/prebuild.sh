@@ -45,7 +45,7 @@ ensure_host_packages() {
 }
 
 extract_base_rootfs() {
-    debugfs -R "rdump / $staging_root" "$base_rootfs" >/dev/null
+    debugfs -R "rdump / $staging_root" "$base_rootfs"
 }
 
 resize_rootfs() {

@@ -1,16 +1,16 @@
 use alloc::sync::{Arc, Weak};
+use core::task::Context;
 
-use axpoll::{IoEvents, Pollable};
-use axpoll_set::PollSet;
+use ax_errno::{AxResult, ax_bail};
+use ax_kspin::SpinNoIrq;
+use ax_task::current;
+use axpoll::{IoEvents, PollSet, Pollable};
+use starry_process::{ProcessGroup, Session};
 
-use super::TerminalStateLock;
-use crate::{
-    StarryError, StarryResult,
-    task::{ProcessGroup, Session, current_user_task},
-};
+use crate::task::AsThread;
 
 pub struct JobControl {
-    state: TerminalStateLock<JobControlState>,
+    state: SpinNoIrq<JobControlState>,
     poll_fg: PollSet,
 }
 
@@ -28,7 +28,7 @@ impl Default for JobControl {
 impl JobControl {
     pub fn new() -> Self {
         Self {
-            state: TerminalStateLock::new(JobControlState {
+            state: SpinNoIrq::new(JobControlState {
                 foreground: Weak::new(),
                 session: Weak::new(),
             }),
@@ -37,16 +37,18 @@ impl JobControl {
     }
 
     pub fn current_in_foreground(&self) -> bool {
-        self.state.lock().foreground.upgrade().is_none_or(|pg| {
-            Arc::ptr_eq(&current_user_task().as_thread().proc_data.proc.group(), &pg)
-        })
+        self.state
+            .lock()
+            .foreground
+            .upgrade()
+            .is_none_or(|pg| Arc::ptr_eq(&current().as_thread().proc_data.proc.group(), &pg))
     }
 
     pub fn foreground(&self) -> Option<Arc<ProcessGroup>> {
         self.state.lock().foreground.upgrade()
     }
 
-    pub fn set_foreground(&self, pg: &Arc<ProcessGroup>) -> StarryResult<()> {
+    pub fn set_foreground(&self, pg: &Arc<ProcessGroup>) -> AxResult<()> {
         let mut state = self.state.lock();
         let weak = Arc::downgrade(pg);
         if Weak::ptr_eq(&weak, &state.foreground) {
@@ -54,10 +56,16 @@ impl JobControl {
         }
 
         let Some(session) = state.session.upgrade() else {
-            return Err(StarryError::OperationNotPermitted);
+            ax_bail!(
+                OperationNotPermitted,
+                "No session associated with job control"
+            );
         };
         if !Arc::ptr_eq(&pg.session(), &session) {
-            return Err(StarryError::OperationNotPermitted);
+            ax_bail!(
+                OperationNotPermitted,
+                "Process group does not belong to the session"
+            );
         }
 
         state.foreground = weak;
@@ -67,13 +75,16 @@ impl JobControl {
         Ok(())
     }
 
-    pub fn set_session(&self, session: &Arc<Session>) -> StarryResult<()> {
+    pub fn set_session(&self, session: &Arc<Session>) -> AxResult<()> {
         let mut state = self.state.lock();
         if let Some(existing) = state.session.upgrade() {
             if Arc::ptr_eq(&existing, session) {
                 return Ok(());
             }
-            return Err(StarryError::ResourceBusy);
+            ax_bail!(
+                ResourceBusy,
+                "Terminal is already associated with another session"
+            );
         }
         state.session = Arc::downgrade(session);
         Ok(())
@@ -112,13 +123,10 @@ impl Pollable for JobControl {
         events
     }
 
-    unsafe fn register_shared(
-        &self,
-        sink: &mut dyn axpoll::SharedRegistrationSink,
-        events: IoEvents,
-    ) {
+    fn register(&self, context: &mut Context<'_>, events: IoEvents) {
         if events.contains(IoEvents::IN) {
-            unsafe { sink.register_shared(&self.poll_fg, IoEvents::IN) };
+            // Registration happens from tty job-control poll task context.
+            unsafe { self.poll_fg.register(context.waker(), IoEvents::IN) };
         }
     }
 }

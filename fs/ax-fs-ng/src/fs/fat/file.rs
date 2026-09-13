@@ -1,11 +1,10 @@
 use alloc::{sync::Arc, vec};
-use core::{any::Any, mem, ops::Deref};
+use core::{any::Any, mem, ops::Deref, task::Context};
 
 use axfs_ng_vfs::{
-    FileNode, FileNodeOps, FilesystemOps, Metadata, MetadataUpdate, NodeFlags, NodeOps, NodeType,
-    VfsResult,
+    FileNode, FileNodeOps, FilesystemOps, FsIoEvents, FsPollable, Metadata, MetadataUpdate,
+    NodeFlags, NodeOps, NodeType, VfsError, VfsResult,
 };
-use axpoll::{IoEvents, Pollable};
 use fatfs::{Read, Seek, SeekFrom, Write};
 
 use super::{
@@ -150,19 +149,18 @@ impl FileNodeOps for FatFileNode {
             grow_file(&fs, file, len)
         }
     }
+
+    fn set_symlink(&self, _target: &str) -> VfsResult<()> {
+        Err(VfsError::PermissionDenied)
+    }
 }
 
-impl Pollable for FatFileNode {
-    fn poll(&self) -> IoEvents {
-        IoEvents::IN | IoEvents::OUT
+impl FsPollable for FatFileNode {
+    fn poll(&self) -> FsIoEvents {
+        FsIoEvents::IN | FsIoEvents::OUT
     }
 
-    unsafe fn register_shared(
-        &self,
-        _sink: &mut dyn axpoll::SharedRegistrationSink,
-        _events: IoEvents,
-    ) {
-    }
+    fn register(&self, _context: &mut Context<'_>, _events: FsIoEvents) {}
 }
 
 impl Drop for FatFileNode {

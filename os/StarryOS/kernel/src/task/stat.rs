@@ -1,11 +1,12 @@
 use alloc::{borrow::ToOwned, fmt, string::String};
 
-use ax_std::os::arceos::task::ThreadState;
+use ax_errno::AxResult;
+use ax_task::{TaskInner, TaskState};
 use starry_signal::Signo;
 
 use crate::{
     mm::ProcessMemStats,
-    task::{UserTaskRef, task_cpu_time},
+    task::{AsThread, task_cpu_time},
 };
 
 /// Represents the `/proc/[pid]/stat` file.
@@ -32,7 +33,7 @@ pub struct TaskStat {
     pub cutime: u64,
     pub cstime: u64,
     pub priority: u32,
-    pub nice: i32,
+    pub nice: u32,
     pub num_threads: u32,
     pub itrealvalue: u32,
     pub starttime: u64,
@@ -69,8 +70,8 @@ pub struct TaskStat {
 }
 
 impl TaskStat {
-    /// Creates a task-stat snapshot from a Starry scheduler handle.
-    pub fn from_thread(task: &UserTaskRef) -> crate::StarryResult<Self> {
+    /// Create a new [`TaskStat`] from a [`AxTaskRef`].
+    pub fn from_thread(task: &TaskInner) -> AxResult<Self> {
         let thread = task.as_thread();
         let proc_data = &thread.proc_data;
         let proc = &proc_data.proc;
@@ -79,12 +80,11 @@ impl TaskStat {
         let comm = task.name();
         let comm = comm[..comm.len().min(16)].to_owned();
         let state = match task.state() {
-            ThreadState::Running | ThreadState::Waking => 'R',
-            ThreadState::Parking | ThreadState::Blocked => 'S',
-            ThreadState::New => 'R',
-            ThreadState::Exited => 'Z',
+            TaskState::Running | TaskState::Ready => 'R',
+            TaskState::Blocked => 'S',
+            TaskState::Exited => 'Z',
         };
-        let ppid = proc.parent().map_or(0, |p| p.pid().get());
+        let ppid = proc.parent().map_or(0, |p| p.pid());
         let pgrp = proc.group().pgid();
         let session = proc.group().session().sid();
 
@@ -96,34 +96,28 @@ impl TaskStat {
         let cutime = (cutime_tv.as_millis() / 10) as u64;
         let cstime = (cstime_tv.as_millis() / 10) as u64;
 
-        let aspace = proc_data.pin_aspace()?;
-        let aspace = aspace.lock();
-        let mem = ProcessMemStats::collect(&aspace)?;
-        let (start_data, end_data) = aspace.executable_data_bounds();
+        let mem = ProcessMemStats::collect(&proc_data.aspace().lock());
 
         Ok(Self {
-            pid: pid.get(),
+            pid,
             comm: comm.to_owned(),
             state,
             ppid,
-            pgrp: pgrp.get(),
-            session: session.get(),
+            pgrp,
+            session,
             utime,
             stime,
             cutime,
             cstime,
-            nice: thread.nice(),
             num_threads: proc.threads().len() as u32,
             vsize: mem.vsize_bytes(),
             rss: mem.rss_pages(),
             start_code: mem.start_code,
             end_code: mem.end_code,
             start_stack: mem.start_stack,
-            start_data: start_data as u64,
-            end_data: end_data as u64,
-            start_brk: aspace.heap_start() as u64,
-            exit_signal: proc_data.exit_signal().unwrap_or(Signo::SIGCHLD) as u8,
-            processor: task.assigned_cpu().ok_or(crate::StarryError::BadState)? as u32,
+            start_brk: proc_data.get_heap_top() as u64,
+            exit_signal: proc_data.exit_signal.unwrap_or(Signo::SIGCHLD) as u8,
+            processor: task.cpu_id(),
             exit_code: proc.exit_code(),
             ..Default::default()
         })

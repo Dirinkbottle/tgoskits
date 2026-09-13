@@ -11,7 +11,7 @@ use axdevice_base::VirtualInterruptController;
 
 use self::{devices::PreparedDevices, vcpus::PreparedVcpus};
 use super::{AxVM, AxVMResources};
-use crate::{config::AxVMConfig, sync::MutexExt, *};
+use crate::*;
 
 pub(crate) struct PreparedVm {
     vcpus: PreparedVcpus,
@@ -36,17 +36,13 @@ impl PreparedVm {
 impl AxVM {
     /// Sets up the VM before booting.
     pub fn prepare(self: &Arc<Self>) -> AxVmResult {
-        crate::arch::current::CurrentArch::init_vm(self)
+        crate::arch::CurrentArch::init_vm(self)
     }
 
     pub(crate) fn prepare_resources_with(
         &self,
-        initialize: impl FnOnce(&mut AxVMResources, &AxVMConfig) -> AxVmResult<PreparedVm>,
+        initialize: impl FnOnce(&mut AxVMResources) -> AxVmResult<PreparedVm>,
     ) -> AxVmResult {
-        // Configuration is task-context state. Always acquire it before the
-        // IRQ-safe machine lock so this path never waits for config while
-        // holding `machine`.
-        let config = self.config.lock_unpoisoned();
         let mut machine = self.machine.lock();
         if !matches!(
             machine.status(),
@@ -65,7 +61,7 @@ impl AxVM {
             .resources_mut()
             .ok_or_else(|| ax_err_type!(BadState, "VM resources are not available for prepare"))?;
         resources.reset_transient_resources()?;
-        let prepared = match initialize(resources, &config) {
+        let prepared = match initialize(resources) {
             Ok(prepared) => prepared,
             Err(err) => {
                 if let Err(reset_err) = resources.reset_transient_resources() {
@@ -78,7 +74,7 @@ impl AxVM {
                 return Err(err);
             }
         };
-        resources.phys_cpu_ls = config.phys_cpu_ls.clone();
+        resources.phys_cpu_ls = resources.config.phys_cpu_ls.clone();
         resources.vcpu_list = Some(prepared.vcpus.into_boxed_slice());
         resources.devices = Some(Arc::new(prepared.devices.into_inner()));
         resources.interrupt_controller = Some(prepared.interrupt_controller);

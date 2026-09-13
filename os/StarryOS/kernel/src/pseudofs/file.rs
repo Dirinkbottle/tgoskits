@@ -1,15 +1,23 @@
 use alloc::{borrow::Cow, string::String, sync::Arc, vec::Vec};
-use core::{any::Any, cmp::Ordering};
+use core::{any::Any, cmp::Ordering, task::Context};
 
+use ax_sync::Mutex;
 use axfs_ng_vfs::{
-    FileNodeOps, FilesystemOps, Metadata, MetadataUpdate, NodeFlags, NodeOps, NodePermission,
-    NodeType, VfsError, VfsResult,
+    FileNodeOps, FilesystemOps, FsIoEvents, FsPollable, Metadata, MetadataUpdate, NodeFlags,
+    NodeOps, NodePermission, NodeType, VfsError, VfsResult,
 };
 use axpoll::{IoEvents, Pollable};
 use inherit_methods_macro::inherit_methods;
 
 use super::fs::{SimpleFs, SimpleFsNode};
-use crate::sync::PiMutex;
+
+fn fs_events_to_io(events: FsIoEvents) -> IoEvents {
+    IoEvents::from_bits_truncate(events.bits())
+}
+
+fn io_events_to_fs(events: IoEvents) -> FsIoEvents {
+    FsIoEvents::from_bits_truncate(events.bits())
+}
 
 /// Operations for a simple file.
 pub trait SimpleFileOps: Send + Sync + 'static {
@@ -226,18 +234,27 @@ impl FileNodeOps for SimpleFile {
             _ => Ok(()),
         }
     }
+
+    fn set_symlink(&self, target: &str) -> VfsResult<()> {
+        self.ops.write_all(target.as_bytes())
+    }
+}
+
+impl FsPollable for SimpleFile {
+    fn poll(&self) -> FsIoEvents {
+        FsIoEvents::IN | FsIoEvents::OUT
+    }
+
+    fn register(&self, _context: &mut Context<'_>, _events: FsIoEvents) {}
 }
 
 impl Pollable for SimpleFile {
     fn poll(&self) -> IoEvents {
-        IoEvents::IN | IoEvents::OUT
+        fs_events_to_io(FsPollable::poll(self))
     }
 
-    unsafe fn register_shared(
-        &self,
-        _sink: &mut dyn axpoll::SharedRegistrationSink,
-        _events: IoEvents,
-    ) {
+    fn register(&self, context: &mut Context<'_>, events: IoEvents) {
+        FsPollable::register(self, context, io_events_to_fs(events));
     }
 }
 
@@ -303,22 +320,28 @@ impl<T: DirectRwFsFileOps> NodeOps for SpecialFsFile<T> {
     }
 }
 
-impl<T: DirectRwFsFileOps> Pollable for SpecialFsFile<T> {
-    fn poll(&self) -> IoEvents {
+impl<T: DirectRwFsFileOps> FsPollable for SpecialFsFile<T> {
+    fn poll(&self) -> FsIoEvents {
         // TODO: support poll for special files when needed
-        IoEvents::IN | IoEvents::OUT
+        FsIoEvents::IN | FsIoEvents::OUT
     }
 
-    unsafe fn register_shared(
-        &self,
-        _sink: &mut dyn axpoll::SharedRegistrationSink,
-        _events: IoEvents,
-    ) {
+    fn register(&self, _context: &mut Context<'_>, _events: FsIoEvents) {
         // SpecialFsFile reports itself as always-ready via `poll()` (IN|OUT),
         // so registration is a no-op. Matches `SimpleFile::register` above —
         // turning this into `unimplemented!()` was a regression that panicked
         // the kernel on any `epoll_ctl` against debugfs/procfs special files
         // (tracepoint trace_pipe, saved_cmdlines, dyn_debug controls, …).
+    }
+}
+
+impl<T: DirectRwFsFileOps> Pollable for SpecialFsFile<T> {
+    fn poll(&self) -> IoEvents {
+        fs_events_to_io(FsPollable::poll(self))
+    }
+
+    fn register(&self, context: &mut Context<'_>, events: IoEvents) {
+        FsPollable::register(self, context, io_events_to_fs(events));
     }
 }
 
@@ -343,13 +366,17 @@ impl<T: DirectRwFsFileOps> FileNodeOps for SpecialFsFile<T> {
         }
         Err(VfsError::InvalidInput)
     }
+
+    fn set_symlink(&self, _target: &str) -> VfsResult<()> {
+        Err(VfsError::InvalidInput)
+    }
 }
 
 // TODO: create a linux like seq file that supports iterating content in chunks instead of reading all content at once, to avoid large memory usage for large files.
 /// A Sequential file, which only supports reading all content. It is used for procfs and sysfs.
 pub struct SeqObject {
     ops: Arc<dyn SimpleFileOps>,
-    content_cache: PiMutex<Option<Vec<u8>>>,
+    content_cache: Mutex<Option<Vec<u8>>>,
 }
 
 impl DirectRwFsFileOps for SeqObject {
@@ -378,7 +405,7 @@ impl SeqObject {
     /// more features like iterating content.
     pub fn new(ops: impl SimpleFileOps) -> Self {
         Self {
-            content_cache: PiMutex::new(None),
+            content_cache: Mutex::new(None),
             ops: Arc::new(ops),
         }
     }

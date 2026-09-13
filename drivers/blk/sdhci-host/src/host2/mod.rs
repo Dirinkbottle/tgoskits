@@ -88,13 +88,13 @@ impl Sdhci {
         Ok((id, request, slot))
     }
 
-    fn pending_transaction_progress(&self) -> sdmmc_host::RequestProgress<sdmmc_host::RawResponse> {
+    fn pending_transaction_progress(&self) -> sdio_host2::RequestProgress<sdio_host2::RawResponse> {
         match self.progress_wait_kind() {
             sdmmc_protocol::sdio::HostProgressWait::Register { retry_after } => {
-                sdmmc_host::RequestProgress::RegisterPending { retry_after }
+                sdio_host2::RequestProgress::RegisterPending { retry_after }
             }
             sdmmc_protocol::sdio::HostProgressWait::Irq => {
-                sdmmc_host::RequestProgress::WaitingForIrq
+                sdio_host2::RequestProgress::WaitingForIrq
             }
         }
     }
@@ -123,15 +123,15 @@ impl Sdhci {
     fn check_host2_transaction_request(
         &self,
         request: &TransactionRequest<'_>,
-    ) -> Result<(), sdmmc_host::AdvanceRequestError> {
+    ) -> Result<(), sdio_host2::AdvanceRequestError> {
         if request.done {
-            return Err(sdmmc_host::AdvanceRequestError::AlreadyCompleted);
+            return Err(sdio_host2::AdvanceRequestError::AlreadyCompleted);
         }
         if request.owner != self.host2_owner() {
-            return Err(sdmmc_host::AdvanceRequestError::WrongOwner);
+            return Err(sdio_host2::AdvanceRequestError::WrongOwner);
         }
         if self.host2_active_id != Some(request.id) {
-            return Err(sdmmc_host::AdvanceRequestError::StaleGeneration);
+            return Err(sdio_host2::AdvanceRequestError::StaleGeneration);
         }
         Ok(())
     }
@@ -139,15 +139,15 @@ impl Sdhci {
     fn check_host2_bus_request(
         &self,
         request: &BusRequest,
-    ) -> Result<(), sdmmc_host::AdvanceRequestError> {
+    ) -> Result<(), sdio_host2::AdvanceRequestError> {
         if request.done {
-            return Err(sdmmc_host::AdvanceRequestError::AlreadyCompleted);
+            return Err(sdio_host2::AdvanceRequestError::AlreadyCompleted);
         }
         if request.owner != self.host2_owner() {
-            return Err(sdmmc_host::AdvanceRequestError::WrongOwner);
+            return Err(sdio_host2::AdvanceRequestError::WrongOwner);
         }
         if self.host2_active_id != Some(request.id) {
-            return Err(sdmmc_host::AdvanceRequestError::StaleGeneration);
+            return Err(sdio_host2::AdvanceRequestError::StaleGeneration);
         }
         Ok(())
     }
@@ -165,7 +165,7 @@ impl Sdhci {
     fn abort_host2_transaction_request(
         &mut self,
         request: &mut TransactionRequest<'_>,
-    ) -> Result<(), sdmmc_host::Error> {
+    ) -> Result<(), sdio_host2::Error> {
         let result = if let Some(data) = request.data.as_mut() {
             if let Some(active) = data.request.take() {
                 let id = active.id();
@@ -184,20 +184,20 @@ impl Sdhci {
     }
 }
 
-fn map_protocol_error(err: Error) -> sdmmc_host::Error {
+fn map_protocol_error(err: Error) -> sdio_host2::Error {
     match err {
-        Error::Timeout(_) => sdmmc_host::Error::Timeout,
-        Error::Crc(_) => sdmmc_host::Error::Crc,
-        Error::NoCard => sdmmc_host::Error::NoCard,
-        Error::Busy => sdmmc_host::Error::Busy,
-        Error::UnsupportedCommand => sdmmc_host::Error::Unsupported,
-        Error::Misaligned => sdmmc_host::Error::Misaligned,
-        Error::InvalidArgument => sdmmc_host::Error::InvalidArgument,
-        Error::BusError(_) => sdmmc_host::Error::Bus,
+        Error::Timeout(_) => sdio_host2::Error::Timeout,
+        Error::Crc(_) => sdio_host2::Error::Crc,
+        Error::NoCard => sdio_host2::Error::NoCard,
+        Error::Busy => sdio_host2::Error::Busy,
+        Error::UnsupportedCommand => sdio_host2::Error::Unsupported,
+        Error::Misaligned => sdio_host2::Error::Misaligned,
+        Error::InvalidArgument => sdio_host2::Error::InvalidArgument,
+        Error::BusError(_) => sdio_host2::Error::Bus,
         Error::ReadError(_) | Error::WriteError(_) | Error::BadResponse(_) => {
-            sdmmc_host::Error::Bus
+            sdio_host2::Error::Bus
         }
-        Error::CardError(_) | Error::CardLocked => sdmmc_host::Error::Controller,
-        _ => sdmmc_host::Error::Controller,
+        Error::CardError(_) | Error::CardLocked => sdio_host2::Error::Controller,
+        _ => sdio_host2::Error::Controller,
     }
 }

@@ -1,16 +1,24 @@
 use alloc::{sync::Arc, vec::Vec};
-use core::any::Any;
+use core::{any::Any, task::Context};
 
 use ax_fs_ng::vfs::CachedFile;
 use ax_memory_addr::{PhysAddr, PhysAddrRange};
 use axfs_ng_vfs::{
-    DeviceId, FileNodeOps, FilesystemOps, Metadata, MetadataUpdate, NodeFlags, NodeOps,
-    NodePermission, NodeType, VfsError, VfsResult,
+    DeviceId, FileNodeOps, FilesystemOps, FsIoEvents, FsPollable, Metadata, MetadataUpdate,
+    NodeFlags, NodeOps, NodePermission, NodeType, VfsError, VfsResult,
 };
 use axpoll::{IoEvents, Pollable};
 use inherit_methods_macro::inherit_methods;
 
 use super::{SimpleFs, SimpleFsNode};
+
+fn fs_events_to_io(events: FsIoEvents) -> IoEvents {
+    IoEvents::from_bits_truncate(events.bits())
+}
+
+fn io_events_to_fs(events: IoEvents) -> FsIoEvents {
+    FsIoEvents::from_bits_truncate(events.bits())
+}
 
 /// Mmap behavior for devices.
 #[derive(Clone)]
@@ -27,6 +35,7 @@ pub enum DeviceMmap {
     ///
     /// This is for DMA buffers that are normal memory and whose driver/runtime
     /// performs explicit cache maintenance around device access.
+    #[cfg(feature = "rknpu")]
     PhysicalCached(PhysAddrRange, Option<Arc<dyn Any + Send + Sync>>),
     /// Maps to an already offset-resolved physical address range.
     ///
@@ -50,12 +59,7 @@ pub trait DeviceOps: Send + Sync {
     /// Writes data to the device at the specified offset.
     fn write_at(&self, buf: &[u8], offset: u64) -> VfsResult<usize>;
     /// Manipulates the underlying device parameters of special files.
-    fn ioctl(
-        &self,
-        _current: &crate::task::UserTaskRef,
-        _cmd: u32,
-        _arg: usize,
-    ) -> VfsResult<usize> {
+    fn ioctl(&self, _cmd: u32, _arg: usize) -> VfsResult<usize> {
         Err(VfsError::NotATty)
     }
 
@@ -123,16 +127,6 @@ impl Device {
     pub fn mmap(&self, offset: u64, length: u64) -> DeviceMmap {
         self.ops.mmap(offset, length)
     }
-
-    /// Executes a user ioctl with an explicit address-space capability.
-    pub fn ioctl_for_task(
-        &self,
-        current: &crate::task::UserTaskRef,
-        cmd: u32,
-        arg: usize,
-    ) -> VfsResult<usize> {
-        self.ops.ioctl(current, cmd, arg)
-    }
 }
 
 #[inherit_methods(from = "self.node")]
@@ -184,38 +178,37 @@ impl FileNodeOps for Device {
         }
     }
 
+    fn set_symlink(&self, _target: &str) -> VfsResult<()> {
+        Err(VfsError::BadFileDescriptor)
+    }
+
     fn ioctl(&self, cmd: u32, arg: usize) -> VfsResult<usize> {
-        let _ = (cmd, arg);
-        Err(VfsError::NotATty)
+        self.ops.ioctl(cmd, arg)
+    }
+}
+
+impl FsPollable for Device {
+    fn poll(&self) -> FsIoEvents {
+        if let Some(pollable) = self.ops.as_pollable() {
+            io_events_to_fs(pollable.poll())
+        } else {
+            FsIoEvents::IN | FsIoEvents::OUT
+        }
+    }
+
+    fn register(&self, context: &mut Context<'_>, events: FsIoEvents) {
+        if let Some(pollable) = self.ops.as_pollable() {
+            pollable.register(context, fs_events_to_io(events));
+        }
     }
 }
 
 impl Pollable for Device {
     fn poll(&self) -> IoEvents {
-        if let Some(pollable) = self.ops.as_pollable() {
-            pollable.poll()
-        } else {
-            IoEvents::IN | IoEvents::OUT
-        }
+        fs_events_to_io(FsPollable::poll(self))
     }
 
-    unsafe fn register_shared(
-        &self,
-        sink: &mut dyn axpoll::SharedRegistrationSink,
-        events: IoEvents,
-    ) {
-        if let Some(pollable) = self.ops.as_pollable() {
-            unsafe { pollable.register_shared(sink, events) };
-        }
-    }
-
-    unsafe fn register_exclusive(
-        &self,
-        sink: &mut dyn axpoll::ExclusiveRegistrationSink,
-        events: IoEvents,
-    ) {
-        if let Some(pollable) = self.ops.as_pollable() {
-            unsafe { pollable.register_exclusive(sink, events) };
-        }
+    fn register(&self, context: &mut Context<'_>, events: IoEvents) {
+        FsPollable::register(self, context, io_events_to_fs(events));
     }
 }

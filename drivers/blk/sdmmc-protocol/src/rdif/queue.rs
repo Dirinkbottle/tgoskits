@@ -7,7 +7,7 @@ use rdif_block::{
     HardwareQueue, OwnedRequest, OwnedRequestBatch, QueueInfo, RequestId, RequestOp,
     SubmissionSink, SubmitError, validate_owned_request,
 };
-use sdmmc_host::ProgressCause;
+use sdio_host2::ProgressCause;
 
 use crate::{
     BlockProgress, BlockRequestId, OperationProgress,
@@ -21,9 +21,9 @@ use crate::{
     },
     response::CardState,
     sdio::{
-        host::{HostProgressWait, SdMmcIrqHost},
-        init::{CardInitPreference, MmcSwitchRequest, SdMmcInitWait},
-        native::{CardKind, SdMmcCard, SdMmcStatusRequest},
+        card::{CardKind, SdioSdmmc, SdioStatusRequest},
+        host::{HostProgressWait, SdioIrqHost},
+        init::{CardInitPreference, MmcSwitchRequest, SdioInitWait},
     },
 };
 
@@ -34,17 +34,17 @@ const INIT_POWER_UP_RETRY_DELAY: Duration = Duration::from_millis(10);
 
 enum FlushRequest {
     Cache(MmcSwitchRequest),
-    Status(SdMmcStatusRequest),
+    Status(SdioStatusRequest),
 }
 
 /// Queue state exclusively owned by one block runtime maintenance task.
 pub struct BlockQueue<H>
 where
-    H: SdMmcIrqHost + Send + 'static,
+    H: SdioIrqHost + Send + 'static,
     H::TransactionRequest<'static>: Send,
     H::BusRequest: Send,
 {
-    card: SdMmcCard<H>,
+    card: SdioSdmmc<H>,
     config: super::config::BlockConfig,
     id: usize,
     slot: ProtocolBlockSlot,
@@ -53,7 +53,7 @@ where
     flush: Option<(RequestId, FlushRequest)>,
     next_flush_id: usize,
     completion_irq_enabled: bool,
-    init_request: Option<crate::sdio::init::SdMmcInitRequest<H>>,
+    init_request: Option<crate::sdio::init::SdioInitRequest<H>>,
     init_status: Option<Arc<BlockInitStatus>>,
     register_retry_after: Option<Duration>,
     supports_flush: bool,
@@ -62,11 +62,11 @@ where
 
 impl<H> BlockQueue<H>
 where
-    H: SdMmcIrqHost + Send + 'static,
+    H: SdioIrqHost + Send + 'static,
     H::TransactionRequest<'static>: Send,
     H::BusRequest: Send,
 {
-    pub(super) fn new(card: SdMmcCard<H>, config: super::config::BlockConfig, id: usize) -> Self {
+    pub(super) fn new(card: SdioSdmmc<H>, config: super::config::BlockConfig, id: usize) -> Self {
         let supports_flush = queue_supports_flush(card.kind(), None);
         Self {
             card,
@@ -87,7 +87,7 @@ where
     }
 
     pub(super) fn new_initializing(
-        card: SdMmcCard<H>,
+        card: SdioSdmmc<H>,
         config: super::config::BlockConfig,
         id: usize,
         preference: CardInitPreference,
@@ -121,8 +121,7 @@ where
         if self.completion_irq_enabled && self.card.host().completion_irq_enabled() {
             return Ok(());
         }
-        SdMmcIrqHost::enable_completion_irq(self.card.host_mut())
-            .map_err(map_dev_err_to_blk_err)?;
+        SdioIrqHost::enable_completion_irq(self.card.host_mut()).map_err(map_dev_err_to_blk_err)?;
         if !self.card.host().completion_irq_enabled() {
             return Err(BlkError::NotSupported);
         }
@@ -145,7 +144,7 @@ where
                     Some(INIT_POWER_UP_RETRY_DELAY)
                 } else if let Some(retry_after) = self.card.init_register_retry_after(&request) {
                     Some(retry_after)
-                } else if self.card.init_wait_kind(&request) == SdMmcInitWait::Register {
+                } else if self.card.init_wait_kind(&request) == SdioInitWait::Register {
                     Some(INIT_REGISTER_RETRY_DELAY)
                 } else {
                     None
@@ -404,9 +403,27 @@ fn queue_supports_flush(
     true
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mmc_first_queue_advertises_flush_before_card_detection() {
+        assert!(queue_supports_flush(
+            CardKind::Sd,
+            Some(CardInitPreference::MmcFirst),
+        ));
+    }
+
+    #[test]
+    fn detected_sd_queue_advertises_irq_backed_flush_barrier() {
+        assert!(queue_supports_flush(CardKind::Sd, None));
+    }
+}
+
 impl<H> HardwareQueue for BlockQueue<H>
 where
-    H: SdMmcIrqHost + Send + 'static,
+    H: SdioIrqHost + Send + 'static,
     H::TransactionRequest<'static>: Send,
     H::BusRequest: Send,
 {
@@ -496,7 +513,7 @@ where
         };
         if self.completion_irq_enabled {
             remember(
-                SdMmcIrqHost::disable_completion_irq(self.card.host_mut())
+                SdioIrqHost::disable_completion_irq(self.card.host_mut())
                     .map_err(map_dev_err_to_blk_err),
             );
             self.completion_irq_enabled = false;
@@ -532,23 +549,5 @@ where
             remember(result);
         }
         first_error.map_or(Ok(()), Err)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn mmc_first_queue_advertises_flush_before_card_detection() {
-        assert!(queue_supports_flush(
-            CardKind::Sd,
-            Some(CardInitPreference::MmcFirst),
-        ));
-    }
-
-    #[test]
-    fn detected_sd_queue_advertises_irq_backed_flush_barrier() {
-        assert!(queue_supports_flush(CardKind::Sd, None));
     }
 }

@@ -16,18 +16,8 @@
 #include <termios.h>
 #include <unistd.h>
 
-/* The parent must retain a kill handle after the child creates a new session. */
-static volatile sig_atomic_t child_to_cleanup = -1;
-
 static void fail(const char *stage)
 {
-    int saved_errno = errno;
-    pid_t child = (pid_t)child_to_cleanup;
-    if (child > 0) {
-        (void)kill(child, SIGKILL);
-        child_to_cleanup = -1;
-    }
-    errno = saved_errno;
     printf("TEST_NIX_BUILDER_INIT_FAILED stage=%s errno=%d (%s)\n", stage,
            errno, strerror(errno));
     exit(1);
@@ -44,9 +34,6 @@ static void child_fail(const char *stage)
 static void timeout_handler(int signo)
 {
     (void)signo;
-    pid_t child = (pid_t)child_to_cleanup;
-    if (child > 0)
-        (void)kill(child, SIGKILL);
     static const char marker[] =
         "TEST_NIX_BUILDER_INIT_FAILED stage=timeout\n";
     ssize_t ignored = write(STDOUT_FILENO, marker, sizeof(marker) - 1);
@@ -158,8 +145,6 @@ int main(void)
         child_fail("exec");
     }
 
-    child_to_cleanup = child;
-
     char line[256];
     ssize_t length = read_line(master, line, sizeof(line));
     if (length < 0)
@@ -176,7 +161,6 @@ int main(void)
     int status;
     if (waitpid(child, &status, 0) != child)
         fail("waitpid");
-    child_to_cleanup = -1;
     if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
         errno = ECHILD;
         fail("child-status");

@@ -34,25 +34,6 @@ pub(super) fn reserve_guest_memory(
     Ok(())
 }
 
-pub(super) fn fixed_mmio_ranges(
-    requests: &[DevicePlanRequest],
-) -> AxVmResult<Vec<core::ops::Range<u64>>> {
-    let mut ranges = Vec::new();
-    for request in requests {
-        for requirement in request.requirements().entries() {
-            if let DeviceRequirement::Mmio {
-                size,
-                request: ResourceRequest::Fixed(base),
-                ..
-            } = requirement
-            {
-                ranges.push(fixed_u64_range(*base, *size, request.id(), "MMIO")?);
-            }
-        }
-    }
-    Ok(ranges)
-}
-
 pub(super) fn allow_fixed_requirements(
     requests: &[DevicePlanRequest],
     pools: &mut ResourcePools,
@@ -175,7 +156,7 @@ fn fixed_u16_range(
     Ok(base..end)
 }
 
-pub(super) fn checked_u64_range(
+fn checked_u64_range(
     base: usize,
     size: usize,
     kind: &'static str,

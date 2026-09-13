@@ -1,28 +1,19 @@
 use core::fmt;
 
+use ax_errno::LinuxResult;
 use ax_net::{
-    RecvOptions, SocketAddrEx, SocketOps, poll_socket_io,
+    RecvOptions, SocketAddrEx, SocketOps,
     unix::{DgramTransport, UnixSocket, UnixSocketAddr},
 };
-use axpoll::IoEvents;
 
-use crate::StarryResult;
-
-pub fn bind_dev_log() -> StarryResult<()> {
+pub fn bind_dev_log() -> LinuxResult<()> {
     let server = UnixSocket::new(DgramTransport::new(1));
     server.bind(SocketAddrEx::Unix(UnixSocketAddr::Path("/dev/log".into())))?;
-    crate::task::spawn_kernel_thread(
+    ax_task::spawn_with_name(
         move || {
             let mut buf = [0u8; 65536];
             loop {
-                let mut dst = &mut buf[..];
-                let mut options = RecvOptions::default();
-                match crate::task::future::block_on(poll_socket_io(
-                    &server,
-                    IoEvents::IN,
-                    false,
-                    || server.try_recv(&mut dst, &mut options),
-                )) {
+                match server.recv(&mut buf[..], RecvOptions::default()) {
                     Ok(read) => {
                         let msg = LossyByteStr(buf[..read].trim_ascii_end());
                         info!("{msg}");

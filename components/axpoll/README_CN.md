@@ -1,6 +1,6 @@
 <h1 align="center">axpoll</h1>
 
-<p align="center">与调度器无关的类型化 I/O readiness 契约</p>
+<p align="center">A library for polling I/O events and waking up tasks</p>
 
 <div align="center">
 
@@ -15,14 +15,7 @@
 
 # 介绍
 
-`axpoll` 是 TGOSKits 使用的纯 `no_std` readiness API。它定义事件位、
-readiness source、拥有所有权的注册 lease，以及类型化的 shared observer
-和 exclusive consumer 注册能力；它不拥有具体 wait queue、调度器、锁实现
-或 hard-IRQ 唤醒路径。
-
-任务/延迟上下文若需要具有 Linux waitqueue 选择语义的通用注册队列，应使用
-[`axpoll-set`](../axpoll-set)。OS runtime 再将队列与任务阻塞、IRQ 到任务的
-投递机制组合；VFS 和设备接口只依赖本 crate 的 readiness 契约。
+`axpoll` 提供了 A library for polling I/O events and waking up tasks。它是 TGOSKits 组件集合的一部分，可用于集成 ArceOS、AxVisor 及相关底层系统软件的 Rust 项目。
 
 ## 快速开始
 
@@ -32,7 +25,7 @@ readiness source、拥有所有权的注册 lease，以及类型化的 shared ob
 
 ```toml
 [dependencies]
-axpoll = "0.5.4"
+axpoll = "0.3.2"
 ```
 
 ### 检查与测试
@@ -56,25 +49,13 @@ cargo doc --no-deps
 
 ## 集成方式
 
-### 契约示例
+### 示例
 
 ```rust
-use axpoll::{IoEvents, Pollable, SharedRegistrationSink};
+use axpoll as _;
 
-struct ReadableObject;
-
-impl Pollable for ReadableObject {
-    fn poll(&self) -> IoEvents {
-        IoEvents::IN
-    }
-
-    unsafe fn register_shared(
-        &self,
-        _sink: &mut dyn SharedRegistrationSink,
-        _events: IoEvents,
-    ) {
-        // 有状态 source 在任务/延迟上下文中注册拥有所有权的 lease。
-    }
+fn main() {
+    // 在这里将 `axpoll` 集成到你的项目中。
 }
 ```
 

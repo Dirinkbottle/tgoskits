@@ -1,5 +1,3 @@
-mod common;
-
 use rdrive::{
     DriverGeneric, Platform, PlatformDevice, PlatformSource, get_one, init_sources,
     probe::{OnProbeError, acpi::AcpiRoot},

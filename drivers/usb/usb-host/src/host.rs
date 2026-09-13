@@ -1,16 +1,13 @@
-use alloc::boxed::Box;
-#[cfg(any(kmod, umod))]
-use alloc::vec::Vec;
+use alloc::{boxed::Box, collections::BTreeMap, sync::Arc, vec::Vec};
 
 #[cfg(kmod)]
 pub use super::backend::kmod::*;
 #[cfg(umod)]
 pub use super::backend::umod::*;
-pub use crate::device::{
-    Device, DeviceInfo, HubDeviceInfo, InterfaceSession, ProbeChanges, ProbedDevice,
-};
+pub use crate::device::{Device, DeviceInfo, HubDeviceInfo, ProbeChanges, ProbedDevice};
 use crate::{
     backend::{BackendOp, ty::*},
+    driver::{UsbDriver, UsbDriverRegistry, UsbId, UsbInterface},
     err::Result,
 };
 
@@ -18,9 +15,30 @@ use crate::{
 pub struct USBHost {
     pub(crate) backend: Box<dyn BackendOp>,
     pub(crate) initialized: bool,
+    driver_registry: UsbDriverRegistry,
+    bound_interfaces: BTreeMap<usize, Vec<Arc<UsbInterface>>>,
+    connected_devices: BTreeMap<usize, DeviceInfo>,
 }
 
 impl USBHost {
+    pub(crate) fn with_backend(backend: Box<dyn BackendOp>) -> Self {
+        Self {
+            backend,
+            initialized: false,
+            driver_registry: UsbDriverRegistry::default(),
+            bound_interfaces: BTreeMap::new(),
+            connected_devices: BTreeMap::new(),
+        }
+    }
+
+    /// Registers static interface driver IDs for this host.
+    ///
+    /// Register drivers before the first [`Self::probe_changes`] call so each
+    /// newly enumerated interface is considered exactly once.
+    pub fn register_usb_driver(&mut self, driver: &'static dyn UsbDriver, ids: &'static [UsbId]) {
+        self.driver_registry.register_usb_driver(driver, ids);
+    }
+
     /// 初始化主机控制器
     pub async fn init(&mut self) -> Result<()> {
         if self.initialized {
@@ -32,12 +50,24 @@ impl USBHost {
     }
 
     #[cfg(any(kmod, umod))]
-    pub async fn probe_devices(&mut self) -> Result<ProbeChanges> {
+    pub async fn probe_devices(&mut self) -> Result<Vec<ProbedDevice>> {
+        Ok(self.probe_changes().await?.connected)
+    }
+
+    #[cfg(any(kmod, umod))]
+    /// Returns connection and disconnection transitions since the last scan.
+    pub async fn probe_changes(&mut self) -> Result<ProbeChanges> {
         let changes = self.backend.device_list().await?;
+        self.disconnect_removed_interfaces(&changes.disconnected);
         let mut connected = Vec::new();
         for dev in changes.connected {
             let dev_info = match dev {
-                ProbedDeviceInfoOp::Device(inner) => ProbedDevice::Device(DeviceInfo { inner }),
+                ProbedDeviceInfoOp::Device(inner) => {
+                    let info = DeviceInfo::new(inner);
+                    self.probe_device_interfaces(&info);
+                    self.connected_devices.insert(info.id(), info.clone());
+                    ProbedDevice::Device(info)
+                }
                 ProbedDeviceInfoOp::Hub(inner) => ProbedDevice::Hub(HubDeviceInfo { inner }),
             };
             connected.push(dev_info);
@@ -46,6 +76,32 @@ impl USBHost {
             connected,
             disconnected: changes.disconnected,
         })
+    }
+
+    fn probe_device_interfaces(&mut self, device: &DeviceInfo) {
+        let interfaces = device.interfaces().to_vec();
+        for interface in &interfaces {
+            self.driver_registry.probe_interface(interface);
+        }
+        self.bound_interfaces.insert(device.id(), interfaces);
+    }
+
+    fn disconnect_removed_interfaces(&mut self, disconnected: &[usize]) {
+        for device_id in disconnected {
+            self.connected_devices.remove(device_id);
+            let Some(interfaces) = self.bound_interfaces.remove(device_id) else {
+                continue;
+            };
+            self.driver_registry.disconnect_interfaces(&interfaces);
+        }
+    }
+
+    /// Returns descriptions for devices retained in the connected USB topology.
+    ///
+    /// Unlike [`Self::probe_changes`], this does not consume a connection
+    /// transition and remains valid after another subsystem handles hotplug.
+    pub fn connected_devices(&self) -> impl Iterator<Item = &DeviceInfo> {
+        self.connected_devices.values()
     }
 
     #[cfg(kmod)]
@@ -85,21 +141,6 @@ pub struct EventHandler {
 }
 
 impl EventHandler {
-    /// Acknowledges one device IRQ without draining task-owned completions.
-    pub fn acknowledge_irq(&self) -> bool {
-        self.handler.acknowledge_irq()
-    }
-
-    /// Drains one event batch in task context.
-    pub fn drain_event(&self) -> Event {
-        self.handler.drain_event()
-    }
-
-    /// Rearms device interrupts after task-context event draining.
-    pub fn rearm_irq(&self) {
-        self.handler.rearm_irq()
-    }
-
     /// 处理事件
     pub fn handle_event(&self) -> Event {
         self.handler.handle_event()
@@ -118,12 +159,17 @@ mod tests {
     };
 
     use futures::{FutureExt, future::LocalBoxFuture};
-    use usb_if::err::USBError;
+    use usb_if::{
+        descriptor::{
+            ConfigurationDescriptor, DeviceDescriptor, InterfaceDescriptor, InterfaceDescriptors,
+        },
+        err::USBError,
+    };
 
     use super::*;
     use crate::backend::{
         BackendOp,
-        ty::{DeviceOp, ProbeChangesOp},
+        ty::{DeviceInfoOp, DeviceOp, ProbeChangesOp, ProbedDeviceInfoOp},
     };
 
     #[derive(Default)]
@@ -135,6 +181,7 @@ mod tests {
 
     struct TestBackend {
         calls: Arc<IrqCalls>,
+        connected: Vec<ProbedDeviceInfoOp>,
         disconnected: Vec<usize>,
     }
 
@@ -148,10 +195,12 @@ mod tests {
         fn device_list<'a>(
             &'a mut self,
         ) -> futures::future::BoxFuture<'a, crate::err::Result<ProbeChangesOp>> {
+            let connected = core::mem::take(&mut self.connected);
+            let disconnected = core::mem::take(&mut self.disconnected);
             async {
                 Ok(ProbeChangesOp {
-                    connected: Vec::new(),
-                    disconnected: Vec::new(),
+                    connected,
+                    disconnected,
                 })
             }
             .boxed()
@@ -185,16 +234,55 @@ mod tests {
 
     #[cfg(kmod)]
     impl crate::backend::ty::EventHandlerOp for TestEventHandler {
-        fn acknowledge_irq(&self) -> bool {
-            false
-        }
-
-        fn drain_event(&self) -> crate::backend::ty::Event {
+        fn handle_event(&self) -> crate::backend::ty::Event {
             crate::backend::ty::Event::Nothing
         }
-
-        fn rearm_irq(&self) {}
     }
+
+    #[derive(Debug)]
+    struct TestDeviceInfo {
+        descriptor: DeviceDescriptor,
+        configurations: Vec<ConfigurationDescriptor>,
+    }
+
+    impl DeviceInfoOp for TestDeviceInfo {
+        fn id(&self) -> usize {
+            1
+        }
+
+        fn backend_name(&self) -> &str {
+            "test"
+        }
+
+        fn descriptor(&self) -> &DeviceDescriptor {
+            &self.descriptor
+        }
+
+        fn configuration_descriptors(&self) -> &[ConfigurationDescriptor] {
+            &self.configurations
+        }
+    }
+
+    struct TestUvcDriver;
+
+    impl UsbDriver for TestUvcDriver {
+        fn name(&self) -> &'static str {
+            "test-uvc"
+        }
+
+        fn probe(&self, _interface: &UsbInterface) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    static TEST_UVC_DRIVER: TestUvcDriver = TestUvcDriver;
+    static TEST_UVC_IDS: &[UsbId] = &[UsbId {
+        vid: None,
+        pid: None,
+        class: Some(0x0e),
+        subclass: Some(0x01),
+        protocol: None,
+    }];
 
     fn block_on_ready<F: Future>(mut future: F) -> F::Output {
         let waker = noop_waker();
@@ -221,13 +309,11 @@ mod tests {
     #[test]
     fn host_irq_control_forwards_to_backend() {
         let calls = Arc::new(IrqCalls::default());
-        let mut host = USBHost {
-            backend: Box::new(TestBackend {
-                calls: calls.clone(),
-                disconnected: Vec::new(),
-            }),
-            initialized: false,
-        };
+        let mut host = USBHost::with_backend(Box::new(TestBackend {
+            calls: calls.clone(),
+            connected: Vec::new(),
+            disconnected: Vec::new(),
+        }));
 
         host.enable_irq().unwrap();
         host.disable_irq().unwrap();
@@ -239,13 +325,11 @@ mod tests {
     #[test]
     fn host_init_is_idempotent() {
         let calls = Arc::new(IrqCalls::default());
-        let mut host = USBHost {
-            backend: Box::new(TestBackend {
-                calls: calls.clone(),
-                disconnected: Vec::new(),
-            }),
-            initialized: false,
-        };
+        let mut host = USBHost::with_backend(Box::new(TestBackend {
+            calls: calls.clone(),
+            connected: Vec::new(),
+            disconnected: Vec::new(),
+        }));
 
         block_on_ready(host.init()).unwrap();
         block_on_ready(host.init()).unwrap();
@@ -255,17 +339,82 @@ mod tests {
 
     #[test]
     fn host_preserves_disconnected_device_ids() {
-        let mut host = USBHost {
-            backend: Box::new(TestBackend {
-                calls: Arc::new(IrqCalls::default()),
-                disconnected: vec![7, 9],
-            }),
-            initialized: true,
-        };
+        let mut host = USBHost::with_backend(Box::new(TestBackend {
+            calls: Arc::new(IrqCalls::default()),
+            connected: Vec::new(),
+            disconnected: vec![7, 9],
+        }));
+        host.initialized = true;
 
         let changes = block_on_ready(host.probe_changes()).unwrap();
 
         assert!(changes.connected.is_empty());
         assert_eq!(changes.disconnected, vec![7, 9]);
+    }
+
+    #[test]
+    fn probe_changes_binds_registered_driver_to_enumerated_interface() {
+        let mut host = USBHost::with_backend(Box::new(TestBackend {
+            calls: Arc::new(IrqCalls::default()),
+            connected: vec![ProbedDeviceInfoOp::Device(Box::new(test_device_info()))],
+            disconnected: Vec::new(),
+        }));
+        host.register_usb_driver(&TEST_UVC_DRIVER, TEST_UVC_IDS);
+
+        let changes = block_on_ready(host.probe_changes()).unwrap();
+        let ProbedDevice::Device(device) = changes.connected.first().unwrap() else {
+            panic!("test backend must enumerate a non-hub device");
+        };
+
+        assert_eq!(device.interfaces().len(), 1);
+        assert_eq!(device.interfaces()[0].driver_name(), Some("test-uvc"));
+        assert_eq!(host.connected_devices().count(), 1);
+        assert_eq!(host.connected_devices().next().unwrap().id(), device.id());
+
+        let changes = block_on_ready(host.probe_changes()).unwrap();
+        assert!(changes.connected.is_empty());
+        assert_eq!(host.connected_devices().count(), 1);
+    }
+
+    fn test_device_info() -> TestDeviceInfo {
+        TestDeviceInfo {
+            descriptor: DeviceDescriptor {
+                usb_version: 0x0200,
+                class: 0,
+                subclass: 0,
+                protocol: 0,
+                max_packet_size_0: 64,
+                vendor_id: 0x1b17,
+                product_id: 0x0211,
+                device_version: 0x0100,
+                manufacturer_string_index: None,
+                product_string_index: None,
+                serial_number_string_index: None,
+                num_configurations: 1,
+            },
+            configurations: vec![ConfigurationDescriptor {
+                num_interfaces: 1,
+                configuration_value: 1,
+                attributes: 0x80,
+                max_power: 50,
+                string_index: None,
+                string: None,
+                interfaces: vec![InterfaceDescriptors {
+                    interface_number: 0,
+                    alt_settings: vec![InterfaceDescriptor {
+                        interface_number: 0,
+                        alternate_setting: 0,
+                        class: 0x0e,
+                        subclass: 0x01,
+                        protocol: 0,
+                        string_index: None,
+                        string: None,
+                        num_endpoints: 0,
+                        endpoints: Vec::new(),
+                    }],
+                }],
+                raw: Vec::new(),
+            }],
+        }
     }
 }

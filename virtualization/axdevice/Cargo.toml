@@ -1,24 +1,27 @@
 [package]
 name = "axdevice"
-version = "0.6.2"
+version = "0.5.6"
 description = "A reusable, OS-agnostic device abstraction layer designed for virtual machines."
+homepage = "https://github.com/arceos-hypervisor/axdevice"
 repository = "https://github.com/arceos-hypervisor/axdevice"
 keywords = ["hypervisor"]
 authors = ["Su Mingxian <aarkegz@gmail.com>"]
 documentation = "https://docs.rs/axdevice"
 categories = ["virtualization"]
 edition.workspace = true
+readme = "README.md"
 license = "Apache-2.0"
 
 [features]
-host-test = ["ax-sync/host-test"]
+host-test = ["ax-kspin/host-test"]
 
 [dependencies]
 log = "0.4"
 cfg-if = "1.0"
-ax-sync.workspace = true
+ax-kspin.workspace = true
 
 # System independent crates provided by ArceOS.
+ax-memory-addr = { workspace = true }
 axdevice_base = { workspace = true }
 axvm-types = { workspace = true }
 thiserror = { workspace = true }
@@ -32,7 +35,7 @@ name = "lookup_DeviceRuntime"
 harness = false
 
 [dev-dependencies]
-ax-sync = { path = "../../os/arceos/modules/axsync", features = ["host-test"] }
+ax-kspin = { workspace = true, features = ["host-test"] }
 divan = "0.1.21"
 paste = "1.0"
 rand = { version = "0.10", features = ["std_rng"] }

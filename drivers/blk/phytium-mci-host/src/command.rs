@@ -43,11 +43,11 @@ pub(crate) enum CommandState {
 }
 
 impl PhytiumMci {
-    pub(crate) fn advance_command_response(
+    pub fn advance_command_response(
         &mut self,
-        cause: sdmmc_host::ProgressCause,
+        cause: sdio_host2::ProgressCause,
     ) -> Result<CommandResponseProgress, Error> {
-        let acknowledged_irq = cause == sdmmc_host::ProgressCause::AcknowledgedIrq;
+        let acknowledged_irq = cause == sdio_host2::ProgressCause::AcknowledgedIrq;
         match self.advance_command_for_cause(acknowledged_irq) {
             Ok(CommandProgress::Pending) => Ok(CommandResponseProgress::Pending),
             Ok(CommandProgress::Complete) => self
@@ -57,7 +57,7 @@ impl PhytiumMci {
         }
     }
 
-    pub(crate) fn submit_command(&mut self, cmd: &ProtoCmd) -> Result<(), Error> {
+    pub fn submit_command(&mut self, cmd: &ProtoCmd) -> Result<(), Error> {
         self.submit_command_in_generation(cmd, true)
     }
 
@@ -110,7 +110,7 @@ impl PhytiumMci {
         Ok(progress)
     }
 
-    pub(crate) fn advance_command(&mut self) -> Result<CommandProgress, Error> {
+    pub fn advance_command(&mut self) -> Result<CommandProgress, Error> {
         match self.command_state {
             CommandState::WaitingInhibit { cmd, data, polls } => {
                 if !self.command_can_issue(data.is_some()) {

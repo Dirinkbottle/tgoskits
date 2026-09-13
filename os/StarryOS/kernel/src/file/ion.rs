@@ -4,14 +4,18 @@
 
 use alloc::{borrow::Cow, sync::Arc};
 
+use ax_errno::{AxError, AxResult};
 use ax_memory_addr::PhysAddrRange;
 use axpoll::{IoEvents, Pollable};
 use sg2002_tpu::ion::IonBuffer;
 
 use super::{FileLike, Kstat};
-use crate::{
-    StarryError, StarryResult,
-    pseudofs::{DeviceMmap, dev::ION_DEVICE},
+use crate::pseudofs::{
+    DeviceMmap, DeviceOps,
+    dev::{
+        ION_DEVICE,
+        ion::{ION_IOC_FREE, IonHandleData},
+    },
 };
 
 /// Ion Buffer 文件
@@ -48,27 +52,23 @@ impl Pollable for IonBufferFile {
         IoEvents::IN | IoEvents::OUT
     }
 
-    unsafe fn register_shared(
-        &self,
-        _sink: &mut dyn axpoll::SharedRegistrationSink,
-        _events: IoEvents,
-    ) {
+    fn register(&self, _context: &mut core::task::Context<'_>, _events: IoEvents) {
         // Ion buffer 总是就绪
     }
 }
 
 impl FileLike for IonBufferFile {
-    fn read(&self, _dst: &mut super::IoDst) -> StarryResult<usize> {
+    fn read(&self, _dst: &mut super::IoDst) -> AxResult<usize> {
         // Ion buffer 不支持直接读取
-        Err(StarryError::InvalidInput)
+        Err(AxError::InvalidInput)
     }
 
-    fn write(&self, _src: &mut super::IoSrc) -> StarryResult<usize> {
+    fn write(&self, _src: &mut super::IoSrc) -> AxResult<usize> {
         // Ion buffer 不支持直接写入
-        Err(StarryError::InvalidInput)
+        Err(AxError::InvalidInput)
     }
 
-    fn stat(&self) -> StarryResult<Kstat> {
+    fn stat(&self) -> AxResult<Kstat> {
         Ok(Kstat {
             size: self.buffer.size as u64,
             ..Default::default()
@@ -79,7 +79,7 @@ impl FileLike for IonBufferFile {
         Cow::Borrowed("/dev/ion_buffer")
     }
 
-    fn device_mmap(&self, _offset: u64, _length: u64) -> StarryResult<DeviceMmap> {
+    fn device_mmap(&self, _offset: u64, _length: u64) -> AxResult<DeviceMmap> {
         Ok(DeviceMmap::Physical(self.phys_range(), None))
     }
 }
@@ -92,7 +92,8 @@ impl Drop for IonBufferFile {
         // ION_IOC_FREE 的情况下，全局 buffer 表里的强引用也会被移除。
         // 物理页的真正释放由最后一个 `Arc<IonBuffer>` 在 Drop 时完成。
         if let Some(dev) = ION_DEVICE.get() {
-            dev.release_handle(handle);
+            let handle_data = IonHandleData { handle };
+            let _ = dev.ioctl(ION_IOC_FREE, &handle_data as *const _ as usize);
         } else {
             error!(
                 "Failed to find ion device to free buffer handle: {}",

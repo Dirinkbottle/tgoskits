@@ -14,6 +14,7 @@ mod _macros;
 
 pub(crate) mod backend;
 pub mod device;
+pub mod driver;
 pub mod err;
 mod host;
 
@@ -22,7 +23,7 @@ pub use host::*;
 #[allow(unused_imports)]
 #[cfg(kmod)]
 pub use crate::backend::kmod::*;
-pub use crate::backend::ty::{Event, ep::EndpointHandle};
+pub use crate::backend::ty::{Event, ep::Endpoint};
 
 define_int_type!(BusAddr, u64);
 

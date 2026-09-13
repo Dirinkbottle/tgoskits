@@ -1,9 +1,5 @@
 {
-  "label": "实现专题：USB",
+  "label": "USB 驱动",
   "collapsed": true,
-  "position": 20,
-  "link": {
-    "type": "doc",
-    "id": "overview"
-  }
+  "position": 20
 }

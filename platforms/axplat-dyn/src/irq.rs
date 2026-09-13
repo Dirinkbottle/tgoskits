@@ -1,6 +1,5 @@
 use ax_plat::irq::{
-    CpuId, IrqAffinity, IrqError, IrqId, IrqIf, IrqOrigin, IrqSource, IrqTrigger, TrapVector,
-    dispatch_ipi_irq_on, dispatch_irq_on,
+    CpuId, IrqAffinity, IrqError, IrqId, IrqIf, IrqSource, IrqTrigger, TrapVector, dispatch_irq_on,
 };
 
 #[cfg(all(target_arch = "loongarch64", feature = "hv"))]
@@ -56,10 +55,13 @@ impl IrqIf for IrqIfImpl {
     }
 
     /// Handles the IRQ.
-    fn handle(vector: TrapVector, origin: IrqOrigin) -> Option<IrqId> {
+    fn handle(vector: TrapVector) -> Option<IrqId> {
         let irq = {
-            let mut active = somehal::irq::begin_irq(vector.0)?;
+            let active = somehal::irq::begin_irq(vector.0)?;
             let irq = active.id();
+
+            #[cfg(all(target_arch = "riscv64", feature = "hv"))]
+            let mut active = active;
 
             #[cfg(all(target_arch = "riscv64", feature = "hv"))]
             let mut guest_claim = is_guest_forwardable(irq)
@@ -75,11 +77,7 @@ impl IrqIf for IrqIfImpl {
             }
 
             let cpu = current_irq_cpu();
-            let outcome = if irq == somehal::irq::ipi_irq() {
-                dispatch_ipi_irq_on(irq, cpu, origin, || active.acknowledge_ipi())
-            } else {
-                dispatch_irq_on(irq, cpu, origin)
-            };
+            let outcome = dispatch_irq_on(irq, cpu);
             if !outcome.handled {
                 #[cfg(all(target_arch = "loongarch64", feature = "hv"))]
                 if is_loongarch_guest_forwardable(irq)
@@ -168,11 +166,11 @@ fn is_loongarch_guest_forwardable(irq: IrqId) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use ax_lazyinit::OnceLock;
     use ax_plat::irq::{CPU_LOCAL_IRQ_DOMAIN, HwIrq, IrqId};
+    use spin::Once;
 
     fn plic_irq(hwirq: u32) -> IrqId {
-        static PLIC_DOMAIN: OnceLock<somehal::irq::IrqDomainId> = OnceLock::new();
+        static PLIC_DOMAIN: Once<somehal::irq::IrqDomainId> = Once::new();
 
         let domain = *PLIC_DOMAIN.call_once(|| {
             somehal::irq::domain_by_kind(somehal::irq::IrqDomainKind::RiscvPlic)

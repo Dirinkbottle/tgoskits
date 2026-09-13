@@ -74,10 +74,6 @@ impl Aarch64VmPlan {
         self.firmware.serials()
     }
 
-    pub(crate) fn firmware_devices(&self) -> &[crate::boot::fdt::device::ResolvedFdtDevice] {
-        self.firmware.devices()
-    }
-
     pub(crate) const fn timer_profile(&self) -> &GuestTimerProfile {
         self.firmware.timer()
     }

@@ -1,6 +1,6 @@
 use core::{arch::global_asm, mem::offset_of};
 
-use crate::{SystimerArch, arch::Arch};
+use crate::timer;
 
 const SCAUSE_INTERRUPT_BIT: usize = 1usize << (usize::BITS as usize - 1);
 const SCAUSE_SUPERVISOR_TIMER: usize = 5;
@@ -68,7 +68,7 @@ extern "C" fn __riscv64_handle_trap(tf: &mut TrapFrame) {
     if (scause & SCAUSE_INTERRUPT_BIT) != 0 {
         let cause = scause & !SCAUSE_INTERRUPT_BIT;
         if cause == SCAUSE_SUPERVISOR_TIMER {
-            Arch::systimer_ack();
+            timer::ack();
             return;
         }
     }

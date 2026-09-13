@@ -9,6 +9,7 @@
 //! Both buddy and slab allocators can be used standalone.
 
 #![no_std]
+#![feature(extern_item_impls)]
 
 mod error;
 pub use error::{AllocError, AllocResult};
@@ -22,22 +23,23 @@ pub use slab::{
     SlabPoolDeallocResult, SlabPoolTrait, SlabTrait, StaticSlabPool,
 };
 
+#[cfg(all(axtest, feature = "axtest"))]
+mod axtest;
+
 pub mod global;
 #[doc(hidden)]
 pub use global::__reset_global_allocator_singleton_for_tests;
 pub use global::GlobalAllocator;
 
 /// External interface items supplied by the platform / allocator integrator.
-pub mod interface {
-    /// Platform services required by the buddy-slab allocator.
-    #[ax_crate_interface::def_interface(gen_caller)]
-    pub trait BuddySlabIf {
-        /// Translate a virtual address to a physical address.
-        fn virt_to_phys(vaddr: usize) -> usize;
+pub mod eii {
+    /// Translate a virtual address to a physical address.
+    #[eii(virt_to_phys_impl)]
+    pub fn virt_to_phys(vaddr: usize) -> usize;
 
-        /// Return the system-global slab pool.
-        fn slab_pool() -> &'static dyn crate::SlabPoolTrait;
-    }
+    /// Return the system-global slab pool.
+    #[eii(slab_pool_impl)]
+    pub fn slab_pool() -> &'static dyn crate::SlabPoolTrait;
 }
 
 // ---------------------------------------------------------------------------
@@ -55,12 +57,12 @@ pub(crate) const fn is_aligned(addr: usize, align: usize) -> bool {
 }
 
 #[cfg(test)]
-mod test_interface_impl {
+mod test_eii_impls {
     use core::{alloc::Layout, ptr::NonNull};
 
     use super::{
         AllocError, AllocResult, SizeClass, SlabAllocResult, SlabPoolTrait, SlabTrait,
-        interface::BuddySlabIf,
+        eii::{slab_pool_impl, virt_to_phys_impl},
     };
 
     struct NullSlabPool;
@@ -100,16 +102,13 @@ mod test_interface_impl {
 
     static NULL_SLAB_POOL: NullSlabPool = NullSlabPool;
 
-    struct TestBuddySlabIf;
+    #[virt_to_phys_impl]
+    fn test_virt_to_phys(vaddr: usize) -> usize {
+        vaddr
+    }
 
-    #[ax_crate_interface::impl_interface]
-    impl BuddySlabIf for TestBuddySlabIf {
-        fn virt_to_phys(vaddr: usize) -> usize {
-            vaddr
-        }
-
-        fn slab_pool() -> &'static dyn SlabPoolTrait {
-            &NULL_SLAB_POOL
-        }
+    #[slab_pool_impl]
+    fn test_slab_pool() -> &'static dyn SlabPoolTrait {
+        &NULL_SLAB_POOL
     }
 }

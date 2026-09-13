@@ -13,11 +13,16 @@ use std::{
 
 use anyhow::{Context, bail};
 use crossbeam_channel::{Sender, TrySendError, bounded};
+use qemu_plugin::{
+    CallbackFlags, PluginId, TranslationBlock, VCPUIndex,
+    install::{Args, Info, Value},
+    plugin::{HasCallbacks, Register},
+    qemu_plugin_get_registers, qemu_plugin_read_memory_vaddr, qemu_plugin_register_atexit_cb,
+};
 use zerocopy::IntoBytes;
 
 use crate::{
-    qemu::{Args, Value},
-    reg,
+    reg::AllRegs,
     target::{Frame, Reg, Target},
 };
 
@@ -141,9 +146,6 @@ impl TryFrom<&Args> for PluginArgs {
             })
             .transpose()?
             .unwrap_or("qperf.bin".into());
-        if freq == 0 {
-            bail!("frequency must be greater than 0");
-        }
         let max_depth = parse_usize_arg(args, "max_depth")?.unwrap_or(128);
         let queue_size = parse_usize_arg(args, "queue_size")?.unwrap_or(4096);
         let mode = args
@@ -263,6 +265,7 @@ fn parse_bool_arg(args: &Args, name: &str) -> anyhow::Result<Option<bool>> {
                 "0" | "false" | "no" | "off" => Ok(false),
                 _ => bail!("invalid {name}: expected boolean"),
             },
+            _ => bail!("invalid {name}: expected boolean"),
         })
         .transpose()
 }
@@ -274,6 +277,7 @@ struct Stats {
     sample_failures: AtomicU64,
 }
 
+#[derive(Clone)]
 pub struct Profiler {
     target: Target,
     tx: Sender<WriterEvent>,
@@ -289,14 +293,35 @@ pub struct Profiler {
     callchain: CallchainMode,
     started_at: Arc<Instant>,
     last: Arc<Mutex<Instant>>,
+    regs: Arc<AllRegs>,
     stats: Arc<Stats>,
 }
 
+impl Default for Profiler {
+    fn default() -> Self {
+        Self {
+            target: Target::Riscv64,
+            tx: bounded(0).0,
+            intvl: Duration::MAX,
+            max_depth: 128,
+            mode: SamplingMode::Tb,
+            filter_start: None,
+            filter_end: None,
+            filter_alias_start: None,
+            filter_alias_end: None,
+            filter_alias_offset: None,
+            filter_kernel: false,
+            callchain: CallchainMode::Leaf,
+            started_at: Arc::new(Instant::now()),
+            last: Arc::new(Mutex::new(Instant::now())),
+            regs: Arc::default(),
+            stats: Arc::default(),
+        }
+    }
+}
+
 impl Profiler {
-    /// # Safety
-    /// Call only on an initialized vCPU inside a QEMU execution callback, with
-    /// R_REGS enabled when using frame-pointer sampling.
-    pub unsafe fn sample(&self, cpu: u32, ip: u64) -> anyhow::Result<()> {
+    fn sample(&mut self, cpu: u32, ip: u64) -> qemu_plugin::Result<()> {
         let now = Instant::now();
         let Ok(mut last) = self.last.try_lock() else {
             return Ok(());
@@ -309,15 +334,13 @@ impl Profiler {
         let mut ips = Vec::with_capacity(self.max_depth.min(16));
         ips.push(ip);
         let sp = if self.callchain.needs_registers() {
-            // SAFETY: The execution callback runs in this vCPU's R_REGS context.
-            unsafe { reg::read(cpu, self.target.reg(Reg::Sp)) }?
+            self.regs.read(self.target.reg(Reg::Sp)).unwrap_or(0)
         } else {
             0
         };
         let mut fp_value = 0;
         if self.callchain == CallchainMode::Fp {
-            // SAFETY: Same initialized vCPU and R_REGS context as the SP read.
-            let mut fp = unsafe { reg::read(cpu, self.target.reg(Reg::Fp)) }?;
+            let mut fp = self.regs.read(self.target.reg(Reg::Fp))?;
             fp_value = fp;
             let mut seen_fps = BTreeSet::new();
 
@@ -329,13 +352,10 @@ impl Profiler {
                     break;
                 };
                 let mut frame = Frame::default();
-                // SAFETY: This callback has the active vCPU memory context. QEMU
-                // validates guest mappings and reports an unreadable frame.
-                if unsafe { reg::read_memory(frame_address, frame.as_mut_bytes()) }.is_err() {
+                if qemu_plugin_read_memory_vaddr(frame_address, frame.as_mut_bytes()).is_err() {
                     break;
                 };
-                // SAFETY: Same vCPU context; QEMU validates this candidate PC.
-                if unsafe { reg::read_memory(frame.ip, &mut [0; 8]) }.is_err() {
+                if qemu_plugin_read_memory_vaddr(frame.ip, &mut [0; 8]).is_err() {
                     break;
                 }
 
@@ -379,7 +399,7 @@ impl Profiler {
         Ok(())
     }
 
-    pub fn sample_ip_for(&self, ip: u64) -> Option<u64> {
+    fn sample_ip_for(&self, ip: u64) -> Option<u64> {
         if let Some(mapped) = self.canonicalize_ip(ip) {
             return Some(mapped);
         }
@@ -409,21 +429,68 @@ impl Profiler {
     }
 }
 
-impl Profiler {
-    pub fn needs_registers(&self) -> bool {
-        self.callchain.needs_registers()
+impl HasCallbacks for Profiler {
+    fn on_vcpu_init(&mut self, _id: PluginId, _vcpu_id: VCPUIndex) -> qemu_plugin::Result<()> {
+        if self.callchain.needs_registers() {
+            self.regs = Arc::new(qemu_plugin_get_registers()?.into());
+        }
+        Ok(())
     }
 
-    pub fn instruction_sampling(&self) -> bool {
-        self.mode == SamplingMode::Insn
-    }
+    fn on_translation_block_translate(
+        &mut self,
+        _id: PluginId,
+        tb: TranslationBlock,
+    ) -> qemu_plugin::Result<()> {
+        let Some(ip) = self.sample_ip_for(tb.vaddr()) else {
+            return Ok(());
+        };
 
-    pub fn record_failure(&self) {
-        self.stats.sample_failures.fetch_add(1, Ordering::Relaxed);
-    }
+        match self.mode {
+            SamplingMode::Tb => {
+                let mut this = self.clone();
+                tb.register_execute_callback_flags(
+                    move |cpu| {
+                        if this.sample(cpu, ip).is_err() {
+                            this.stats.sample_failures.fetch_add(1, Ordering::Relaxed);
+                        }
+                    },
+                    callback_flags(self.callchain),
+                );
+            }
+            SamplingMode::Insn => {
+                tb.instructions().for_each(|insn| {
+                    let Some(ip) = self.sample_ip_for(insn.vaddr()) else {
+                        return;
+                    };
+                    let mut this = self.clone();
+                    insn.register_execute_callback_flags(
+                        move |cpu| {
+                            if this.sample(cpu, ip).is_err() {
+                                this.stats.sample_failures.fetch_add(1, Ordering::Relaxed);
+                            }
+                        },
+                        callback_flags(self.callchain),
+                    );
+                });
+            }
+        }
 
-    pub fn start(args: &Args, target_name: &str) -> anyhow::Result<Self> {
-        let target_arch = target_name.parse()?;
+        Ok(())
+    }
+}
+
+fn callback_flags(callchain: CallchainMode) -> CallbackFlags {
+    if callchain.needs_registers() {
+        CallbackFlags::QEMU_PLUGIN_CB_R_REGS
+    } else {
+        CallbackFlags::QEMU_PLUGIN_CB_NO_REGS
+    }
+}
+
+impl Register for Profiler {
+    fn register(&mut self, id: PluginId, args: &Args, info: &Info) -> qemu_plugin::Result<()> {
+        eprintln!("QPerf loaded: id={id:?} info={info:?}");
         let args = PluginArgs::try_from(args)?;
         eprintln!("QPerf arguments: {args:?}");
         let summary_path = args.out.with_extension("summary.txt");
@@ -437,7 +504,7 @@ impl Profiler {
         let max_depth = args.max_depth;
         let freq = args.freq;
         let callchain = args.callchain;
-        let target = target_name.to_string();
+        let target = info.target_name.to_string();
         spawn(move || {
             let mut shutdown = None;
             while let Ok(event) = rx.recv() {
@@ -501,31 +568,32 @@ impl Profiler {
             }
         });
 
-        Ok(Self {
-            target: target_arch,
-            tx,
-            intvl: Duration::from_secs_f64(1.0 / args.freq as f64),
-            max_depth: args.max_depth,
-            mode: args.mode,
-            filter_start: args.filter_start,
-            filter_end: args.filter_end,
-            filter_alias_start: args.filter_alias_start,
-            filter_alias_end: args.filter_alias_end,
-            filter_alias_offset: args.filter_alias_offset,
-            filter_kernel: args.filter_kernel,
-            callchain: args.callchain,
-            started_at: Arc::new(Instant::now()),
-            last: Arc::new(Mutex::new(Instant::now())),
-            stats,
-        })
+        let exit_tx = tx.clone();
+        qemu_plugin_register_atexit_cb(id, move |_| {
+            let (done_tx, done_rx) = bounded(0);
+            if exit_tx.send(WriterEvent::Shutdown(done_tx)).is_ok() {
+                let _ = done_rx.recv();
+            }
+        })?;
+
+        self.target = info.target_name.parse()?;
+        self.tx = tx;
+        self.intvl = Duration::from_secs_f64(1.0 / args.freq as f64);
+        self.max_depth = args.max_depth;
+        self.mode = args.mode;
+        self.filter_start = args.filter_start;
+        self.filter_end = args.filter_end;
+        self.filter_alias_start = args.filter_alias_start;
+        self.filter_alias_end = args.filter_alias_end;
+        self.filter_alias_offset = args.filter_alias_offset;
+        self.filter_kernel = args.filter_kernel;
+        self.callchain = args.callchain;
+        self.started_at = Arc::new(Instant::now());
+        self.last = Arc::new(Mutex::new(Instant::now()));
+        self.stats = stats;
+
+        Ok(())
     }
 }
 
-impl Drop for Profiler {
-    fn drop(&mut self) {
-        let (done_tx, done_rx) = bounded(0);
-        if self.tx.send(WriterEvent::Shutdown(done_tx)).is_ok() {
-            let _ = done_rx.recv();
-        }
-    }
-}
+qemu_plugin::register!(Profiler::default());

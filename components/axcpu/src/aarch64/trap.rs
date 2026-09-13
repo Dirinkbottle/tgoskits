@@ -119,6 +119,7 @@ core::arch::global_asm!(
     #[cfg(feature = "arm-el2")]
     concat!(".equ arm_el2, 1\n", include_str!("trap.S")),
     trapframe_size = const core::mem::size_of::<RawTrapFrame>(),
+    current_thread_offset = const cpu_local::CPU_AREA_CURRENT_THREAD_OFFSET,
     TRAP_KIND_SYNC = const TrapKind::Synchronous as u8,
     TRAP_KIND_IRQ = const TrapKind::Irq as u8,
     TRAP_KIND_FIQ = const TrapKind::Fiq as u8,
@@ -170,10 +171,6 @@ fn handle_breakpoint(tf: &mut KernelTrapFrame<'_>) {
 
 fn handle_page_fault(tf: &mut KernelTrapFrame<'_>, access_flags: PageFaultFlags) {
     let vaddr = va!(fault_addr());
-    #[cfg(feature = "exception-table")]
-    if tf.raw.0.fixup_nofault_exception() {
-        return;
-    }
     if crate::trap::call_page_fault_handler_with_parent_irqs(
         vaddr,
         access_flags,
@@ -233,7 +230,7 @@ unsafe extern "C" fn aarch64_trap_handler(raw: *mut RawTrapFrame, raw_kind: u8, 
             );
         }
         TrapKind::Irq => {
-            crate::trap::dispatch_irq(0, crate::trap::TrapOrigin::Kernel);
+            crate::trap::dispatch_irq(0);
         }
         TrapKind::Synchronous => {
             #[cfg(not(feature = "arm-el2"))]

@@ -34,12 +34,8 @@ use xhci::Xhci;
 use crate::err::*;
 
 impl USBHost {
-    pub fn new_xhci(
-        mmio: Mmio,
-        dma: dma_api::DeviceDma,
-        kernel: &'static dyn KernelOp,
-    ) -> Result<USBHost> {
-        Ok(USBHost::new(Xhci::new(mmio, dma, kernel)?))
+    pub fn new_xhci(mmio: Mmio, kernel: &'static dyn KernelOp) -> Result<USBHost> {
+        Ok(USBHost::new(Xhci::new(mmio, kernel)?))
     }
 
     pub fn new_dwc(params: DwcNewParams<'_>) -> Result<USBHost> {
@@ -55,11 +51,7 @@ impl USBHost {
     }
 
     pub(crate) fn new(backend: impl CoreOp) -> Self {
-        let b = Core::new(backend);
-        Self {
-            backend: Box::new(b),
-            initialized: false,
-        }
+        Self::with_backend(Box::new(Core::new(backend)))
     }
 }
 

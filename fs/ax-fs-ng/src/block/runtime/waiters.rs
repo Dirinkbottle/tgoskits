@@ -1,10 +1,9 @@
 use alloc::{sync::Arc, vec::Vec};
 use core::sync::atomic::{AtomicUsize, Ordering};
 
-use crate::{
-    BlockResult,
-    os::{BlockNotification, runtime_ops, sync::IrqMutex},
-};
+use ax_errno::AxResult;
+
+use crate::os::{BlockNotification, runtime_ops, sync::IrqMutex};
 
 /// Task-context waiters whose wakeups must not be coalesced with each other.
 ///
@@ -26,7 +25,7 @@ impl TaskWaiters {
     ///
     /// This function is task-context only. `should_wait` must only observe the
     /// state whose publisher calls [`notify_all`](Self::notify_all).
-    pub(super) fn wait_while(&self, should_wait: impl FnOnce() -> bool) -> BlockResult {
+    pub(super) fn wait_while(&self, should_wait: impl FnOnce() -> bool) -> AxResult {
         let notification = runtime_ops()?.notification();
         self.notifications.lock().push(Arc::clone(&notification));
 
@@ -99,11 +98,7 @@ impl CapacityWaiters {
         }
     }
 
-    pub(super) fn wait_for(
-        &self,
-        required: usize,
-        available: impl FnOnce() -> usize,
-    ) -> BlockResult {
+    pub(super) fn wait_for(&self, required: usize, available: impl FnOnce() -> usize) -> AxResult {
         let notification = runtime_ops()?.notification();
         {
             let mut waiters = self.waiters.lock();

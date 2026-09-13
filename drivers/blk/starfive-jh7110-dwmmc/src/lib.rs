@@ -7,11 +7,11 @@ use core::ptr::NonNull;
 
 use dma_api::{CompletedDma, DeviceDma};
 use dwmmc_host::{DwMmc, DwMmcIrq, Event, FifoConfig, FifoDataWidth};
-use sdmmc_host::{
+use sdio_host2::{
     AdvanceRequestError, BusOp, BusWidth, Error as Host2Error, ProgressCause, RawResponse,
-    RequestProgress, SdMmcHost, SignalVoltage, SubmitTransactionError, Transaction,
+    RequestProgress, SdioHost, SignalVoltage, SubmitTransactionError, Transaction,
 };
-use sdmmc_protocol::{Error, sdio::host::SdMmcIrqHost};
+use sdmmc_protocol::{Error, sdio::host::SdioIrqHost};
 
 pub const JH7110_STABLE_REFERENCE_CLOCK_HZ: u32 = 50_000_000;
 pub const JH7110_FIFO_DEPTH_WORDS: u16 = 32;
@@ -154,13 +154,13 @@ impl Jh7110DwMmc {
     }
 }
 
-impl SdMmcHost for Jh7110DwMmc {
+impl SdioHost for Jh7110DwMmc {
     type TransactionRequest<'a>
-        = <DwMmc as SdMmcHost>::TransactionRequest<'a>
+        = <DwMmc as SdioHost>::TransactionRequest<'a>
     where
         Self: 'a;
 
-    type BusRequest = <DwMmc as SdMmcHost>::BusRequest;
+    type BusRequest = <DwMmc as SdioHost>::BusRequest;
 
     unsafe fn submit_transaction<'a>(
         &mut self,
@@ -235,10 +235,9 @@ impl SdMmcHost for Jh7110DwMmc {
     }
 }
 
-impl SdMmcIrqHost for Jh7110DwMmc {
+impl SdioIrqHost for Jh7110DwMmc {
     type Event = Event;
     type IrqHandle = DwMmcIrq;
-    type CardIrq = ();
 
     fn completion_irq_enabled(&self) -> bool {
         self.inner.completion_irq_enabled()
@@ -254,25 +253,16 @@ impl SdMmcIrqHost for Jh7110DwMmc {
         Ok(())
     }
 
-    fn into_parts(self) -> sdmmc_host::HostParts<Self, Self::IrqHandle, Self::CardIrq> {
-        let Jh7110DwMmc { inner, config } = self;
-        let parts = <DwMmc as SdMmcIrqHost>::into_parts(inner);
-        sdmmc_host::HostParts {
-            bus: Jh7110DwMmc {
-                inner: parts.bus,
-                config,
-            },
-            irq: parts.irq,
-            card_irq: None,
-        }
+    fn irq_handle(&mut self) -> Self::IrqHandle {
+        self.inner.irq_endpoint()
     }
 
     fn device_dma(&self) -> Result<&DeviceDma, Error> {
-        <DwMmc as SdMmcIrqHost>::device_dma(&self.inner)
+        <DwMmc as SdioIrqHost>::device_dma(&self.inner)
     }
 
     fn progress_wait_kind(&self) -> sdmmc_protocol::sdio::HostProgressWait {
-        <DwMmc as SdMmcIrqHost>::progress_wait_kind(&self.inner)
+        <DwMmc as SdioIrqHost>::progress_wait_kind(&self.inner)
     }
 }
 
@@ -281,8 +271,8 @@ mod tests {
     use core::ptr::NonNull;
     use std::{vec, vec::Vec};
 
-    use sdmmc_host::{BusOp, BusWidth, SdMmcHost, SignalVoltage};
-    use sdmmc_protocol::sdio::host::SdMmcIrqHost;
+    use sdio_host2::{BusOp, BusWidth, SdioHost, SignalVoltage};
+    use sdmmc_protocol::sdio::host::SdioIrqHost;
 
     use super::*;
 
@@ -331,16 +321,16 @@ mod tests {
 
         assert!(matches!(
             unsafe { host.submit_bus_op(BusOp::SetBusWidth(BusWidth::Bit8)) },
-            Err(sdmmc_host::Error::Unsupported)
+            Err(sdio_host2::Error::Unsupported)
         ));
         assert!(matches!(
             unsafe { host.submit_bus_op(BusOp::SetSignalVoltage(SignalVoltage::V180)) },
-            Err(sdmmc_host::Error::Unsupported)
+            Err(sdio_host2::Error::Unsupported)
         ));
     }
 
     #[test]
-    fn completion_irq_enable_disable_delegate_to_inner_dwmmc() {
+    fn completion_irq_methods_delegate_to_inner_dwmmc() {
         let (_regs, mmio) = fake_mmio();
         let mut host = unsafe { Jh7110DwMmc::new(mmio, Jh7110DwMmcConfig::default()) };
 
@@ -353,7 +343,7 @@ mod tests {
 
     #[test]
     fn host_exposes_explicit_progress_cause_api() {
-        fn assert_progress_api<H: SdMmcHost>() {}
+        fn assert_progress_api<H: SdioHost>() {}
 
         assert_progress_api::<Jh7110DwMmc>();
     }

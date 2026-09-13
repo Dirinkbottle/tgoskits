@@ -1,6 +1,6 @@
+use alloc::boxed::Box;
 #[cfg(any(kmod, umod))]
 use alloc::vec::Vec;
-use alloc::{boxed::Box, sync::Arc};
 use core::{
     any::Any,
     future::Future,
@@ -8,7 +8,6 @@ use core::{
     task::{Context, Poll},
 };
 
-use ax_sync::SpinLock;
 #[cfg(any(kmod, umod))]
 use usb_if::endpoint::{IsoPacketResult, TransferStatus};
 use usb_if::{
@@ -44,33 +43,17 @@ pub(crate) trait EndpointOp: Send + Any + 'static {
 pub type EndpointResetFuture =
     Pin<Box<dyn Future<Output = Result<(), TransferError>> + Send + 'static>>;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum EndpointLifecycle {
-    Active,
-    Revoked,
-    Disconnected,
-}
-
-struct EndpointInner {
-    raw: Box<dyn EndpointOp>,
-    lifecycle: EndpointLifecycle,
-}
-
-#[derive(Clone)]
-pub struct EndpointHandle {
+pub struct Endpoint {
     info: EndpointInfo,
-    inner: Arc<SpinLock<EndpointInner>>,
+    raw: Box<dyn EndpointOp>,
 }
 
-impl EndpointHandle {
+impl Endpoint {
     #[cfg(any(kmod, umod))]
     pub(crate) fn new(info: EndpointInfo, raw: impl EndpointOp) -> Self {
         Self {
             info,
-            inner: Arc::new(SpinLock::new(EndpointInner {
-                raw: Box::new(raw),
-                lifecycle: EndpointLifecycle::Active,
-            })),
+            raw: Box::new(raw),
         }
     }
 
@@ -78,34 +61,28 @@ impl EndpointHandle {
         self.info
     }
 
-    pub fn submit(&self, request: TransferRequest) -> Result<RequestId, TransferError> {
+    pub fn submit(&mut self, request: TransferRequest) -> Result<RequestId, TransferError> {
         self.validate_request(&request)?;
-        let mut inner = self.inner.lock();
-        match inner.lifecycle {
-            EndpointLifecycle::Active => inner.raw.submit_request(request),
-            EndpointLifecycle::Revoked => Err(TransferError::EndpointRevoked),
-            EndpointLifecycle::Disconnected => Err(TransferError::Disconnected),
-        }
+        self.raw.submit_request(request)
     }
 
-    pub fn reclaim(&self, id: RequestId) -> Result<Option<TransferCompletion>, TransferError> {
-        match self.inner.lock().raw.reclaim_request(id) {
+    pub fn reclaim(&mut self, id: RequestId) -> Result<Option<TransferCompletion>, TransferError> {
+        match self.raw.reclaim_request(id) {
             Some(result) => result.map(Some),
             None => Ok(None),
         }
     }
 
     pub fn poll_request(
-        &self,
+        &mut self,
         id: RequestId,
         cx: &mut Context<'_>,
     ) -> Poll<Result<TransferCompletion, TransferError>> {
-        let mut inner = self.inner.lock();
-        match inner.raw.reclaim_request(id) {
+        match self.raw.reclaim_request(id) {
             Some(res) => Poll::Ready(res),
             None => {
-                inner.raw.register_waker(id, cx);
-                match inner.raw.reclaim_request(id) {
+                self.raw.register_waker(id, cx);
+                match self.raw.reclaim_request(id) {
                     Some(res) => Poll::Ready(res),
                     None => Poll::Pending,
                 }
@@ -113,18 +90,18 @@ impl EndpointHandle {
         }
     }
 
-    pub fn cancel(&self, id: RequestId) -> Result<(), TransferError> {
-        self.inner.lock().raw.cancel_request(id)
+    pub fn cancel(&mut self, id: RequestId) -> Result<(), TransferError> {
+        self.raw.cancel_request(id)
     }
 
     /// Resets host-controller state for this endpoint after a successful
     /// `CLEAR_FEATURE(ENDPOINT_HALT)` request.
-    pub fn reset(&self) -> EndpointResetFuture {
-        self.inner.lock().raw.reset()
+    pub fn reset(&mut self) -> EndpointResetFuture {
+        self.raw.reset()
     }
 
     pub async fn wait(
-        &self,
+        &mut self,
         request: TransferRequest,
     ) -> Result<TransferCompletion, TransferError> {
         let id = self.submit(request)?;
@@ -132,23 +109,9 @@ impl EndpointHandle {
     }
 
     #[allow(unused)]
-    pub(crate) fn with_raw_mut<T: EndpointOp, R>(&self, f: impl FnOnce(&mut T) -> R) -> R {
-        let mut inner = self.inner.lock();
-        let d = inner.raw.as_mut() as &mut dyn Any;
-        f(d.downcast_mut::<T>()
-            .expect("EndpointHandle downcast_mut failed"))
-    }
-
-    pub(crate) fn revoke(&self) {
-        self.inner.lock().lifecycle = EndpointLifecycle::Revoked;
-    }
-
-    pub(crate) fn disconnect(&self) {
-        self.inner.lock().lifecycle = EndpointLifecycle::Disconnected;
-    }
-
-    pub(crate) fn reactivate(&self) {
-        self.inner.lock().lifecycle = EndpointLifecycle::Active;
+    pub(crate) fn with_raw_mut<T: EndpointOp, R>(&mut self, f: impl FnOnce(&mut T) -> R) -> R {
+        let d = self.raw.as_mut() as &mut dyn Any;
+        f(d.downcast_mut::<T>().expect("Endpoint downcast_mut failed"))
     }
 
     fn validate_request(&self, request: &TransferRequest) -> Result<(), TransferError> {
@@ -168,7 +131,7 @@ impl EndpointHandle {
 
 struct EndpointRequestFuture<'a> {
     id: RequestId,
-    endpoint: &'a EndpointHandle,
+    endpoint: &'a mut Endpoint,
 }
 
 impl Future for EndpointRequestFuture<'_> {

@@ -38,10 +38,6 @@ impl EndpointImpl {
         }
     }
 
-    pub(super) fn pending_request_ids(&self) -> Vec<RequestId> {
-        self.transfers.keys().copied().map(RequestId::new).collect()
-    }
-
     fn make_transfer(
         &mut self,
         transfer: Transfer,
@@ -205,7 +201,8 @@ impl EndpointOp for EndpointImpl {
         let id = trans.id();
         let ptr = trans.transfer;
         self.transfers.insert(id, trans);
-        let submit_result = usb!(libusb_submit_transfer(ptr)).map_err(TransferError::from);
+        let submit_result = usb!(libusb_submit_transfer(ptr))
+            .map_err(|e| TransferError::Other(anyhow!("Failed to submit transfer: {e:?}")));
 
         if submit_result.is_err() {
             self.transfers.remove(&id);
@@ -245,8 +242,6 @@ impl EndpointOp for EndpointImpl {
         let res = unsafe { libusb_cancel_transfer(trans.transfer) };
         if res == libusb1_sys::constants::LIBUSB_SUCCESS {
             Ok(())
-        } else if res == libusb1_sys::constants::LIBUSB_ERROR_NO_DEVICE {
-            Err(TransferError::Disconnected)
         } else {
             Err(TransferError::Other(anyhow!(
                 "Failed to cancel transfer: libusb error {res}"

@@ -3,7 +3,6 @@
 use tock_registers::interfaces::{Readable, Writeable};
 
 use super::{
-    error::{JpuDmaAddressError, JpuHardwareSetupError},
     header::{HuffTable, JpegHeaderInfo},
     layout::{FrameLayout, JpuPixelFormat},
     regs::{
@@ -79,16 +78,16 @@ pub(super) fn checked_dma_region(
     dma_start: u64,
     capacity: usize,
     used_len: usize,
-) -> Result<DmaRegion, JpuDmaAddressError> {
+) -> Result<DmaRegion, &'static str> {
     if used_len == 0 || used_len > capacity {
-        return Err(JpuDmaAddressError::InvalidRegionLength);
+        return Err("invalid JPU DMA region length");
     }
     let mapped_end = dma_start
         .checked_add(used_len as u64)
-        .ok_or(JpuDmaAddressError::AddressRangeOverflow)?;
+        .ok_or("JPU DMA address range overflow")?;
     Ok(DmaRegion {
-        start: u32::try_from(dma_start).map_err(|_| JpuDmaAddressError::StartDoesNotFitU32)?,
-        end: u32::try_from(mapped_end).map_err(|_| JpuDmaAddressError::EndDoesNotFitU32)?,
+        start: u32::try_from(dma_start).map_err(|_| "JPU DMA start does not fit u32")?,
+        end: u32::try_from(mapped_end).map_err(|_| "JPU DMA end does not fit u32")?,
     })
 }
 
@@ -96,14 +95,14 @@ pub(super) fn checked_dma_offset(
     region: DmaRegion,
     offset: usize,
     allow_end: bool,
-) -> Result<u32, JpuDmaAddressError> {
-    let offset = u32::try_from(offset).map_err(|_| JpuDmaAddressError::OffsetDoesNotFitU32)?;
+) -> Result<u32, &'static str> {
+    let offset = u32::try_from(offset).map_err(|_| "JPU DMA offset does not fit u32")?;
     let address = region
         .start
         .checked_add(offset)
-        .ok_or(JpuDmaAddressError::OffsetAddressOverflow)?;
+        .ok_or("JPU DMA offset address overflow")?;
     if address > region.end || (!allow_end && address == region.end) {
-        return Err(JpuDmaAddressError::OffsetOutsideRegion);
+        return Err("JPU DMA offset is outside its region");
     }
     Ok(address)
 }
@@ -111,15 +110,14 @@ pub(super) fn checked_dma_offset(
 pub(super) fn checked_frame_dma_addresses(
     region: DmaRegion,
     layout: &FrameLayout,
-) -> Result<FrameDmaAddresses, JpuDmaAddressError> {
-    let plane_address = |offset: usize| -> Result<u32, JpuDmaAddressError> {
+) -> Result<FrameDmaAddresses, &'static str> {
+    let plane_address = |offset: usize| -> Result<u32, &'static str> {
         let address = (region.start as usize)
             .checked_add(offset)
-            .ok_or(JpuDmaAddressError::FramePlaneAddressOverflow)?;
-        let address =
-            u32::try_from(address).map_err(|_| JpuDmaAddressError::FramePlaneDoesNotFitU32)?;
+            .ok_or("JPU frame plane address overflow")?;
+        let address = u32::try_from(address).map_err(|_| "JPU frame plane does not fit u32")?;
         if address >= region.end {
-            return Err(JpuDmaAddressError::FramePlaneOutsideRegion);
+            return Err("JPU frame plane starts outside DMA region");
         }
         Ok(address)
     };
@@ -186,13 +184,17 @@ pub(super) fn configure_stream_regs(
     r.op_info.write(VALUE32::VAL.val(hardware.bus_req_num));
 }
 
-pub(super) fn upload_huff_tables(jpu_base: usize, header: &JpegHeaderInfo) {
+pub(super) fn upload_huff_tables(
+    jpu_base: usize,
+    header: &JpegHeaderInfo,
+) -> Result<(), &'static str> {
     let r = jpu_regs_at(jpu_base);
 
     r.huff_ctrl
         .write(MJPEG_HUFF_CTRL::PHASE.val(HUFF_PHASE_MIN));
     for table_idx in [0, 2, 1, 3] {
-        for &huff_data in &header.huff_tables[table_idx].min_codes {
+        for j in 0..16 {
+            let huff_data = header.huff_tables[table_idx].min_codes[j];
             let temp = HuffTable::sign_extend_16(huff_data);
             r.huff_data
                 .write(VALUE32::VAL.val(((temp & 0xFFFF) << 16) | huff_data));
@@ -203,7 +205,8 @@ pub(super) fn upload_huff_tables(jpu_base: usize, header: &JpegHeaderInfo) {
         .write(MJPEG_HUFF_CTRL::PHASE.val(HUFF_PHASE_MAX));
     r.huff_addr.write(VALUE32::VAL.val(HUFF_ADDR_MAX));
     for table_idx in [0, 2, 1, 3] {
-        for &huff_data in &header.huff_tables[table_idx].max_codes {
+        for j in 0..16 {
+            let huff_data = header.huff_tables[table_idx].max_codes[j];
             let temp = HuffTable::sign_extend_16(huff_data);
             r.huff_data
                 .write(VALUE32::VAL.val(((temp & 0xFFFF) << 16) | huff_data));
@@ -214,8 +217,8 @@ pub(super) fn upload_huff_tables(jpu_base: usize, header: &JpegHeaderInfo) {
         .write(MJPEG_HUFF_CTRL::PHASE.val(HUFF_PHASE_PTR));
     r.huff_addr.write(VALUE32::VAL.val(HUFF_ADDR_PTR));
     for table_idx in [0, 2, 1, 3] {
-        for &ptr in &header.huff_tables[table_idx].ptrs {
-            let huff_data = ptr as u32;
+        for j in 0..16 {
+            let huff_data = header.huff_tables[table_idx].ptrs[j] as u32;
             let temp = HuffTable::sign_extend_8(huff_data);
             r.huff_data
                 .write(VALUE32::VAL.val(((temp & 0xFFFFFF) << 8) | huff_data));
@@ -233,12 +236,8 @@ pub(super) fn upload_huff_tables(jpu_base: usize, header: &JpegHeaderInfo) {
             .map(|&b| b as usize)
             .sum();
 
-        for &value in header.huff_tables[table_idx]
-            .values
-            .iter()
-            .take(count.min(header.huff_tables[table_idx].num_values))
-        {
-            let val = value as u32;
+        for j in 0..count.min(header.huff_tables[table_idx].num_values) {
+            let val = header.huff_tables[table_idx].values[j] as u32;
             let temp = HuffTable::sign_extend_8(val);
             r.huff_data
                 .write(VALUE32::VAL.val(((temp & 0xFFFFFF) << 8) | val));
@@ -249,9 +248,13 @@ pub(super) fn upload_huff_tables(jpu_base: usize, header: &JpegHeaderInfo) {
     }
 
     r.huff_ctrl.write(MJPEG_HUFF_CTRL::PHASE.val(0));
+    Ok(())
 }
 
-pub(super) fn upload_quant_tables(jpu_base: usize, header: &JpegHeaderInfo) {
+pub(super) fn upload_quant_tables(
+    jpu_base: usize,
+    header: &JpegHeaderInfo,
+) -> Result<(), &'static str> {
     let r = jpu_regs_at(jpu_base);
     let qmat_phases = [QMAT_PHASE_Y, QMAT_PHASE_CB, QMAT_PHASE_CR];
     let comp_count = (header.num_components as usize).min(3);
@@ -262,18 +265,20 @@ pub(super) fn upload_quant_tables(jpu_base: usize, header: &JpegHeaderInfo) {
         }
 
         r.qmat_ctrl.write(MJPEG_QMAT_CTRL::PHASE.val(phase));
-        for &value in &header.quant_tables[table_idx].values {
-            r.qmat_data.write(VALUE32::VAL.val(value as u32));
+        for j in 0..64 {
+            r.qmat_data
+                .write(VALUE32::VAL.val(header.quant_tables[table_idx].values[j] as u32));
         }
         r.qmat_ctrl.write(MJPEG_QMAT_CTRL::PHASE.val(0));
     }
+    Ok(())
 }
 
 pub(super) fn gram_setup(
     jpu_base: usize,
     stream_dma: DmaRegion,
     header: &JpegHeaderInfo,
-) -> Result<(), JpuHardwareSetupError> {
+) -> Result<(), &'static str> {
     let r = jpu_regs_at(jpu_base);
     let ecs_offset = header.ecs_offset;
     let page_ptr = ecs_offset >> 8;
@@ -290,14 +295,15 @@ pub(super) fn gram_setup(
     for i in 0..GRAM_PREFETCH_PAGES {
         let cur_page = page_ptr
             .checked_add(i)
-            .ok_or(JpuHardwareSetupError::PageIndexOverflow)?;
+            .ok_or("JPU GRAM page index overflow")?;
         let page_offset = cur_page
             .checked_mul(BBC_STREAM_PAGE_SIZE)
-            .ok_or(JpuHardwareSetupError::PageOffsetOverflow)?;
+            .ok_or("JPU GRAM page offset overflow")?;
         let external_address = checked_dma_offset(stream_dma, page_offset, false)?;
-        r.bbc_cur_pos.write(VALUE32::VAL.val(
-            u32::try_from(cur_page).map_err(|_| JpuHardwareSetupError::PageIndexDoesNotFitU32)?,
-        ));
+        r.bbc_cur_pos.write(
+            VALUE32::VAL
+                .val(u32::try_from(cur_page).map_err(|_| "JPU GRAM page index does not fit u32")?),
+        );
         r.bbc_ext_addr.write(VALUE32::VAL.val(external_address));
         r.bbc_int_addr
             .write(VALUE32::VAL.val(((cur_page & 1) as u32) << 6));
@@ -309,11 +315,10 @@ pub(super) fn gram_setup(
 
     let next_page = page_ptr
         .checked_add(GRAM_PREFETCH_PAGES)
-        .ok_or(JpuHardwareSetupError::NextPageIndexOverflow)?;
+        .ok_or("JPU GRAM next page index overflow")?;
     r.bbc_cur_pos.write(
-        VALUE32::VAL.val(
-            u32::try_from(next_page).map_err(|_| JpuHardwareSetupError::NextPageDoesNotFitU32)?,
-        ),
+        VALUE32::VAL
+            .val(u32::try_from(next_page).map_err(|_| "JPU GRAM next page does not fit u32")?),
     );
     r.bbc_ctrl.write(VALUE32::VAL.val(1));
 

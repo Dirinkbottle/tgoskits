@@ -328,43 +328,38 @@ impl SlabPageHeader {
     }
 }
 
-#[cfg(test)]
-mod coverage_tests {
-    use super::*;
+#[cfg(axtest)]
+pub(crate) fn slab_page_constants_and_header_helpers_hold_for_test() -> bool {
+    // Test constants
+    assert!(SLAB_MAGIC == 0x534C_4142);
+    assert!(MAX_OBJECTS_PER_SLAB == 512);
+    assert!(BITMAP_WORDS == 8);
+    assert!(MAX_SLAB_PAGES == 4);
 
-    fn slab_page_constants_and_header_helpers_hold_for_test() -> bool {
-        const {
-            assert!(SLAB_MAGIC == 0x534C_4142);
-            assert!(MAX_OBJECTS_PER_SLAB == 512);
-            assert!(BITMAP_WORDS == 8);
-            assert!(MAX_SLAB_PAGES == 4);
-            assert!(core::mem::size_of::<SlabListState>() > 0);
-            assert!(SlabPageHeader::HEADER_SIZE > 0);
-        }
+    // Test SlabListState variants
+    use core::mem::size_of;
+    assert!(size_of::<SlabListState>() > 0);
 
-        // Test data_offset with various sizes (must be power of 2)
-        // For size=16, offset should be aligned up to 16
-        let offset_16 = SlabPageHeader::data_offset(16);
-        assert!(offset_16.is_multiple_of(16));
-        assert!(offset_16 >= SlabPageHeader::HEADER_SIZE);
+    // Test HEADER_SIZE is non-zero
+    assert!(SlabPageHeader::HEADER_SIZE > 0);
 
-        let offset_32 = SlabPageHeader::data_offset(32);
-        assert!(offset_32.is_multiple_of(32));
-        assert!(offset_32 >= SlabPageHeader::HEADER_SIZE);
+    // Test data_offset with various sizes (must be power of 2)
+    // For size=16, offset should be aligned up to 16
+    let offset_16 = SlabPageHeader::data_offset(16);
+    assert!(offset_16 % 16 == 0);
+    assert!(offset_16 >= SlabPageHeader::HEADER_SIZE);
 
-        let offset_64 = SlabPageHeader::data_offset(64);
-        assert!(offset_64.is_multiple_of(64));
-        assert!(offset_64 >= SlabPageHeader::HEADER_SIZE);
+    let offset_32 = SlabPageHeader::data_offset(32);
+    assert!(offset_32 % 32 == 0);
+    assert!(offset_32 >= SlabPageHeader::HEADER_SIZE);
 
-        // Test that data_offset for size=1 returns HEADER_SIZE (no alignment needed)
-        let offset_1 = SlabPageHeader::data_offset(1);
-        assert!(offset_1 >= SlabPageHeader::HEADER_SIZE);
+    let offset_64 = SlabPageHeader::data_offset(64);
+    assert!(offset_64 % 64 == 0);
+    assert!(offset_64 >= SlabPageHeader::HEADER_SIZE);
 
-        true
-    }
+    // Test that data_offset for size=1 returns HEADER_SIZE (no alignment needed)
+    let offset_1 = SlabPageHeader::data_offset(1);
+    assert!(offset_1 >= SlabPageHeader::HEADER_SIZE);
 
-    #[test]
-    fn slab_page_constants_and_header_helpers_hold() {
-        assert!(slab_page_constants_and_header_helpers_hold_for_test());
-    }
+    true
 }

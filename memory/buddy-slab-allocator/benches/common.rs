@@ -11,7 +11,8 @@ use std::{
 
 use buddy_slab_allocator::{
     __reset_global_allocator_singleton_for_tests, BuddyAllocator, GlobalAllocator, PerCpuSlab,
-    SlabAllocResult, SlabAllocator, SlabDeallocResult, SlabPoolTrait, interface::BuddySlabIf,
+    SlabAllocResult, SlabAllocator, SlabDeallocResult, SlabPoolTrait,
+    eii::{slab_pool_impl, virt_to_phys_impl},
 };
 use rand::{SeedableRng, rngs::StdRng};
 
@@ -126,17 +127,14 @@ fn bench_slab_pool_ref() -> &'static BenchSlabPool {
     })
 }
 
-struct BenchBuddySlabIf;
+#[virt_to_phys_impl]
+fn bench_virt_to_phys(vaddr: usize) -> usize {
+    vaddr
+}
 
-#[ax_crate_interface::impl_interface]
-impl BuddySlabIf for BenchBuddySlabIf {
-    fn virt_to_phys(vaddr: usize) -> usize {
-        vaddr
-    }
-
-    fn slab_pool() -> &'static dyn SlabPoolTrait {
-        bench_slab_pool_ref()
-    }
+#[slab_pool_impl]
+fn bench_slab_pool() -> &'static dyn SlabPoolTrait {
+    bench_slab_pool_ref()
 }
 
 pub fn seeded_rng() -> StdRng {

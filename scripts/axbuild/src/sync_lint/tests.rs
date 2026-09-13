@@ -247,9 +247,9 @@ fn reports_relaxed_publish_before_task_wake() {
         r#"
 use core::sync::atomic::{AtomicBool, Ordering};
 
-fn demo(flag: &AtomicBool, wake: &ThreadWakeHandle) {
+fn demo(flag: &AtomicBool, task: &AxTaskRef) {
     flag.store(true, Ordering::Relaxed);
-    wake.wake();
+    ax_task::wake_task(task);
 }
 "#,
     );
@@ -267,7 +267,7 @@ fn reports_relaxed_publish_before_signal_wake_entrypoint() {
         r#"
 use core::sync::atomic::{AtomicBool, Ordering};
 
-fn demo(flag: &AtomicBool, tid: Pid, sig: SignalInfo) -> Result<(), SignalError> {
+fn demo(flag: &AtomicBool, tid: Pid, sig: SignalInfo) -> AxResult<()> {
     flag.store(true, Ordering::Relaxed);
     send_signal_to_thread(None, tid, Some(sig))
 }
@@ -452,11 +452,12 @@ fn stats_path(flag: &AtomicBool) {
 "#,
     );
 
-    assert!(
-        findings
-            .iter()
-            .any(|finding| finding.rule == Rule::MixedOrdering)
-    );
+    let mixed = findings
+        .iter()
+        .filter(|finding| finding.rule == Rule::MixedOrdering)
+        .collect::<Vec<_>>();
+
+    assert_eq!(mixed.len(), 1);
 }
 
 #[test]
@@ -477,11 +478,12 @@ fn demo(flag: &AtomicBool, wq: WaitQueue) {
 "#,
     );
 
-    assert!(
-        findings
-            .iter()
-            .any(|finding| finding.rule == Rule::MixedOrdering)
-    );
+    let mixed = findings
+        .iter()
+        .filter(|finding| finding.rule == Rule::MixedOrdering)
+        .collect::<Vec<_>>();
+
+    assert_eq!(mixed.len(), 1);
 }
 
 #[test]

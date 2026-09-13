@@ -23,7 +23,7 @@ mod world_switch_tests;
 
 pub use self::{
     context_frame::LoongArchContextFrame,
-    exception::handle_exception_irq,
+    exception::{handle_exception_irq, handle_exception_sync},
     host::LoongArchHostOps,
     iocsr::{LoongArchIocsrState, LoongArchIocsrStateRef},
     pcpu::LoongArchPerCpu,

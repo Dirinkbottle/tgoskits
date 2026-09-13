@@ -1,9 +1,5 @@
 {
   "label": "驱动框架",
   "collapsed": false,
-  "position": 2,
-  "link": {
-    "type": "doc",
-    "id": "overview"
-  }
+  "position": 2
 }

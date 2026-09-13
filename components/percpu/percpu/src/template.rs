@@ -1,7 +1,6 @@
 //! Loaded per-CPU template metadata.
 
 /// Returns the loaded address of the single CPU-area template.
-#[inline(always)]
 pub(crate) fn template_base() -> usize {
     cpu_local::cpu_area_template_base()
 }

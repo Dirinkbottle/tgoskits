@@ -1,6 +1,7 @@
+use ax_errno::AxResult;
 use ax_memory_addr::{PhysAddr, VirtAddr};
 
-use crate::{AllocResult, PAGE_SIZE, UsageKind, global_allocator};
+use crate::{PAGE_SIZE, UsageKind, global_allocator};
 
 /// A RAII wrapper of contiguous 4K-sized pages.
 ///
@@ -13,8 +14,10 @@ pub struct GlobalPage {
 
 impl GlobalPage {
     /// Allocate one 4K-sized page.
-    pub fn alloc() -> AllocResult<Self> {
-        let vaddr = global_allocator().alloc_pages(1, PAGE_SIZE, UsageKind::Global)?;
+    pub fn alloc() -> AxResult<Self> {
+        let vaddr = global_allocator()
+            .alloc_pages(1, PAGE_SIZE, UsageKind::Global)
+            .map_err(|_| ax_errno::AxError::NoMemory)?;
         Ok(Self {
             start_vaddr: vaddr.into(),
             num_pages: 1,
@@ -22,15 +25,17 @@ impl GlobalPage {
     }
 
     /// Allocate one 4K-sized page and fill with zero.
-    pub fn alloc_zero() -> AllocResult<Self> {
+    pub fn alloc_zero() -> AxResult<Self> {
         let mut p = Self::alloc()?;
         p.zero();
         Ok(p)
     }
 
     /// Allocate contiguous 4K-sized pages.
-    pub fn alloc_contiguous(num_pages: usize, alignment: usize) -> AllocResult<Self> {
-        let vaddr = global_allocator().alloc_pages(num_pages, alignment, UsageKind::Global)?;
+    pub fn alloc_contiguous(num_pages: usize, alignment: usize) -> AxResult<Self> {
+        let vaddr = global_allocator()
+            .alloc_pages(num_pages, alignment, UsageKind::Global)
+            .map_err(|_| ax_errno::AxError::NoMemory)?;
         Ok(Self {
             start_vaddr: vaddr.into(),
             num_pages,

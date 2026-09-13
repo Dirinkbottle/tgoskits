@@ -3,8 +3,9 @@ mod poll;
 mod select;
 
 use alloc::{sync::Arc, vec::Vec};
+use core::task::Context;
 
-use axpoll::{IoEvents, Pollable, SharedRegistrationSink};
+use axpoll::{IoEvents, Pollable};
 
 pub use self::{epoll::*, poll::*, select::*};
 use crate::file::FileLike;
@@ -15,9 +16,16 @@ impl Pollable for FdPollSet {
         unreachable!()
     }
 
-    unsafe fn register_shared(&self, sink: &mut dyn SharedRegistrationSink, _events: IoEvents) {
+    fn register(&self, context: &mut Context<'_>, _events: IoEvents) {
         for (file, events) in &self.0 {
-            unsafe { file.register_shared(sink, *events) };
+            file.register(context, *events);
         }
     }
 }
+
+#[cfg(axtest)]
+pub(crate) use self::epoll::epoll_validation_rules_hold_for_test;
+#[cfg(axtest)]
+pub(crate) use self::poll::poll_nfds_validation_rules_hold_for_test;
+#[cfg(axtest)]
+pub(crate) use self::select::select_fd_set_and_validation_rules_hold_for_test;

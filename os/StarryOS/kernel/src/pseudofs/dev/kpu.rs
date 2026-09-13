@@ -1,18 +1,14 @@
 use core::{
     any::Any,
-    hint::spin_loop,
-    mem::{offset_of, size_of},
-    sync::atomic::{AtomicU8, AtomicU64, Ordering},
+    mem::{MaybeUninit, size_of},
+    sync::atomic::{AtomicU64, Ordering},
     time::Duration,
 };
 
-use ax_lazyinit::LazyInit;
 use ax_memory_addr::{PhysAddr, PhysAddrRange};
-use ax_std::os::arceos::task::{
-    self as scheduler, IrqWaitCell, IrqWaitRegistration, ThreadId, WaitQueue,
-};
+use ax_runtime::hal::cpu::asm::user_copy;
+use ax_task::WaitQueue;
 use axfs_ng_vfs::{DeviceId, NodeFlags, VfsError, VfsResult};
-use bytemuck::NoUninit;
 use k230_kpu::{
     CommandRange, KPU_CFG_PADDR, KPU_CFG_SIZE, KPU_INFO_F_FAKE_OUTPUT, KPU_INFO_F_FDT,
     KPU_INFO_F_IRQ_WAIT, KPU_INFO_F_RUNTIME_SCRATCH, KPU_IOC_CLEAR, KPU_IOC_GET_INFO,
@@ -23,12 +19,9 @@ use k230_kpu::{
     Kpu, KpuInfo,
 };
 
-use crate::{
-    mm::{UserConstPtr, UserPtr},
-    pseudofs::{
-        DeviceMmap, DeviceOps,
-        dev::{IrqRegistration, irq_service::complete_irq_service_cycle, request_shared_disabled},
-    },
+use crate::pseudofs::{
+    DeviceMmap, DeviceOps,
+    dev::{IrqRegistration, request_shared_disabled},
 };
 
 pub const KPU_DEVICE_ID: DeviceId = DeviceId::new(240, 1);
@@ -37,13 +30,6 @@ const KPU_IRQ_WAIT_TIMEOUT: Duration = Duration::from_millis(100);
 // move this IRQ state into per-device storage.
 static KPU_IRQ_COUNT: AtomicU64 = AtomicU64::new(0);
 static KPU_DONE_WQ: WaitQueue = WaitQueue::new();
-static KPU_SERVICE_PARK: WaitQueue = WaitQueue::new();
-static KPU_IRQ_NOTIFY: IrqWaitCell = IrqWaitCell::new();
-static KPU_SERVICE_WAITER: LazyInit<KpuServiceWaiter> = LazyInit::new();
-static KPU_SERVICE_STATE: AtomicU8 = AtomicU8::new(KPU_SERVICE_STOPPED);
-const KPU_SERVICE_STOPPED: u8 = 0;
-const KPU_SERVICE_STARTING: u8 = 1;
-const KPU_SERVICE_STARTED: u8 = 2;
 
 pub struct KpuDevice {
     hw: Kpu,
@@ -86,17 +72,8 @@ impl KpuDevice {
         })
     }
 
-    fn copy_command_range(
-        current: &crate::task::UserTaskRef,
-        arg: usize,
-    ) -> VfsResult<CommandRange> {
-        if arg == 0 {
-            return Err(VfsError::InvalidInput);
-        }
-        // SAFETY: `CommandRange` is `repr(C)` with exactly two `u64` fields,
-        // so every possible userspace byte pattern is a valid value.
-        unsafe { UserConstPtr::<CommandRange>::from(arg).read_abi(current) }
-            .map_err(|_| VfsError::InvalidData)
+    fn copy_command_range(arg: usize) -> VfsResult<CommandRange> {
+        copy_from_user(arg)
     }
 
     fn info(&self) -> KpuInfo {
@@ -149,21 +126,21 @@ impl DeviceOps for KpuDevice {
         Ok(size_of::<u32>())
     }
 
-    fn ioctl(&self, current: &crate::task::UserTaskRef, cmd: u32, arg: usize) -> VfsResult<usize> {
+    fn ioctl(&self, cmd: u32, arg: usize) -> VfsResult<usize> {
         match cmd {
             KPU_IOC_GET_STATUS => {
                 let status = self.hw.status();
-                copy_to_user(current, arg, &status)?;
+                copy_to_user(arg, &status)?;
                 Ok(0)
             }
             KPU_IOC_GET_INFO => {
                 let info = self.info();
-                copy_info_to_user(current, arg, &info)?;
+                copy_to_user(arg, &info)?;
                 Ok(0)
             }
             KPU_IOC_GET_IRQ_COUNT => {
                 let count = KPU_IRQ_COUNT.load(Ordering::Acquire);
-                copy_to_user(current, arg, &count)?;
+                copy_to_user(arg, &count)?;
                 Ok(0)
             }
             KPU_IOC_CLEAR => {
@@ -171,7 +148,7 @@ impl DeviceOps for KpuDevice {
                 Ok(0)
             }
             KPU_IOC_PROGRAM_COMMAND => {
-                let range = Self::copy_command_range(current, arg)?;
+                let range = Self::copy_command_range(arg)?;
                 self.hw
                     .program_command(range)
                     .map_err(|_| VfsError::InvalidInput)?;
@@ -182,7 +159,7 @@ impl DeviceOps for KpuDevice {
                 Ok(0)
             }
             KPU_IOC_RUN => {
-                let range = Self::copy_command_range(current, arg)?;
+                let range = Self::copy_command_range(arg)?;
                 self.hw
                     .run_command(range)
                     .map_err(|_| VfsError::InvalidInput)?;
@@ -462,9 +439,6 @@ fn register_kpu_irq(irq: ax_runtime::hal::irq::IrqId) -> Option<IrqRegistration>
             return None;
         }
     };
-    if !start_kpu_irq_service() {
-        return None;
-    }
     if let Err(err) = registration.enable() {
         warn!("k230-kpu devfs: failed to enable IRQ {irq:?}: {err:?}");
         return None;
@@ -474,83 +448,8 @@ fn register_kpu_irq(irq: ax_runtime::hal::irq::IrqId) -> Option<IrqRegistration>
 
 fn kpu_irq_handler(_ctx: ax_runtime::hal::irq::IrqContext) -> ax_runtime::hal::irq::IrqReturn {
     KPU_IRQ_COUNT.fetch_add(1, Ordering::AcqRel);
-    let _result = KPU_IRQ_NOTIFY.notify();
+    KPU_DONE_WQ.notify_all_from_irq();
     ax_runtime::hal::irq::IrqReturn::Handled
-}
-
-struct KpuServiceWaiter {
-    owner: ThreadId,
-    registration: IrqWaitRegistration,
-}
-
-fn start_kpu_irq_service() -> bool {
-    loop {
-        match KPU_SERVICE_STATE.load(Ordering::Acquire) {
-            KPU_SERVICE_STARTED => return true,
-            KPU_SERVICE_STARTING => spin_loop(),
-            KPU_SERVICE_STOPPED => {
-                if KPU_SERVICE_STATE
-                    .compare_exchange(
-                        KPU_SERVICE_STOPPED,
-                        KPU_SERVICE_STARTING,
-                        Ordering::AcqRel,
-                        Ordering::Acquire,
-                    )
-                    .is_ok()
-                {
-                    break;
-                }
-            }
-            _ => unreachable!("invalid KPU IRQ service state"),
-        }
-    }
-
-    match crate::task::try_spawn_kernel_thread_with_stack(
-        kpu_irq_service,
-        "kpu-irq-service".into(),
-        crate::task::default_task_stack_size(),
-    ) {
-        Ok(_service) => {
-            KPU_SERVICE_STATE.store(KPU_SERVICE_STARTED, Ordering::Release);
-            true
-        }
-        Err(error) => {
-            KPU_SERVICE_STATE.store(KPU_SERVICE_STOPPED, Ordering::Release);
-            warn!("k230-kpu devfs: failed to spawn IRQ service thread: {error}");
-            false
-        }
-    }
-}
-
-fn kpu_irq_service() {
-    let current = scheduler::current_thread_handle()
-        .unwrap_or_else(|error| panic!("KPU IRQ service has no scheduler thread: {error}"));
-    let waiter = KPU_SERVICE_WAITER.get_or_init(|| create_kpu_service_waiter(&current));
-    assert_eq!(
-        waiter.owner,
-        current.id(),
-        "KPU IRQ notifications must be consumed by one fixed service thread"
-    );
-
-    loop {
-        let registration = KPU_IRQ_NOTIFY.register(&waiter.registration);
-        let completed = complete_irq_service_cycle(
-            registration,
-            |token| KPU_SERVICE_PARK.wait_until(|| !token.is_attached()),
-            || KPU_DONE_WQ.notify_all(),
-        )
-        .unwrap_or_else(|error| panic!("KPU IRQ waiter could not quiesce: {error}"));
-        if !completed {
-            panic!("KPU IRQ service registration was occupied concurrently");
-        }
-    }
-}
-
-fn create_kpu_service_waiter(current: &scheduler::ThreadHandle) -> KpuServiceWaiter {
-    KpuServiceWaiter {
-        owner: current.id(),
-        registration: IrqWaitRegistration::new(current.wake_handle()),
-    }
 }
 
 fn fallback_irq() -> Option<ax_runtime::hal::irq::IrqId> {
@@ -598,33 +497,37 @@ fn decode_named_region(
     .flatten()
 }
 
-fn copy_to_user<T: NoUninit>(
-    current: &crate::task::UserTaskRef,
-    arg: usize,
-    value: &T,
-) -> VfsResult<()> {
+fn copy_from_user<T: Copy>(arg: usize) -> VfsResult<T> {
     if arg == 0 {
         return Err(VfsError::InvalidInput);
     }
-    UserPtr::<T>::from(arg)
-        .write(current, *value)
-        .map_err(|_| VfsError::InvalidData)
+    let mut value = MaybeUninit::<T>::uninit();
+    let ret = unsafe {
+        user_copy(
+            value.as_mut_ptr().cast::<u8>(),
+            arg as *const u8,
+            size_of::<T>(),
+        )
+    };
+    if ret != 0 {
+        return Err(VfsError::InvalidData);
+    }
+    Ok(unsafe { value.assume_init() })
 }
 
-fn copy_info_to_user(
-    current: &crate::task::UserTaskRef,
-    arg: usize,
-    info: &KpuInfo,
-) -> VfsResult<()> {
+fn copy_to_user<T: Copy>(arg: usize, value: &T) -> VfsResult<()> {
     if arg == 0 {
         return Err(VfsError::InvalidInput);
     }
-    let user = UserPtr::<KpuInfo>::from(arg);
-    user.write_field(current, offset_of!(KpuInfo, cfg_paddr), info.cfg_paddr)
-        .and_then(|()| user.write_field(current, offset_of!(KpuInfo, cfg_size), info.cfg_size))
-        .and_then(|()| user.write_field(current, offset_of!(KpuInfo, l2_paddr), info.l2_paddr))
-        .and_then(|()| user.write_field(current, offset_of!(KpuInfo, l2_size), info.l2_size))
-        .and_then(|()| user.write_field(current, offset_of!(KpuInfo, irq), info.irq))
-        .and_then(|()| user.write_field(current, offset_of!(KpuInfo, flags), info.flags))
-        .map_err(|_| VfsError::InvalidData)
+    let ret = unsafe {
+        user_copy(
+            arg as *mut u8,
+            (value as *const T).cast::<u8>(),
+            size_of::<T>(),
+        )
+    };
+    if ret != 0 {
+        return Err(VfsError::InvalidData);
+    }
+    Ok(())
 }

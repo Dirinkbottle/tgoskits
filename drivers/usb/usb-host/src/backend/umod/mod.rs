@@ -20,11 +20,7 @@ mod endpoint;
 
 impl USBHost {
     pub fn new_libusb() -> Result<USBHost, USBError> {
-        let host = USBHost {
-            backend: Box::new(Libusb::new()),
-            initialized: false,
-        };
-        Ok(host)
+        Ok(USBHost::with_backend(Box::new(Libusb::new())))
     }
 }
 

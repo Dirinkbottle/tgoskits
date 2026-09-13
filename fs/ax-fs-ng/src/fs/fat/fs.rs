@@ -53,7 +53,7 @@ impl FatFilesystem {
         let result = Arc::new(Self {
             inner: SleepMutex::new(inner),
             disk_flusher,
-            root_dir: IrqMutex::new(None),
+            root_dir: IrqMutex::default(),
         });
 
         let root_dir = DirEntry::new_dir(
@@ -112,9 +112,7 @@ impl FilesystemOps for FatFilesystem {
 
     fn flush(&self) -> VfsResult<()> {
         let _state = self.inner.lock();
-        self.disk_flusher
-            .flush()
-            .map_err(crate::block_error_to_vfs_error)
+        self.disk_flusher.flush()
     }
 
     fn shutdown(&self) -> VfsResult<()> {

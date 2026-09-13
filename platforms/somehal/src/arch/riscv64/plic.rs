@@ -122,9 +122,13 @@ impl ActiveIrq {
     }
 
     pub(super) fn take_plic_claim(&mut self) -> Option<PlicClaim> {
-        match core::mem::replace(&mut self.completion, Completion::None) {
-            Completion::None => None,
+        let completion = core::mem::replace(&mut self.completion, Completion::None);
+        match completion {
             Completion::Plic(claim) => Some(claim),
+            other => {
+                self.completion = other;
+                None
+            }
         }
     }
 
@@ -142,8 +146,9 @@ impl ActiveIrq {
 
 impl Drop for ActiveIrq {
     fn drop(&mut self) {
-        if let Some(claim) = self.take_plic_claim() {
-            complete_external_irq_claim(claim);
+        match core::mem::replace(&mut self.completion, Completion::None) {
+            Completion::Plic(claim) => complete_external_irq_claim(claim),
+            Completion::None => {}
         }
     }
 }
@@ -201,9 +206,8 @@ pub fn secondary_init_intc(cpu_idx: usize) {
 
 pub fn send_ipi_to_cpu(cpu_id: usize) -> Result<(), crate::irq::IrqError> {
     let hart_id = someboot::smp::cpu_idx_to_id(cpu_id).ok_or(crate::irq::IrqError::InvalidCpu)?;
-    // An SBI IPI is only a doorbell. Complete the shared-memory publication
-    // before entering firmware, whose later MMIO/IMSIC operation may otherwise
-    // become visible to the target hart first under RVWMO.
+    // The SBI IPI is a doorbell for earlier shared-memory publication. Keep
+    // that publication ordered before firmware makes the interrupt visible.
     unsafe {
         core::arch::asm!("fence rw, rw", options(nostack, preserves_flags));
     }

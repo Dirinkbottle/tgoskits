@@ -30,18 +30,12 @@ pub(crate) const DWMMC_INT_ERROR_MASK: u32 = DWMMC_INT_RESPONSE_ERROR
     | DWMMC_INT_START_BIT_ERROR
     | DWMMC_INT_END_BIT_ERROR;
 
-impl SdMmcIrqHost for DwMmc {
+impl SdioIrqHost for DwMmc {
     type Event = Event;
     type IrqHandle = DwMmcIrq;
-    type CardIrq = ();
 
-    fn into_parts(mut self) -> sdmmc_host::HostParts<Self, Self::IrqHandle, Self::CardIrq> {
-        let irq = DwMmc::irq_endpoint(&mut self);
-        sdmmc_host::HostParts {
-            bus: self,
-            irq,
-            card_irq: None,
-        }
+    fn irq_handle(&mut self) -> Self::IrqHandle {
+        DwMmc::irq_endpoint(self)
     }
 
     fn completion_irq_enabled(&self) -> bool {
@@ -103,14 +97,14 @@ impl HostEvent for Event {
 }
 
 impl DwMmc {
-    pub(crate) fn irq_endpoint(&mut self) -> DwMmcIrq {
+    pub fn irq_endpoint(&mut self) -> DwMmcIrq {
         DwMmcIrq {
             irq: self.irq.clone(),
         }
     }
 }
 
-impl SdMmcIrqHandle for DwMmcIrq {
+impl SdioIrqHandle for DwMmcIrq {
     type Event = Event;
 
     fn handle_irq(&mut self) -> Self::Event {

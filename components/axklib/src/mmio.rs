@@ -2,7 +2,7 @@ use core::ptr::NonNull;
 
 use mmio_api::{MapError, Mmio, MmioAddr, MmioOp, MmioRaw};
 
-use crate::KlibError;
+use crate::AxError;
 
 pub struct KlibMmio;
 
@@ -39,10 +39,10 @@ impl MmioOp for KlibMmio {
     fn iounmap(&self, _mmio: &MmioRaw) {}
 }
 
-fn map_error(err: KlibError) -> MapError {
+fn map_error(err: AxError) -> MapError {
     match err {
-        KlibError::NoMemory => MapError::NoMemory,
-        KlibError::AlreadyExists | KlibError::ResourceBusy => MapError::Busy,
+        AxError::NoMemory => MapError::NoMemory,
+        AxError::AlreadyExists | AxError::ResourceBusy => MapError::Busy,
         _ => MapError::Invalid,
     }
 }

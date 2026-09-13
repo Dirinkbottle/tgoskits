@@ -7,13 +7,18 @@ use core::{
 };
 
 use ax_alloc::tracking::{allocations_in, current_generation, disable_tracking, enable_tracking};
+use ax_kspin::SpinNoIrq;
 use axbacktrace::Backtrace;
 use axfs_ng_vfs::{NodeFlags, VfsResult};
 
-use crate::{mm::clear_elf_cache, pseudofs::DeviceOps, sync::IrqMutex, task::tasks};
+use crate::{
+    mm::clear_elf_cache,
+    pseudofs::DeviceOps,
+    task::{cleanup_task_tables, tasks},
+};
 
 static STAMPED_GENERATION: AtomicU64 = AtomicU64::new(0);
-static SAMPLE_ALLOCATION: IrqMutex<Option<Vec<u8>>> = IrqMutex::new(None);
+static SAMPLE_ALLOCATION: SpinNoIrq<Option<Vec<u8>>> = SpinNoIrq::new(None);
 
 #[derive(PartialEq, Eq, PartialOrd, Ord)]
 struct AllocationBacktrace(Backtrace);
@@ -32,7 +37,8 @@ impl fmt::Display for AllocationBacktrace {
 
 fn run_memory_analysis() {
     // Wait for gc
-    crate::task::yield_now();
+    ax_task::yield_now();
+    cleanup_task_tables();
     clear_elf_cache();
 
     ax_println!(
@@ -163,7 +169,7 @@ impl DeviceOps for MemTrack {
     }
 }
 
-#[cfg(all(test, not(axtest)))]
+#[cfg(test)]
 mod tests {
     use super::*;
 

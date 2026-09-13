@@ -3,11 +3,16 @@ use core::{
     sync::atomic::{AtomicUsize, Ordering},
 };
 
-use crate::{CpuId, CpuMask, IrqError, IrqId, IrqRequest, IrqScope, ShareMode, action::Action};
+use crate::{
+    CpuId, CpuMask, IrqAffinity, IrqError, IrqExecution, IrqId, IrqRequest, IrqScope, ShareMode,
+    action::Action,
+};
 
 pub(crate) struct Descriptor {
     pub(crate) irq: IrqId,
     share_mode: ShareMode,
+    affinity: IrqAffinity,
+    execution: IrqExecution,
     pub(crate) in_flight: AtomicUsize,
     line_desired: bool,
     line_applied: bool,
@@ -21,6 +26,8 @@ impl Descriptor {
         Self {
             irq,
             share_mode: request.share_mode,
+            affinity: request.affinity,
+            execution: request.execution,
             in_flight: AtomicUsize::new(0),
             line_desired: false,
             line_applied: false,
@@ -45,6 +52,8 @@ impl Descriptor {
 
         if !has_active_actions {
             self.share_mode = request.share_mode;
+            self.affinity = request.affinity;
+            self.execution = request.execution;
             return Ok(());
         }
 
@@ -52,9 +61,10 @@ impl Descriptor {
             return Err(IrqError::Busy);
         }
 
-        // Global line routing belongs to the descriptor/controller, while
-        // reentrancy belongs to each action. Neither is a shared-action
-        // compatibility condition.
+        if self.affinity != request.affinity || self.execution != request.execution {
+            return Err(IrqError::Busy);
+        }
+
         Ok(())
     }
 

@@ -5,18 +5,12 @@ pub struct PhytiumMciIrqHandle {
     pub(crate) irq: Arc<host::IrqCore>,
 }
 
-impl SdMmcIrqHost for PhytiumMci {
+impl SdioIrqHost for PhytiumMci {
     type Event = Event;
     type IrqHandle = PhytiumMciIrqHandle;
-    type CardIrq = ();
 
-    fn into_parts(mut self) -> sdmmc_host::HostParts<Self, Self::IrqHandle, Self::CardIrq> {
-        let irq = PhytiumMci::irq_endpoint(&mut self);
-        sdmmc_host::HostParts {
-            bus: self,
-            irq,
-            card_irq: None,
-        }
+    fn irq_handle(&mut self) -> Self::IrqHandle {
+        PhytiumMci::irq_endpoint(self)
     }
 
     fn completion_irq_enabled(&self) -> bool {

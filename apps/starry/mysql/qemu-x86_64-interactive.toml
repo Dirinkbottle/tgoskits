@@ -21,6 +21,7 @@ args = [
     "user,id=net0",
     "-append",
     "root=/dev/nvme0n1",
+    "-snapshot",
 ]
 
 shell_init_cmd = "/usr/bin/mysql-interactive.sh"

@@ -23,18 +23,19 @@ use core::{
     any::Any,
     fmt::{self, Debug},
     net::SocketAddr,
+    task::Context,
     time::Duration,
 };
 
+use ax_errno::{AxError, AxResult, LinuxError};
 use ax_io::prelude::*;
-use axpoll::{ExclusiveRegistrationSink, IoEvents, Pollable, SharedRegistrationSink};
+use axpoll::{IoEvents, Pollable};
 use bitflags::bitflags;
 use enum_dispatch::enum_dispatch;
 
 #[cfg(feature = "vsock")]
 use crate::vsock::{VsockAddr, VsockSocket};
 use crate::{
-    NetError, NetResult,
     options::{Configurable, GetSocketOption, SetSocketOption, UnixCredentials},
     raw::RawSocket,
     tcp::TcpSocket,
@@ -56,31 +57,31 @@ pub enum SocketAddrEx {
 
 impl SocketAddrEx {
     /// Convert into an IP socket address, or return an error if not IP.
-    pub fn into_ip(self) -> NetResult<SocketAddr> {
+    pub fn into_ip(self) -> AxResult<SocketAddr> {
         match self {
             SocketAddrEx::Ip(addr) => Ok(addr),
-            SocketAddrEx::Unix(_) => Err(NetError::AddressFamilyUnsupported),
+            SocketAddrEx::Unix(_) => Err(AxError::from(LinuxError::EAFNOSUPPORT)),
             #[cfg(feature = "vsock")]
-            SocketAddrEx::Vsock(_) => Err(NetError::AddressFamilyUnsupported),
+            SocketAddrEx::Vsock(_) => Err(AxError::from(LinuxError::EAFNOSUPPORT)),
         }
     }
 
     /// Convert into a Unix socket address, or return an error if not Unix.
-    pub fn into_unix(self) -> NetResult<UnixSocketAddr> {
+    pub fn into_unix(self) -> AxResult<UnixSocketAddr> {
         match self {
             SocketAddrEx::Unix(addr) => Ok(addr),
-            SocketAddrEx::Ip(_) => Err(NetError::AddressFamilyUnsupported),
+            SocketAddrEx::Ip(_) => Err(AxError::from(LinuxError::EAFNOSUPPORT)),
             #[cfg(feature = "vsock")]
-            SocketAddrEx::Vsock(_) => Err(NetError::AddressFamilyUnsupported),
+            SocketAddrEx::Vsock(_) => Err(AxError::from(LinuxError::EAFNOSUPPORT)),
         }
     }
 
     /// Convert into a vsock address, or return an error if not vsock.
     #[cfg(feature = "vsock")]
-    pub fn into_vsock(self) -> NetResult<VsockAddr> {
+    pub fn into_vsock(self) -> AxResult<VsockAddr> {
         match self {
-            SocketAddrEx::Ip(_) => Err(NetError::AddressFamilyUnsupported),
-            SocketAddrEx::Unix(_) => Err(NetError::AddressFamilyUnsupported),
+            SocketAddrEx::Ip(_) => Err(AxError::from(LinuxError::EAFNOSUPPORT)),
+            SocketAddrEx::Unix(_) => Err(AxError::from(LinuxError::EAFNOSUPPORT)),
             SocketAddrEx::Vsock(addr) => Ok(addr),
         }
     }
@@ -169,8 +170,6 @@ pub type CMsgData = Box<dyn CMsgPayload>;
 /// IP ancillary data reported through `recvmsg`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IpCmsg {
-    /// IPv4 hop limit for `IP_RECVTTL`.
-    Ipv4Ttl(u8),
     /// IPv4 TOS byte for `IP_RECVTOS`.
     Ipv4Tos(u8),
     /// IPv6 traffic-class byte for `IPV6_RECVTCLASS`.
@@ -179,7 +178,7 @@ pub enum IpCmsg {
 
 /// Transport-independent socket-level ancillary data reported through
 /// `recvmsg`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SocketCmsg {
     /// Sender credentials requested with `SO_PASSCRED`.
     Credentials(UnixCredentials),
@@ -235,43 +234,6 @@ pub enum Shutdown {
     /// Shut down both halves.
     Both,
 }
-
-/// Progress of a connection attempt whose completion is readiness-driven.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ConnectStatus {
-    /// The transport completed the connection synchronously or asynchronously.
-    Connected,
-    /// The transport started an asynchronous connection and is not ready yet.
-    InProgress,
-}
-
-/// OS-facing policy for driving one task-neutral socket future.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct SocketWaitPolicy {
-    /// Whether this operation must return after the registration recheck.
-    pub nonblocking: bool,
-    /// Optional relative timeout owned and enforced by the consuming OS.
-    pub timeout: Option<Duration>,
-}
-
-fn socket_wait_policy(
-    socket: &(impl Configurable + ?Sized),
-    send: bool,
-    extra_nonblocking: bool,
-) -> NetResult<SocketWaitPolicy> {
-    let mut nonblocking = false;
-    socket.get_option(GetSocketOption::NonBlocking(&mut nonblocking))?;
-    let mut timeout = Duration::ZERO;
-    if send {
-        socket.get_option(GetSocketOption::SendTimeout(&mut timeout))?;
-    } else {
-        socket.get_option(GetSocketOption::ReceiveTimeout(&mut timeout))?;
-    }
-    Ok(SocketWaitPolicy {
-        nonblocking: nonblocking || extra_nonblocking,
-        timeout: (!timeout.is_zero()).then_some(timeout),
-    })
-}
 impl Shutdown {
     /// Returns `true` if the read half should be shut down.
     pub fn has_read(&self) -> bool {
@@ -288,73 +250,51 @@ impl Shutdown {
 #[enum_dispatch]
 pub trait SocketOps: Configurable {
     /// Binds an unbound socket to the given address and port.
-    fn bind(&self, local_addr: SocketAddrEx) -> NetResult;
-    /// Starts a connection without waiting for asynchronous completion.
-    fn start_connect(&self, remote_addr: SocketAddrEx) -> NetResult<ConnectStatus>;
-    /// Checks a previously started asynchronous connection.
-    fn connect_status(&self) -> NetResult<ConnectStatus> {
-        Ok(ConnectStatus::Connected)
-    }
+    fn bind(&self, local_addr: SocketAddrEx) -> AxResult;
+    /// Connects the socket to a remote address.
+    fn connect(&self, remote_addr: SocketAddrEx) -> AxResult;
 
     /// Starts listening on the bound address and port.
-    fn listen(&self, _backlog: usize) -> NetResult {
-        Err(NetError::OperationNotSupported)
+    fn listen(&self, _backlog: usize) -> AxResult {
+        Err(AxError::OperationNotSupported)
     }
     /// Returns whether this socket currently accepts incoming connections.
     fn is_listening(&self) -> bool {
         false
     }
-    /// Attempts to accept one connection without parking the caller.
-    fn try_accept(&self) -> NetResult<Socket> {
-        Err(NetError::OperationNotSupported)
+    /// Accepts a connection on a listening socket, returning a new socket.
+    fn accept(&self) -> AxResult<Socket> {
+        Err(AxError::OperationNotSupported)
     }
 
-    /// Attempts to send data without parking the caller.
-    fn try_send(&self, src: impl Read + IoBuf, options: &mut SendOptions) -> NetResult<usize>;
-    /// Attempts to receive data without parking the caller.
-    fn try_recv(
-        &self,
-        dst: impl Write + IoBufMut,
-        options: &mut RecvOptions<'_>,
-    ) -> NetResult<usize>;
+    /// Send data to the socket, optionally to a specific address.
+    fn send(&self, src: impl Read + IoBuf, options: SendOptions) -> AxResult<usize>;
+    /// Receive data from the socket.
+    fn recv(&self, dst: impl Write + IoBufMut, options: RecvOptions<'_>) -> AxResult<usize>;
     /// Returns the number of bytes that can be read without blocking.
-    fn recv_available(&self) -> NetResult<usize> {
-        Err(NetError::OperationNotSupported)
+    fn recv_available(&self) -> AxResult<usize> {
+        Err(AxError::OperationNotSupported)
     }
 
     /// Get the local endpoint of the socket.
-    fn local_addr(&self) -> NetResult<SocketAddrEx>;
+    fn local_addr(&self) -> AxResult<SocketAddrEx>;
     /// Get the remote endpoint of the socket.
-    fn peer_addr(&self) -> NetResult<SocketAddrEx>;
+    fn peer_addr(&self) -> AxResult<SocketAddrEx>;
 
     /// Shutdown the socket, closing the connection.
-    fn shutdown(&self, how: Shutdown) -> NetResult;
-
-    /// Returns the send wait policy without acquiring scheduler ownership.
-    fn send_wait_policy(&self, extra_nonblocking: bool) -> NetResult<SocketWaitPolicy> {
-        socket_wait_policy(self, true, extra_nonblocking)
-    }
-
-    /// Returns the receive wait policy without acquiring scheduler ownership.
-    fn recv_wait_policy(&self, extra_nonblocking: bool) -> NetResult<SocketWaitPolicy> {
-        socket_wait_policy(self, false, extra_nonblocking)
-    }
+    fn shutdown(&self, how: Shutdown) -> AxResult;
 }
 
 impl<T: SocketOps + ?Sized> SocketOps for Box<T> {
-    fn bind(&self, local_addr: SocketAddrEx) -> NetResult {
+    fn bind(&self, local_addr: SocketAddrEx) -> AxResult {
         (**self).bind(local_addr)
     }
 
-    fn start_connect(&self, remote_addr: SocketAddrEx) -> NetResult<ConnectStatus> {
-        (**self).start_connect(remote_addr)
+    fn connect(&self, remote_addr: SocketAddrEx) -> AxResult {
+        (**self).connect(remote_addr)
     }
 
-    fn connect_status(&self) -> NetResult<ConnectStatus> {
-        (**self).connect_status()
-    }
-
-    fn listen(&self, backlog: usize) -> NetResult {
+    fn listen(&self, backlog: usize) -> AxResult {
         (**self).listen(backlog)
     }
 
@@ -362,35 +302,31 @@ impl<T: SocketOps + ?Sized> SocketOps for Box<T> {
         (**self).is_listening()
     }
 
-    fn try_accept(&self) -> NetResult<Socket> {
-        (**self).try_accept()
+    fn accept(&self) -> AxResult<Socket> {
+        (**self).accept()
     }
 
-    fn try_send(&self, src: impl Read + IoBuf, options: &mut SendOptions) -> NetResult<usize> {
-        (**self).try_send(src, options)
+    fn send(&self, src: impl Read + IoBuf, options: SendOptions) -> AxResult<usize> {
+        (**self).send(src, options)
     }
 
-    fn try_recv(
-        &self,
-        dst: impl Write + IoBufMut,
-        options: &mut RecvOptions<'_>,
-    ) -> NetResult<usize> {
-        (**self).try_recv(dst, options)
+    fn recv(&self, dst: impl Write + IoBufMut, options: RecvOptions<'_>) -> AxResult<usize> {
+        (**self).recv(dst, options)
     }
 
-    fn recv_available(&self) -> NetResult<usize> {
+    fn recv_available(&self) -> AxResult<usize> {
         (**self).recv_available()
     }
 
-    fn local_addr(&self) -> NetResult<SocketAddrEx> {
+    fn local_addr(&self) -> AxResult<SocketAddrEx> {
         (**self).local_addr()
     }
 
-    fn peer_addr(&self) -> NetResult<SocketAddrEx> {
+    fn peer_addr(&self) -> AxResult<SocketAddrEx> {
         (**self).peer_addr()
     }
 
-    fn shutdown(&self, how: Shutdown) -> NetResult {
+    fn shutdown(&self, how: Shutdown) -> AxResult {
         (**self).shutdown(how)
     }
 }
@@ -448,29 +384,14 @@ impl Pollable for Socket {
         }
     }
 
-    unsafe fn register_shared(&self, sink: &mut dyn SharedRegistrationSink, events: IoEvents) {
+    fn register(&self, context: &mut Context<'_>, events: IoEvents) {
         match self {
-            Socket::Tcp(tcp) => unsafe { tcp.register_shared(sink, events) },
-            Socket::Udp(udp) => unsafe { udp.register_shared(sink, events) },
-            Socket::Raw(raw) => unsafe { raw.register_shared(sink, events) },
-            Socket::Unix(unix) => unsafe { unix.register_shared(sink, events) },
+            Socket::Tcp(tcp) => tcp.register(context, events),
+            Socket::Udp(udp) => udp.register(context, events),
+            Socket::Raw(raw) => raw.register(context, events),
+            Socket::Unix(unix) => unix.register(context, events),
             #[cfg(feature = "vsock")]
-            Socket::Vsock(vsock) => unsafe { vsock.register_shared(sink, events) },
-        }
-    }
-
-    unsafe fn register_exclusive(
-        &self,
-        sink: &mut dyn ExclusiveRegistrationSink,
-        events: IoEvents,
-    ) {
-        match self {
-            Socket::Tcp(tcp) => unsafe { tcp.register_exclusive(sink, events) },
-            Socket::Udp(udp) => unsafe { udp.register_exclusive(sink, events) },
-            Socket::Raw(raw) => unsafe { raw.register_exclusive(sink, events) },
-            Socket::Unix(unix) => unsafe { unix.register_exclusive(sink, events) },
-            #[cfg(feature = "vsock")]
-            Socket::Vsock(vsock) => unsafe { vsock.register_exclusive(sink, events) },
+            Socket::Vsock(vsock) => vsock.register(context, events),
         }
     }
 }

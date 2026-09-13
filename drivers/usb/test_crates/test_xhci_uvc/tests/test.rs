@@ -50,10 +50,9 @@ mod tests {
             let mut devices = Vec::new();
             for _ in 0..50 {
                 let ls2 = host.probe_devices().await.unwrap();
-                if !ls2.connected.is_empty() {
-                    info!("found {} devices", ls2.connected.len());
+                if !ls2.is_empty() {
+                    info!("found {} devices", ls2.len());
                     devices = ls2
-                        .connected
                         .into_iter()
                         .filter_map(|device| device.into_device_info())
                         .collect();
@@ -252,12 +251,7 @@ mod tests {
                 let irq = node.irq_info();
 
                 return XhciInfo {
-                    usb: USBHost::new_xhci(
-                        addr,
-                        crab_usb::DmaCoherency::NonCoherent,
-                        &KernelImpl,
-                    )
-                    .expect("Failed to create xhci host"),
+                    usb: USBHost::new_xhci(addr, &KernelImpl).expect("Failed to create xhci host"),
                     irq,
                 };
             }
@@ -368,11 +362,7 @@ mod tests {
                     println!("irq: {irq:?}");
 
                     return Some(XhciInfo {
-                        usb: USBHost::new_xhci(
-                            addr,
-                            crab_usb::DmaCoherency::NonCoherent,
-                            &KernelImpl,
-                        )
+                        usb: USBHost::new_xhci(addr, &KernelImpl)
                             .expect("Failed to create xhci host"),
                         irq,
                     });

@@ -62,10 +62,7 @@ impl<'a, T: TableMeta, A: FrameAllocator> PageTableWalker<'a, T, A> {
             let root_state = WalkState {
                 frame: page_table.root.clone(),
                 level: Frame::<T, A>::PT_LEVEL,
-                index: Frame::<T, A>::virt_to_index(
-                    walker.config.start_vaddr,
-                    Frame::<T, A>::PT_LEVEL,
-                ),
+                index: 0,
                 base_vaddr: VirtAddr::from_usize(0),
             };
             walker.stack.push(root_state).ok(); // 栈容量足够时一定成功
@@ -108,14 +105,8 @@ impl<'a, T: TableMeta, A: FrameAllocator> PageTableWalker<'a, T, A> {
                 state.base_vaddr,
             ));
 
-            // A range may begin inside an entry owned by an upper-level page
-            // table. Compare the represented interval rather than only the
-            // entry base, otherwise the walker skips the child table that
-            // contains `start_vaddr` and has to fall back to a full-tree walk.
-            let entry_end = current_vaddr
-                .as_usize()
-                .saturating_add(Frame::<T, A>::level_size(state.level));
-            if entry_end <= self.config.start_vaddr.as_usize() {
+            // 跳过不在范围内的地址
+            if current_vaddr < self.config.start_vaddr {
                 continue;
             }
 
@@ -144,11 +135,7 @@ impl<'a, T: TableMeta, A: FrameAllocator> PageTableWalker<'a, T, A> {
                 let child_state = WalkState {
                     frame: child_frame,
                     level: state.level - 1,
-                    index: if current_vaddr < self.config.start_vaddr {
-                        Frame::<T, A>::virt_to_index(self.config.start_vaddr, state.level - 1)
-                    } else {
-                        0
-                    },
+                    index: 0,
                     base_vaddr: child_base_vaddr,
                 };
 

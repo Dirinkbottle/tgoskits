@@ -1,18 +1,19 @@
 use alloc::{borrow::Cow, sync::Arc};
-use core::mem::size_of;
+use core::{mem::size_of, task::Context};
 
 use ax_alloc::{UsageKind, global_allocator};
+use ax_errno::{AxError, AxResult};
 use ax_memory_addr::{PAGE_SIZE_4K, PhysAddr, PhysAddrRange, VirtAddr, align_up_4k};
 use ax_runtime::hal::mem::virt_to_phys;
-use axpoll::{IoEvents, Pollable};
-use axpoll_set::PollSet;
+use ax_sync::Mutex;
+use axpoll::{IoEvents, PollSet, Pollable};
 use linux_raw_sys::io_uring::{
     IORING_FEAT_RW_CUR_POS, IORING_FEAT_SUBMIT_STABLE, IORING_OFF_CQ_RING, IORING_OFF_SQ_RING,
     IORING_OFF_SQES, io_uring_params,
 };
 
 use super::FileLike;
-use crate::{StarryError, StarryResult, pseudofs::DeviceMmap, sync::PiMutex};
+use crate::pseudofs::DeviceMmap;
 
 const SQ_HEAD_OFFSET: usize = 0;
 const SQ_TAIL_OFFSET: usize = 4;
@@ -67,13 +68,13 @@ struct RingMemory {
 }
 
 impl RingMemory {
-    fn new(size: usize) -> StarryResult<Self> {
+    fn new(size: usize) -> AxResult<Self> {
         let size = align_up_4k(size);
         let pages = size / PAGE_SIZE_4K;
         let vaddr = VirtAddr::from(
             global_allocator()
                 .alloc_pages(pages, PAGE_SIZE_4K, UsageKind::VirtMem)
-                .map_err(|_| StarryError::NoMemory)?,
+                .map_err(|_| AxError::NoMemory)?,
         );
         unsafe { core::ptr::write_bytes(vaddr.as_mut_ptr(), 0, size) };
         Ok(Self {
@@ -134,7 +135,7 @@ pub struct IoUringRings {
 }
 
 impl IoUringRings {
-    fn new(entries: u32, cq_entries: u32) -> StarryResult<Self> {
+    fn new(entries: u32, cq_entries: u32) -> AxResult<Self> {
         let sq_ring_size = SQ_ARRAY_OFFSET + entries as usize * size_of::<u32>();
         let cq_ring_size = CQ_CQES_OFFSET + cq_entries as usize * size_of::<IoUringCqe>();
         let sqes_size = entries as usize * size_of::<IoUringSqe>();
@@ -163,7 +164,7 @@ impl IoUringRings {
         self.cq_ring.write_u32(CQ_OVERFLOW_OFFSET, 0);
     }
 
-    fn mmap_region(self: &Arc<Self>, offset: u64) -> StarryResult<DeviceMmap> {
+    fn mmap_region(self: &Arc<Self>, offset: u64) -> AxResult<DeviceMmap> {
         let range = if offset == IORING_OFF_SQ_RING as u64 {
             self.sq_ring.phys_range()
         } else if offset == IORING_OFF_CQ_RING as u64 {
@@ -179,15 +180,15 @@ impl IoUringRings {
 
 pub struct IoUring {
     rings: Arc<IoUringRings>,
-    submit_lock: PiMutex<()>,
+    submit_lock: Mutex<()>,
     poll_cq: PollSet,
 }
 
 impl IoUring {
-    pub fn new(entries: u32, cq_entries: u32) -> StarryResult<Self> {
+    pub fn new(entries: u32, cq_entries: u32) -> AxResult<Self> {
         Ok(Self {
             rings: Arc::new(IoUringRings::new(entries, cq_entries)?),
-            submit_lock: PiMutex::new(()),
+            submit_lock: Mutex::new(()),
             poll_cq: PollSet::new(),
         })
     }
@@ -220,7 +221,7 @@ impl IoUring {
         params.cq_off.user_addr = 0;
     }
 
-    pub fn submit<F>(&self, to_submit: u32, mut execute: F) -> StarryResult<u32>
+    pub fn submit<F>(&self, to_submit: u32, mut execute: F) -> AxResult<u32>
     where
         F: FnMut(&IoUringSqe) -> i32,
     {
@@ -263,7 +264,7 @@ impl IoUring {
         } else if count == 0 {
             Ok(0)
         } else {
-            Err(StarryError::InvalidInput)
+            Err(AxError::InvalidInput)
         }
     }
 
@@ -299,7 +300,7 @@ impl FileLike for IoUring {
         "anon_inode:[io_uring]".into()
     }
 
-    fn device_mmap(&self, offset: u64, _length: u64) -> StarryResult<DeviceMmap> {
+    fn device_mmap(&self, offset: u64, _length: u64) -> AxResult<DeviceMmap> {
         self.rings.mmap_region(offset)
     }
 }
@@ -311,23 +312,10 @@ impl Pollable for IoUring {
         events
     }
 
-    unsafe fn register_shared(
-        &self,
-        sink: &mut dyn axpoll::SharedRegistrationSink,
-        events: IoEvents,
-    ) {
+    fn register(&self, context: &mut Context<'_>, events: IoEvents) {
         if events.contains(IoEvents::IN) {
-            unsafe { sink.register_shared(&self.poll_cq, IoEvents::IN) };
-        }
-    }
-
-    unsafe fn register_exclusive(
-        &self,
-        sink: &mut dyn axpoll::ExclusiveRegistrationSink,
-        events: IoEvents,
-    ) {
-        if events.contains(IoEvents::IN) {
-            unsafe { sink.register_exclusive(&self.poll_cq, IoEvents::IN) };
+            // Registration happens from file poll task context.
+            unsafe { self.poll_cq.register(context.waker(), IoEvents::IN) };
         }
     }
 }

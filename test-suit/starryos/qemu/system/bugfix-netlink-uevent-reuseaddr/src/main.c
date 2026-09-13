@@ -6,7 +6,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
-#include <sys/syscall.h>
 #include <unistd.h>
 
 #ifndef AF_NETLINK
@@ -63,33 +62,6 @@ static void expect_reuseaddr_enabled(int fd, const char *name)
     failed++;
 }
 
-static void expect_reuseaddr_alias_writeback(int fd, const char *name)
-{
-    socklen_t shared = sizeof(int);
-
-    errno = 0;
-    long result = syscall(SYS_getsockopt,
-                          fd,
-                          SOL_SOCKET,
-                          SO_REUSEADDR,
-                          &shared,
-                          &shared);
-    if (result == 0 && shared == sizeof(int) && errno == 0) {
-        printf("PASS: %s\n", name);
-        passed++;
-        return;
-    }
-
-    printf("FAIL: %s: result=%ld final=%u expected=%zu errno=%d (%s)\n",
-           name,
-           result,
-           (unsigned int)shared,
-           sizeof(int),
-           errno,
-           strerror(errno));
-    failed++;
-}
-
 static void check_netlink_listener(int protocol,
                                    unsigned int groups,
                                    const char *socket_name,
@@ -112,7 +84,6 @@ static void check_netlink_listener(int protocol,
     expect_zero(setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &enabled, sizeof(enabled)),
                 reuseaddr_name);
     expect_reuseaddr_enabled(fd, reuseaddr_get_name);
-    expect_reuseaddr_alias_writeback(fd, "get SO_REUSEADDR with aliased value and length");
 
     struct sockaddr_nl address = {
         .nl_family = AF_NETLINK,

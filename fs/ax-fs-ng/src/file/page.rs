@@ -1,19 +1,9 @@
-#[cfg(test)]
-use alloc::sync::Arc;
-#[cfg(test)]
-use core::sync::atomic::{AtomicUsize, Ordering};
-
 use axfs_ng_vfs::{VfsError, VfsResult};
 
-use crate::os::memory::FsPage;
+use crate::os::memory::{FsPage, PAGE_SIZE};
 
 pub struct PageCache {
     page: Option<FsPage>,
-    #[cfg(test)]
-    dirty_drop_observer: Option<Arc<AtomicUsize>>,
-    /// Transient users that hold the frame identity outside the cache-index
-    /// lock while publishing or validating a PTE.
-    pub(super) pins: usize,
     pub(super) dirty: bool,
     pub(super) dirty_generation: u64,
     pub(super) writeback_protecting: bool,
@@ -28,27 +18,11 @@ impl PageCache {
         })?;
         Ok(Self {
             page: Some(page),
-            #[cfg(test)]
-            dirty_drop_observer: None,
-            pins: 0,
             dirty: false,
             dirty_generation: 0,
             writeback_protecting: false,
             dirty_during_writeback: false,
         })
-    }
-
-    #[cfg(all(test, feature = "vfs"))]
-    pub(super) const fn detached_for_test() -> Self {
-        Self {
-            page: None,
-            dirty_drop_observer: None,
-            pins: 0,
-            dirty: false,
-            dirty_generation: 0,
-            writeback_protecting: false,
-            dirty_during_writeback: false,
-        }
     }
 
     /// Returns the physical address of this page.
@@ -70,34 +44,15 @@ impl PageCache {
     pub fn data(&mut self) -> &mut [u8] {
         let page = self
             .page
-            .as_mut()
+            .as_ref()
             .expect("page cache frame already dropped");
-        page.as_mut_slice()
-    }
-
-    /// Retires a page whose cached contents were invalidated by a file-layout
-    /// change rather than persisted by writeback.
-    ///
-    /// The caller must first retire every mapping of this frame. Consuming the
-    /// owner makes it impossible to accidentally restore invalidated dirty
-    /// contents to the cache after this transition.
-    pub(super) fn retire_invalidated(mut self) {
-        self.dirty = false;
-    }
-
-    #[cfg(test)]
-    pub(super) fn observe_dirty_drop(&mut self, observer: Arc<AtomicUsize>) {
-        self.dirty_drop_observer = Some(observer);
+        unsafe { core::slice::from_raw_parts_mut(page.as_mut_ptr(), PAGE_SIZE) }
     }
 }
 
 impl Drop for PageCache {
     fn drop(&mut self) {
         if self.dirty {
-            #[cfg(test)]
-            if let Some(observer) = &self.dirty_drop_observer {
-                observer.fetch_add(1, Ordering::AcqRel);
-            }
             warn!("dirty page dropped without flushing");
         }
         if let Some(page) = self.page.take() {

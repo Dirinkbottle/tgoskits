@@ -1,6 +1,6 @@
 //! Resource access granted to one device factory invocation.
 
-use alloc::{sync::Arc, vec::Vec};
+use alloc::vec::Vec;
 
 use axdevice_base::{HostIrqId, IrqLine, MsiEndpoint};
 
@@ -9,7 +9,6 @@ use crate::{interrupt::*, *};
 /// VM-owned services available while a device factory is building a device.
 pub struct DeviceBuildContext<'a> {
     resources: PlannedBuildResources<'a>,
-    pci_host_topology: Option<&'a Arc<ResolvedPciTopology>>,
 }
 
 struct PlannedBuildResources<'a> {
@@ -86,18 +85,8 @@ impl<'a> DeviceBuildContext<'a> {
         self.build_msi_range(&slot, false)
     }
 
-    /// Returns the frozen topology when building a PCI host node.
-    pub fn pci_host_topology(&self) -> Option<&Arc<ResolvedPciTopology>> {
-        self.pci_host_topology
-    }
-
-    pub(crate) fn planned(
-        interrupts: &'a InterruptRegistry,
-        claims: ResourceClaimSet,
-        pci_host_topology: Option<&'a Arc<ResolvedPciTopology>>,
-    ) -> Self {
+    pub(crate) fn planned(interrupts: &'a InterruptRegistry, claims: ResourceClaimSet) -> Self {
         Self {
-            pci_host_topology,
             resources: PlannedBuildResources {
                 interrupts,
                 claims,

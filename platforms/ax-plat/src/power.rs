@@ -3,13 +3,13 @@
 /// Power management interface.
 #[def_plat_interface]
 pub trait PowerIf {
-    /// Requests that the platform release the given CPU core.
+    /// Bootstraps the given CPU core with the given initial stack (in physical
+    /// address).
     ///
     /// Where `cpu_id` is the logical CPU ID (0, 1, ..., N-1, N is the number of
-    /// CPU cores on the platform). The platform boot layer owns the secondary
-    /// stack and boot record; the OS runtime supplies only the logical target.
+    /// CPU cores on the platform).
     #[cfg(feature = "smp")]
-    fn cpu_boot(cpu_id: usize);
+    fn cpu_boot(cpu_id: usize, stack_top_paddr: usize);
 
     /// Shutdown the whole system.
     fn system_off() -> !;

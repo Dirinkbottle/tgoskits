@@ -8,14 +8,12 @@ use log::*;
 pub use tock_registers::{LocalRegisterCopy, interfaces::*};
 
 mod gicd;
-pub(crate) mod gicr;
+mod gicr;
 mod its;
-mod nmi;
 
 use gicd::*;
 use gicr::*;
 pub use its::*;
-pub use nmi::*;
 
 use crate::version::{IrqVecReadable, IrqVecWriteable};
 pub use crate::{IntId, VirtAddr, define::Trigger, sys_reg::*};
@@ -959,25 +957,18 @@ fn rd_slice_from(gicr: VirtAddr) -> RDv3Slice {
 }
 
 fn current_rd_from(gicr: VirtAddr) -> NonNull<RedistributorV3> {
-    let affinity = Affinity::current();
-    redistributor_for_affinity_from(gicr, affinity)
-        .unwrap_or_else(|| panic!("No redistributor for current CPU affinity {affinity:?}"))
-}
+    let want = (MPIDR_EL1.get() & 0xFFFFFF) as u32;
 
-fn redistributor_for_affinity_from(
-    gicr: VirtAddr,
-    affinity: Affinity,
-) -> Option<NonNull<RedistributorV3>> {
-    let want = affinity.affinity();
-    rd_slice_from(gicr).iter().find(|rd| {
-        // SAFETY: every pointer comes from the Redistributor region whose
-        // mapping and lifetime are guaranteed by the `Gic::new` contract.
+    for rd in rd_slice_from(gicr).iter() {
         let affi = unsafe { rd.as_ref() }
             .lpi_ref()
             .TYPER
             .read(gicr::TYPER::Affinity) as u32;
-        affi == want
-    })
+        if affi == want {
+            return rd;
+        }
+    }
+    panic!("No current redistributor")
 }
 
 /// Every CPU interface has its own GICC registers

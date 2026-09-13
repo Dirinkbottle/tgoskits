@@ -1,4 +1,7 @@
 //! Block bitmap wrappers.
+
+use log::error;
+
 use crate::bitmap::BitmapError;
 
 /// Block bitmap view with allocation helpers.
@@ -134,6 +137,7 @@ impl<'a> BlockBitmap<'a> {
         }
 
         if (self.data[byte_idx] & (1 << bit_idx)) == 0 {
+            error!("Block num:{block_idx} already free!");
             return Err(BitmapError::AlreadyFree);
         }
 

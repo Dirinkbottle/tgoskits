@@ -9,7 +9,7 @@ use some_serial::ns16550::rockchip_fiq::{
 };
 
 use super::{PlatformSerialDevice, erase_uart, prop_u32};
-use crate::BindingInfo;
+use crate::{BindingInfo, BindingIrq};
 
 model_register!(
     name: "rockchip fiq debugger serial",
@@ -85,10 +85,7 @@ fn uart_binding_info(fdt: &Fdt, uart_path: &str) -> Result<BindingInfo, OnProbeE
             ))
         })?;
     Ok(BindingInfo::with_binding_irq(Some(
-        crate::binding_resolver::binding_irq_from_fdt_interrupt(
-            interrupt_parent,
-            interrupt.specifier,
-        )?,
+        BindingIrq::fdt_interrupt_with_controller(interrupt_parent, interrupt.specifier),
     )))
 }
 

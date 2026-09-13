@@ -5,19 +5,18 @@ use std::{
     hint::spin_loop,
     ptr,
     sync::{
-        Arc, Mutex,
+        Arc,
         atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicUsize, Ordering},
     },
     vec::Vec,
 };
 
+use ax_std::os::arceos::{modules::ax_task::IrqNotify, sync::IrqSafeMutex};
 use axvm_types::InterruptTriggerMode;
 use riscv_vplic::{PLIC_NUM_SOURCES, VPlicGlobal};
 
 use super::DeferredVcpuKick;
-use crate::{
-    AxVmError, AxVmResult, ThreadHandle, ax_err, host::task::IrqNotification, sync::MutexExt,
-};
+use crate::{AxTaskRef, AxVmError, AxVmResult, TaskInner, ax_err};
 
 const PHYSICAL_IRQ_WORKER_STACK_SIZE: usize = 0x20_000;
 const CLAIM_IDLE: u8 = 0;
@@ -38,8 +37,8 @@ pub(super) fn publish_physical_claim_from_irq(source: u32) -> bool {
 pub(super) struct PhysicalIrqBridge {
     shared: Arc<PhysicalBridgeShared>,
     bindings: Box<[Arc<PhysicalSourceBinding>]>,
-    registrations: Mutex<Vec<PhysicalRouteRegistration>>,
-    worker: Mutex<Option<ThreadHandle>>,
+    registrations: IrqSafeMutex<Vec<PhysicalRouteRegistration>>,
+    worker: IrqSafeMutex<Option<AxTaskRef>>,
     running: AtomicBool,
 }
 
@@ -57,7 +56,7 @@ impl PhysicalIrqBridge {
             vplic,
             kick,
             vcpu_count,
-            notify: IrqNotification::new(),
+            notify: IrqNotify::new(),
             stopping: AtomicBool::new(false),
         });
         let mut bindings = Vec::with_capacity(routes.len());
@@ -93,8 +92,8 @@ impl PhysicalIrqBridge {
         Ok(Arc::new(Self {
             shared,
             bindings: bindings.into_boxed_slice(),
-            registrations: Mutex::new(Vec::new()),
-            worker: Mutex::new(None),
+            registrations: IrqSafeMutex::new(Vec::new()),
+            worker: IrqSafeMutex::new(None),
             running: AtomicBool::new(false),
         }))
     }
@@ -103,19 +102,10 @@ impl PhysicalIrqBridge {
         if self.running.swap(true, Ordering::AcqRel) {
             return Ok(());
         }
-        if let Err(error) = self.start_worker() {
-            self.running.store(false, Ordering::Release);
-            return Err(error);
-        }
+        self.start_worker();
         if let Err(error) = self.install_and_activate_routes() {
-            return match self.rollback_start() {
-                Ok(()) => Err(error),
-                Err(rollback) => Err(AxVmError::lifecycle_rollback(
-                    "start RISC-V physical IRQ bridge",
-                    error,
-                    rollback,
-                )),
-            };
+            self.rollback_start();
+            return Err(error);
         }
         Ok(())
     }
@@ -140,12 +130,8 @@ impl PhysicalIrqBridge {
                 ));
             }
         }
-        self.registrations.lock_unpoisoned().clear();
-        if let Err(error) = self.stop_worker()
-            && first_error.is_none()
-        {
-            first_error = Some(error);
-        }
+        self.registrations.lock().clear();
+        self.stop_worker();
         self.release_outstanding_claims();
 
         first_error.map_or(Ok(()), Err)
@@ -180,28 +166,20 @@ impl PhysicalIrqBridge {
         }
     }
 
-    fn start_worker(self: &Arc<Self>) -> AxVmResult {
+    fn start_worker(self: &Arc<Self>) {
         self.shared.stopping.store(false, Ordering::Release);
         let bridge = self.clone();
-        let worker = unsafe {
-            // SAFETY: no OS extension or affinity capability is transferred;
-            // the worker closure and bridge reference move exactly once.
-            crate::host::task::spawn_thread_with_extension_and_affinity(
-                move || bridge.run_worker(),
-                std::format!("VM[{}]-plic-physical", self.shared.vm_id),
-                PHYSICAL_IRQ_WORKER_STACK_SIZE,
-                None,
-                None,
-            )
-        }
-        .map_err(|error| AxVmError::host("start RISC-V physical IRQ worker", error))?;
-        *self.worker.lock_unpoisoned() = Some(worker);
-        Ok(())
+        let task = TaskInner::new(
+            move || bridge.run_worker(),
+            std::format!("VM[{}]-plic-physical", self.shared.vm_id),
+            PHYSICAL_IRQ_WORKER_STACK_SIZE,
+        );
+        *self.worker.lock() = Some(crate::host::task::spawn_task(task));
     }
 
     fn install_and_activate_routes(&self) -> AxVmResult {
         {
-            let mut registrations = self.registrations.lock_unpoisoned();
+            let mut registrations = self.registrations.lock();
             for binding in &self.bindings {
                 registrations.push(PhysicalRouteRegistration::install(binding)?);
             }
@@ -223,26 +201,23 @@ impl PhysicalIrqBridge {
         Ok(())
     }
 
-    fn rollback_start(&self) -> AxVmResult {
+    fn rollback_start(&self) {
         for binding in &self.bindings {
             binding.accepting.store(false, Ordering::Release);
             let _ = ax_plat::irq::riscv64_hv::deactivate_guest_plic_source(binding.source as u32);
         }
-        self.registrations.lock_unpoisoned().clear();
-        let stop_result = self.stop_worker();
+        self.registrations.lock().clear();
+        self.stop_worker();
         self.release_outstanding_claims();
         self.running.store(false, Ordering::Release);
-        stop_result
     }
 
-    fn stop_worker(&self) -> AxVmResult {
+    fn stop_worker(&self) {
         self.shared.stopping.store(true, Ordering::Release);
         self.shared.notify.notify();
-        let worker = self.worker.lock_unpoisoned().take();
-        worker
-            .map_or(Ok(0), crate::host::task::join_thread)
-            .map(|_exit_code| ())
-            .map_err(|error| AxVmError::host("join RISC-V physical IRQ worker", error))
+        if let Some(worker) = self.worker.lock().take() {
+            worker.join();
+        }
     }
 
     fn run_worker(&self) {
@@ -297,7 +272,7 @@ struct PhysicalBridgeShared {
     vplic: Arc<VPlicGlobal>,
     kick: Arc<DeferredVcpuKick>,
     vcpu_count: usize,
-    notify: IrqNotification,
+    notify: IrqNotify,
     stopping: AtomicBool,
 }
 
@@ -325,7 +300,7 @@ impl PhysicalSourceBinding {
         {
             return false;
         }
-        self.shared.notify.notify();
+        self.shared.notify.notify_irq();
         true
     }
 

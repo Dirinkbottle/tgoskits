@@ -25,11 +25,11 @@ pub use self::{
     tcp::{TcpListener, TcpStream},
     udp::UdpSocket,
 };
-use crate::{StdError, StdResult};
+use crate::io;
 
-fn each_addr<A: ToSocketAddrs, F, T>(addr: A, mut f: F) -> StdResult<T>
+fn each_addr<A: ToSocketAddrs, F, T>(addr: A, mut f: F) -> io::Result<T>
 where
-    F: FnMut(StdResult<&SocketAddr>) -> StdResult<T>,
+    F: FnMut(io::Result<&SocketAddr>) -> io::Result<T>,
 {
     let addrs = match addr.to_socket_addrs() {
         Ok(addrs) => addrs,
@@ -42,5 +42,7 @@ where
             Err(e) => last_err = Some(e),
         }
     }
-    Err(last_err.unwrap_or(StdError::NoResolvedAddress))
+    Err(last_err.unwrap_or_else(|| {
+        ax_errno::ax_err_type!(InvalidInput, "could not resolve to any addresses")
+    }))
 }

@@ -1,6 +1,8 @@
 use core::ffi::c_int;
 
-use crate::{PosixError, ctypes};
+use ax_errno::LinuxError;
+
+use crate::ctypes;
 
 const DEFAULT_TASK_STACK_SIZE: usize = 0x40000;
 
@@ -14,7 +16,7 @@ pub unsafe fn sys_getrlimit(resource: c_int, rlimits: *mut ctypes::rlimit) -> c_
             ctypes::RLIMIT_DATA => {}
             ctypes::RLIMIT_STACK => {}
             ctypes::RLIMIT_NOFILE => {}
-            _ => return Err(PosixError::EINVAL),
+            _ => return Err(LinuxError::EINVAL),
         }
         if rlimits.is_null() {
             return Ok(0);
@@ -45,7 +47,7 @@ pub unsafe fn sys_setrlimit(resource: c_int, rlimits: *mut crate::ctypes::rlimit
             crate::ctypes::RLIMIT_DATA => {}
             crate::ctypes::RLIMIT_STACK => {}
             crate::ctypes::RLIMIT_NOFILE => {}
-            _ => return Err(PosixError::EINVAL),
+            _ => return Err(LinuxError::EINVAL),
         }
         // Currently do not support set resources
         Ok(0)

@@ -18,7 +18,7 @@ use usb_if::{
 
 use super::{HubOp, PortEvent};
 use crate::{
-    Device, InterfaceSession,
+    Device,
     backend::kmod::hub::{HubInfo, PortChangeInfo},
     osal::Kernel,
 };
@@ -61,8 +61,6 @@ struct Inner {
     pub ports: Vec<Port>,
 
     pub dev: Device,
-
-    pub interface_session: Option<InterfaceSession>,
 
     pub descriptor: HubDescriptor,
 
@@ -152,7 +150,6 @@ impl HubDevice {
                 num_ports: 0,
                 ports: vec![],
                 dev,
-                interface_session: None,
                 descriptor: unsafe { core::mem::zeroed() },
                 parent_hub_slot_id,
                 root_port_id,
@@ -179,9 +176,11 @@ impl HubDevice {
                     .await?;
             }
 
-            if !status.connected && self.data.ports[port_idx as usize].state == PortState::Probed {
-                self.data.ports[port_idx as usize].state = PortState::Uninit;
-                changed_ports.push(PortEvent::Disconnected { port_id });
+            if let Some(event) = self.data.ports[port_idx as usize]
+                .state
+                .take_disconnect_event(status.connected, port_id)
+            {
+                changed_ports.push(event);
                 continue;
             }
 
@@ -276,8 +275,7 @@ impl HubDevice {
                 info.speed = Speed::High;
                 debug!("Hub is High Speed with Multiple TTs");
                 match self.data.dev.claim_interface(0, 1).await {
-                    Ok(session) => {
-                        self.data.interface_session = Some(session);
+                    Ok(_) => {
                         debug!("TT per port");
                         info.tt.multi = true;
                     }
@@ -730,6 +728,25 @@ impl HubDevice {
             port_id, port_speed, enabled_status.enabled
         );
 
+        // ✅ 修复：更新 tt_required 字段
+        // 根据 xHCI 规范，LS/FS 设备连接在 HS Hub 时需要 TT
+        let hub_speed = match self.data.dev.descriptor().protocol {
+            // Hub 协议值：0=FS Hub, 1/2=HS Hub, 3=SS Hub
+            1 | 2 => Speed::High,   // HS Hub
+            3 => Speed::SuperSpeed, // SS Hub
+            _ => Speed::Full,       // FS Hub
+        };
+
+        let port = &mut self.data.ports[port_id as usize - 1];
+
+        // TT 需求判断：使用 DeviceSpeed::requires_tt 方法
+        port.tt_required = port_speed.requires_tt(hub_speed);
+
+        debug!(
+            "TT required: port_speed={:?}, hub_speed={:?}, tt_required={}",
+            port_speed, hub_speed, port.tt_required
+        );
+
         Ok(PortChangeInfo {
             root_port_id: self.root_port_id(),
             port_id,
@@ -788,6 +805,9 @@ pub struct Port {
 
     /// 端口状态机
     pub state: PortState,
+
+    /// 是否需要 Transaction Translator
+    pub tt_required: bool,
 }
 
 impl Port {
@@ -814,6 +834,7 @@ impl Port {
                 },
             },
             state: PortState::Uninit,
+            tt_required: false,
         }
     }
 }

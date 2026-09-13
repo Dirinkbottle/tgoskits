@@ -1,50 +1,23 @@
-use alloc::{boxed::Box, sync::Arc};
-use core::sync::atomic::{AtomicBool, Ordering as AtomicOrdering, fence};
+use alloc::{boxed::Box, collections::VecDeque, sync::Arc};
+use core::sync::atomic::{Ordering as AtomicOrdering, fence};
 
-use ax_sync::SpinLock as Mutex;
+use ax_kspin::SpinRaw as Mutex;
 use dma_api::CoherentArray;
-use log::{Level, debug, info, warn};
-use mbarrier::wmb;
-use rdif_eth::{
-    DmaBuffer, IRxQueue, ITxQueue, NetError, NetQueueId, QueueConfig, RxCompletion, SubmitError,
-    TxChecksumCapabilities, TxNotify, TxSubmitOptions,
-};
+use log::{debug, info, warn};
+use rdif_eth::{DmaBuffer, IRxQueue, ITxQueue, NetError, QueueConfig};
 
 use crate::{
-    DMA_ALIGN, LINK_DOWN_DROP_LOG_INTERVAL, MAX_PACKET, QUEUE_ID0, QUEUE_SIZE, RX_BUF_SIZE,
-    RX_IDLE_LOG_INTERVAL, RX_OVERFLOW_REARM_IDLE_POLLS, RX_QUEUE_CONFIG_SIZE,
-    RX_RECLAIM_LOG_INTERVAL, RX_START_THRESHOLD, TX_RECLAIM_LOG_INTERVAL, TX_SUBMIT_LOG_INTERVAL,
+    DMA_ALIGN, EARLY_PACKET_LOG_COUNT, LINK_DOWN_DROP_LOG_INTERVAL, MAX_PACKET, QUEUE_ID0,
+    QUEUE_SIZE, RX_BUF_SIZE, RX_DESC_PER_CACHE_LINE, RX_IDLE_LOG_INTERVAL,
+    RX_OVERFLOW_REARM_IDLE_POLLS, RX_QUEUE_CONFIG_SIZE, RX_RECLAIM_LOG_INTERVAL,
+    RX_START_THRESHOLD, TX_LINK_SAMPLE_INTERVAL, TX_RECLAIM_LOG_INTERVAL, TX_SUBMIT_LOG_INTERVAL,
     descriptor::{RxDesc, TxDesc},
     read_status,
-    registers::{Regs, irq_has_rx_overflow},
+    registers::{DEFAULT_IRQ_MASK, Regs, irq_has_rx_overflow},
     set_rx_mode,
 };
 
 pub(crate) type QueueStart = Arc<Mutex<QueueStartState>>;
-
-#[derive(Default)]
-pub(crate) struct TxNotificationState {
-    pending: bool,
-}
-
-impl TxNotificationState {
-    fn descriptor_submitted(&mut self, notify: TxNotify) -> bool {
-        match notify {
-            TxNotify::Immediate => {
-                self.pending = false;
-                true
-            }
-            TxNotify::Deferred => {
-                self.pending = true;
-                false
-            }
-        }
-    }
-
-    fn take_pending(&mut self) -> bool {
-        core::mem::take(&mut self.pending)
-    }
-}
 
 #[derive(Default)]
 pub(crate) struct QueueStartState {
@@ -58,18 +31,17 @@ pub(crate) struct Rtl8125TxQueue {
     pub(crate) regs: Regs,
     pub(crate) desc: CoherentArray<TxDesc>,
     pub(crate) dma_mask: u64,
-    pub(crate) buffers: [Option<DmaBuffer>; QUEUE_SIZE],
+    pub(crate) bus_addrs: [Option<u64>; QUEUE_SIZE],
     pub(crate) next_submit: usize,
     pub(crate) next_reclaim: usize,
-    pub(crate) link_up: Arc<AtomicBool>,
+    pub(crate) link_up: Option<bool>,
     pub(crate) link_down_drops: u64,
     pub(crate) submitted: u64,
     pub(crate) reclaimed: u64,
-    pub(crate) notification: TxNotificationState,
 }
 
 impl ITxQueue for Rtl8125TxQueue {
-    fn id(&self) -> NetQueueId {
+    fn id(&self) -> usize {
         QUEUE_ID0
     }
 
@@ -82,94 +54,37 @@ impl ITxQueue for Rtl8125TxQueue {
         }
     }
 
-    fn checksum_capabilities(&self) -> TxChecksumCapabilities {
-        TxChecksumCapabilities::TCP_UDP
-    }
-
-    fn submit(&mut self, buffer: DmaBuffer) -> core::result::Result<(), SubmitError> {
-        self.submit_buffer(buffer, TxSubmitOptions::default())
-    }
-
-    fn submit_with_options(
-        &mut self,
-        buffer: DmaBuffer,
-        options: TxSubmitOptions,
-    ) -> core::result::Result<(), SubmitError> {
-        self.submit_buffer(buffer, options)
-    }
-
-    fn flush(&mut self) {
-        if self.notification.take_pending() {
-            self.notify_device();
-        }
-    }
-
-    fn reclaim(&mut self) -> Option<DmaBuffer> {
-        let idx = self.next_reclaim;
-        self.buffers[idx].as_ref()?;
-        let desc = self.desc.read_cpu(idx)?;
-        if desc.is_owned_by_hw() {
-            return None;
+    fn submit(&mut self, buffer: DmaBuffer) -> core::result::Result<(), NetError> {
+        if buffer.len > MAX_PACKET {
+            return Err(NetError::NotSupported);
         }
 
-        self.next_reclaim = (idx + 1) % QUEUE_SIZE;
-        let buffer = self.buffers[idx].take()?;
-        self.reclaimed = self.reclaimed.saturating_add(1);
-        if let Some(level) = packet_progress_log_level(self.reclaimed, TX_RECLAIM_LOG_INTERVAL) {
-            log::log!(
-                level,
-                "RTL8125 tx reclaimed: idx={idx}, len={}, submitted={}, reclaimed={}, status={:?}",
-                desc.len(),
-                self.submitted,
-                self.reclaimed,
-                read_status(self.regs),
-            );
-        }
-        Some(buffer)
-    }
-}
-
-impl Rtl8125TxQueue {
-    fn submit_buffer(
-        &mut self,
-        buffer: DmaBuffer,
-        options: TxSubmitOptions,
-    ) -> core::result::Result<(), SubmitError> {
-        if buffer.len() > MAX_PACKET {
-            return Err(SubmitError::new(buffer, NetError::NotSupported));
-        }
-
-        if !self.observe_link_before_tx(buffer.len()) {
+        if !self.observe_link_before_tx(buffer.len) {
             self.link_down_drops = self.link_down_drops.saturating_add(1);
-            return Err(SubmitError::new(buffer, NetError::LinkDown));
+            return Err(NetError::Retry);
         }
 
         let idx = self.next_submit;
         let next = (idx + 1) % QUEUE_SIZE;
-        if self.buffers[idx].is_some() {
-            return Err(SubmitError::new(buffer, NetError::Retry));
+        if self.bus_addrs[idx].is_some() {
+            return Err(NetError::Retry);
         }
 
         let ring_end = idx == QUEUE_SIZE - 1;
-        let len = buffer.len();
-        let Some(desc) = TxDesc::new_cpu_owned(buffer.bus_addr(), len, ring_end, options.checksum)
-        else {
-            return Err(SubmitError::new(buffer, NetError::NotSupported));
-        };
+        let desc = TxDesc::new_cpu_owned(buffer.bus_addr, buffer.len, ring_end);
         self.desc.set_cpu(idx, desc);
         release_dma_descriptor();
         self.desc.set_cpu(idx, desc.release_to_hw());
-        self.buffers[idx] = Some(buffer);
+        self.bus_addrs[idx] = Some(buffer.bus_addr);
         self.next_submit = next;
         self.submitted = self.submitted.saturating_add(1);
-        if self.notification.descriptor_submitted(options.notify) {
-            self.notify_device();
-        }
-        if let Some(level) = packet_progress_log_level(self.submitted, TX_SUBMIT_LOG_INTERVAL) {
-            log::log!(
-                level,
+        self.regs.poll_tx();
+        if self.submitted <= EARLY_PACKET_LOG_COUNT
+            || self.submitted.is_multiple_of(TX_SUBMIT_LOG_INTERVAL)
+        {
+            info!(
                 "RTL8125 tx submitted: idx={idx}, len={}, submitted={}, reclaimed={}, status={:?}",
-                len,
+                buffer.len,
                 self.submitted,
                 self.reclaimed,
                 read_status(self.regs),
@@ -178,20 +93,43 @@ impl Rtl8125TxQueue {
         Ok(())
     }
 
-    fn notify_device(&self) {
-        // Coherent DMA removes cache-maintenance requirements, but descriptor
-        // ownership still has to reach the device before the MMIO doorbell.
-        wmb();
-        self.regs.poll_tx();
-    }
+    fn reclaim(&mut self) -> Option<u64> {
+        let idx = self.next_reclaim;
+        self.bus_addrs[idx]?;
+        let desc = self.desc.read_cpu(idx)?;
+        if desc.is_owned_by_hw() {
+            return None;
+        }
 
+        self.next_reclaim = (idx + 1) % QUEUE_SIZE;
+        let bus_addr = self.bus_addrs[idx].take()?;
+        self.reclaimed = self.reclaimed.saturating_add(1);
+        if self.reclaimed <= EARLY_PACKET_LOG_COUNT
+            || self.reclaimed.is_multiple_of(TX_RECLAIM_LOG_INTERVAL)
+        {
+            info!(
+                "RTL8125 tx reclaimed: idx={idx}, len={}, submitted={}, reclaimed={}, status={:?}",
+                desc.len(),
+                self.submitted,
+                self.reclaimed,
+                read_status(self.regs),
+            );
+        }
+        Some(bus_addr)
+    }
+}
+
+impl Rtl8125TxQueue {
     fn observe_link_before_tx(&mut self, len: usize) -> bool {
-        if self.link_up.load(AtomicOrdering::Acquire) {
+        let must_sample = self.link_up != Some(true)
+            || self.submitted == 0
+            || self.submitted.is_multiple_of(TX_LINK_SAMPLE_INTERVAL);
+        if !must_sample {
             return true;
         }
 
         let link_up = self.regs.link_up();
-        let changed = self.link_up.swap(link_up, AtomicOrdering::AcqRel) != link_up;
+        let changed = self.link_up.replace(link_up) != Some(link_up);
 
         if link_up {
             if changed {
@@ -220,7 +158,7 @@ pub(crate) struct Rtl8125RxQueue {
     pub(crate) desc: CoherentArray<RxDesc>,
     pub(crate) dma_mask: u64,
     pub(crate) start: QueueStart,
-    pub(crate) buffers: [Option<DmaBuffer>; QUEUE_SIZE],
+    pub(crate) bus_addrs: [Option<u64>; QUEUE_SIZE],
     pub(crate) next_submit: usize,
     pub(crate) next_reclaim: usize,
     pub(crate) idle_polls: u64,
@@ -228,10 +166,11 @@ pub(crate) struct Rtl8125RxQueue {
     pub(crate) submitted: usize,
     pub(crate) reclaimed: u64,
     pub(crate) rx_errors: u64,
+    pub(crate) deferred_refill: VecDeque<u64>,
 }
 
 impl IRxQueue for Rtl8125RxQueue {
-    fn id(&self) -> NetQueueId {
+    fn id(&self) -> usize {
         QUEUE_ID0
     }
 
@@ -244,34 +183,35 @@ impl IRxQueue for Rtl8125RxQueue {
         }
     }
 
-    fn submit(&mut self, buffer: DmaBuffer) -> core::result::Result<(), SubmitError> {
-        if buffer.len() < RX_BUF_SIZE {
-            return Err(SubmitError::new(buffer, NetError::NotSupported));
+    fn submit(&mut self, buffer: DmaBuffer) -> core::result::Result<(), NetError> {
+        if buffer.len < RX_BUF_SIZE {
+            return Err(NetError::NotSupported);
         }
 
+        self.flush_deferred_refill();
         if self.submitted >= RX_START_THRESHOLD {
-            return self.submit_buffer(buffer);
+            self.deferred_refill.push_back(buffer.bus_addr);
+            self.flush_deferred_refill();
+            return Ok(());
         }
 
         let idx = self.next_submit;
         let next = (idx + 1) % QUEUE_SIZE;
-        if self.buffers[idx].is_some() {
-            return Err(SubmitError::new(buffer, NetError::Retry));
+        if self.bus_addrs[idx].is_some() {
+            return Err(NetError::Retry);
         }
 
         let ring_end = idx == QUEUE_SIZE - 1;
-        let desc = RxDesc::new_cpu_owned(buffer.bus_addr(), RX_BUF_SIZE, ring_end);
+        let desc = RxDesc::new_cpu_owned(buffer.bus_addr, RX_BUF_SIZE, ring_end);
         self.desc.set_cpu(idx, desc);
         release_dma_descriptor();
         self.desc.set_cpu(idx, desc.release_to_hw());
-        self.buffers[idx] = Some(buffer);
+        self.bus_addrs[idx] = Some(buffer.bus_addr);
         self.next_submit = next;
         self.submitted = self.submitted.saturating_add(1);
         if self.submitted >= RX_START_THRESHOLD {
             let was_ready = {
-                // SAFETY: queue completion runs with local re-entry excluded;
-                // the raw lock serializes concurrent queue state.
-                let mut start = unsafe { self.start.lock_raw() };
+                let mut start = self.start.lock();
                 let was_ready = start.rx_ready;
                 start.rx_ready = true;
                 was_ready
@@ -291,18 +231,18 @@ impl IRxQueue for Rtl8125RxQueue {
         Ok(())
     }
 
-    fn reclaim(&mut self) -> Option<RxCompletion> {
+    fn reclaim(&mut self) -> Option<(u64, usize)> {
         let idx = self.next_reclaim;
-        self.buffers[idx].as_ref()?;
+        let bus_addr = self.bus_addrs[idx]?;
         let desc = self.desc.read_cpu(idx)?;
         if desc.is_owned_by_hw() {
             self.idle_polls = self.idle_polls.saturating_add(1);
-            if self.idle_polls.saturating_sub(self.last_rx_rearm_idle)
-                >= RX_OVERFLOW_REARM_IDLE_POLLS
-                && irq_has_rx_overflow(self.regs.read_interrupt_status())
+            let status = read_status(self.regs);
+            if irq_has_rx_overflow(status.intr_status)
+                && self.idle_polls.saturating_sub(self.last_rx_rearm_idle)
+                    >= RX_OVERFLOW_REARM_IDLE_POLLS
             {
                 self.last_rx_rearm_idle = self.idle_polls;
-                let status = read_status(self.regs);
                 warn!(
                     "RTL8125 rx overflow rearm: idx={idx}, opts1={:#x}, submitted={}, \
                      reclaimed={}, status={status:?}",
@@ -313,10 +253,7 @@ impl IRxQueue for Rtl8125RxQueue {
                 self.regs.enable_tx_rx();
                 self.regs.commit();
             }
-            if self.idle_polls.is_multiple_of(RX_IDLE_LOG_INTERVAL)
-                && log::log_enabled!(Level::Debug)
-            {
-                let status = read_status(self.regs);
+            if self.idle_polls.is_multiple_of(RX_IDLE_LOG_INTERVAL) {
                 debug!(
                     "RTL8125 rx idle: idx={idx}, opts1={:#x}, submitted={}, reclaimed={}, \
                      status={:?}",
@@ -331,7 +268,7 @@ impl IRxQueue for Rtl8125RxQueue {
         self.last_rx_rearm_idle = 0;
 
         self.next_reclaim = (idx + 1) % QUEUE_SIZE;
-        let buffer = self.buffers[idx].take()?;
+        self.bus_addrs[idx] = None;
 
         if desc.has_error() || !desc.is_whole_packet() {
             self.rx_errors = self.rx_errors.saturating_add(1);
@@ -344,51 +281,49 @@ impl IRxQueue for Rtl8125RxQueue {
                 self.rx_errors,
                 read_status(self.regs),
             );
-            return Some(RxCompletion {
-                buffer,
-                packet_len: 0,
-            });
+            return Some((bus_addr, 0));
         }
         let len = desc.packet_len();
         self.reclaimed = self.reclaimed.saturating_add(1);
-        if let Some(level) = packet_progress_log_level(self.reclaimed, RX_RECLAIM_LOG_INTERVAL) {
-            log::log!(
-                level,
+        if self.reclaimed.is_multiple_of(RX_RECLAIM_LOG_INTERVAL) {
+            info!(
                 "RTL8125 rx packet: idx={idx}, len={len}, submitted={}, reclaimed={}, status={:?}",
                 self.submitted,
                 self.reclaimed,
                 read_status(self.regs),
             );
         }
-        Some(RxCompletion {
-            buffer,
-            packet_len: len,
-        })
-    }
-}
-
-fn packet_progress_log_level(sequence: u64, debug_interval: u64) -> Option<Level> {
-    if sequence.is_multiple_of(debug_interval) {
-        Some(Level::Debug)
-    } else {
-        None
+        Some((bus_addr, len))
     }
 }
 
 impl Rtl8125RxQueue {
-    fn submit_buffer(&mut self, buffer: DmaBuffer) -> core::result::Result<(), SubmitError> {
+    fn flush_deferred_refill(&mut self) {
+        while self.deferred_refill.len() >= RX_DESC_PER_CACHE_LINE {
+            let Some(bus_addr) = self.deferred_refill.pop_front() else {
+                break;
+            };
+            if let Err(err) = self.submit_deferred_buffer(bus_addr) {
+                warn!("RTL8125 rx deferred refill failed: {err:?}");
+                self.deferred_refill.push_front(bus_addr);
+                break;
+            }
+        }
+    }
+
+    fn submit_deferred_buffer(&mut self, bus_addr: u64) -> core::result::Result<(), NetError> {
         let idx = self.next_submit;
         let next = (idx + 1) % QUEUE_SIZE;
-        if self.buffers[idx].is_some() {
-            return Err(SubmitError::new(buffer, NetError::Retry));
+        if self.bus_addrs[idx].is_some() {
+            return Err(NetError::Retry);
         }
 
         let ring_end = idx == QUEUE_SIZE - 1;
-        let desc = RxDesc::new_cpu_owned(buffer.bus_addr(), RX_BUF_SIZE, ring_end);
+        let desc = RxDesc::new_cpu_owned(bus_addr, RX_BUF_SIZE, ring_end);
         self.desc.set_cpu(idx, desc);
         release_dma_descriptor();
         self.desc.set_cpu(idx, desc.release_to_hw());
-        self.buffers[idx] = Some(buffer);
+        self.bus_addrs[idx] = Some(bus_addr);
         self.next_submit = next;
         self.submitted = self.submitted.saturating_add(1);
         Ok(())
@@ -405,8 +340,7 @@ fn acquire_dma_descriptor() {
 
 pub(crate) fn try_start_queues(regs: Regs, dma_mask: u64, start: &QueueStart) {
     let (tx_base, rx_base) = {
-        // SAFETY: queue initialization is serialized before publication.
-        let mut start = unsafe { start.lock_raw() };
+        let mut start = start.lock();
         if start.started || !start.rx_ready {
             return;
         }
@@ -429,7 +363,7 @@ pub(crate) fn try_start_queues(regs: Regs, dma_mask: u64, start: &QueueStart) {
     regs.write_default_tx_config();
     regs.write_interrupt_status(u32::MAX);
     set_rx_mode(regs);
-    regs.write_interrupt_mask(0);
+    regs.write_interrupt_mask(DEFAULT_IRQ_MASK);
     regs.commit();
     info!("RTL8125 queues started: status={:?}", read_status(regs));
 }
@@ -440,32 +374,4 @@ pub(crate) fn boxed_tx(queue: Rtl8125TxQueue) -> Box<dyn ITxQueue> {
 
 pub(crate) fn boxed_rx(queue: Rtl8125RxQueue) -> Box<dyn IRxQueue> {
     Box::new(queue)
-}
-
-#[cfg(test)]
-mod tests {
-    use rdif_eth::TxNotify;
-
-    use super::{TxNotificationState, packet_progress_log_level};
-
-    #[test]
-    fn deferred_descriptors_share_one_device_notification() {
-        let mut notification = TxNotificationState::default();
-
-        assert!(!notification.descriptor_submitted(TxNotify::Deferred));
-        assert!(!notification.descriptor_submitted(TxNotify::Deferred));
-        assert!(notification.take_pending());
-        assert!(!notification.take_pending());
-        assert!(notification.descriptor_submitted(TxNotify::Immediate));
-        assert!(!notification.take_pending());
-    }
-
-    #[test]
-    fn periodic_packet_progress_is_debug_only() {
-        assert_eq!(packet_progress_log_level(1, 16), None);
-        assert_eq!(packet_progress_log_level(8, 16), None);
-        assert_eq!(packet_progress_log_level(9, 16), None);
-        assert_eq!(packet_progress_log_level(16, 16), Some(log::Level::Debug));
-        assert_eq!(packet_progress_log_level(64, 64), Some(log::Level::Debug));
-    }
 }

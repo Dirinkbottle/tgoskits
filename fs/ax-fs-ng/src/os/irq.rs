@@ -1,10 +1,11 @@
 use alloc::{boxed::Box, string::String};
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use ax_sync::SpinRwLock as RwLock;
+use ax_errno::{AxError, AxResult};
+use ax_kspin::SpinRwLock as RwLock;
 use irq_framework::IrqId;
 
-use crate::{BlockError, BlockResult, block::runtime::BlockIrqAction};
+use crate::block::runtime::BlockIrqAction;
 
 /// Result returned from the runtime-independent hard IRQ action.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -20,10 +21,10 @@ pub enum BlockIrqOutcome {
 /// Owned IRQ registration and boxed hard-handler lifetime token.
 pub trait BlockIrqRegistration: Send + Sync {
     /// Enables the registered action after all runtime state is published.
-    fn enable(&self) -> BlockResult;
+    fn enable(&self) -> AxResult;
 
     /// Disables the action and waits for every in-flight callback to return.
-    fn disable_and_synchronize(&self) -> BlockResult;
+    fn disable_and_synchronize(&self) -> AxResult;
 }
 
 /// Registers fixed-affinity non-reentrant block hard IRQ actions.
@@ -40,7 +41,7 @@ pub trait BlockIrqRegistrar: Send + Sync {
         irq: IrqId,
         cpu: usize,
         action: BlockIrqAction,
-    ) -> BlockResult<Box<dyn BlockIrqRegistration>>;
+    ) -> AxResult<Box<dyn BlockIrqRegistration>>;
 }
 
 static IRQ_REGISTRAR: RwLock<Option<&'static dyn BlockIrqRegistrar>> = RwLock::new(None);
@@ -56,50 +57,40 @@ pub fn set_irq_registrar(registrar: &'static dyn BlockIrqRegistrar) {
 ///
 /// # Errors
 ///
-/// Returns [`BlockError::RuntimeUnavailable`] before the runtime installs an IRQ registrar,
+/// Returns [`AxError::BadState`] before the runtime installs an IRQ registrar,
 /// or propagates registration failures.
 pub fn register_block_irq(
     name: String,
     irq: IrqId,
     cpu: usize,
     action: BlockIrqAction,
-) -> BlockResult<Box<dyn BlockIrqRegistration>> {
+) -> AxResult<Box<dyn BlockIrqRegistration>> {
     IRQ_REGISTRAR
         .read()
         .as_ref()
         .copied()
-        .ok_or(BlockError::RuntimeUnavailable)?
+        .ok_or(AxError::BadState)?
         .register(name, irq, cpu, action)
 }
 
 /// Returns whether an IRQ registrar is installed.
 pub fn has_irq_registrar() -> bool {
-    irq_registrar_ready(&IRQ_READY)
+    IRQ_READY.load(Ordering::Acquire)
 }
 
-fn irq_registrar_ready(ready: &AtomicBool) -> bool {
-    ready.load(Ordering::Acquire)
-}
+#[cfg(all(axtest, feature = "axtest"))]
+pub(crate) fn block_irq_outcome_and_ready_hold_for_test() -> bool {
+    // Test BlockIrqOutcome variants
+    let handled = BlockIrqOutcome::Handled;
+    let wake = BlockIrqOutcome::Wake;
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+    assert!(handled != wake);
 
-    #[test]
-    fn block_irq_outcomes_keep_handled_and_wake_distinct() {
-        let handled = BlockIrqOutcome::Handled;
-        let copied = handled;
+    // Test Clone, Copy, Debug, Eq, PartialEq
+    let _cloned = handled;
 
-        assert_eq!(copied, BlockIrqOutcome::Handled);
-        assert_ne!(handled, BlockIrqOutcome::Wake);
-    }
+    // Test has_irq_registrar returns false initially (no registrar set)
+    assert!(!has_irq_registrar());
 
-    #[test]
-    fn irq_registrar_readiness_starts_unpublished() {
-        let ready = AtomicBool::new(false);
-
-        assert!(!irq_registrar_ready(&ready));
-        ready.store(true, Ordering::Release);
-        assert!(irq_registrar_ready(&ready));
-    }
+    true
 }

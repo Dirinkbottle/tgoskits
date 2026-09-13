@@ -1,6 +1,6 @@
 [package]
 name = "ax-posix-api"
-version = "0.5.34"
+version = "0.5.31"
 repository = "https://github.com/rcore-os/tgoskits"
 edition.workspace = true
 authors = [
@@ -18,9 +18,11 @@ license.workspace = true
 [features]
 default = []
 
-smp = ["ax-runtime/smp"]
+smp = []
+irq = []
 alloc = ["dep:ax-alloc"]
-lockdep = ["ax-runtime/lockdep"]
+multitask = ["alloc", "ax-task/multitask", "ax-sync/multitask"]
+lockdep = ["multitask", "ax-sync/lockdep", "ax-kspin/lockdep"]
 fd = ["alloc", "dep:scope-local"]
 fs = ["dep:ax-fs-ng", "fd"]
 net = ["dep:ax-net", "fd"]
@@ -28,27 +30,28 @@ pipe = ["fd"]
 select = ["fd"]
 poll = ["fd"]
 epoll = ["fd"]
+serial = ["ax-runtime/serial"]
 eventfd = ["fd"]
 
 [dependencies]
 # ArceOS modules
 ax-alloc = { workspace = true, optional = true }
-ax-api.workspace = true
 ax-fs-ng = { workspace = true, optional = true }
 ax-hal.workspace = true
+ax-kspin.workspace = true
 ax-log.workspace = true
 ax-net = { workspace = true, optional = true }
 ax-runtime.workspace = true
-ax-task.workspace = true
+ax-sync.workspace = true
+ax-task = { workspace = true, optional = true }
 
 # Other crates
+ax-errno.workspace = true
 ax-io.workspace = true
-ax-lazyinit.workspace = true
 axpoll.workspace = true
 flatten_objects = "0.2"
 scope-local = { workspace = true, optional = true }
-syscalls.workspace = true
-thiserror.workspace = true
+spin.workspace = true
 
 [build-dependencies]
 bindgen.workspace = true

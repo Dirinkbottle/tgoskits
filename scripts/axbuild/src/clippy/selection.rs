@@ -6,13 +6,7 @@ use std::{
 use anyhow::bail;
 use cargo_metadata::{Metadata, Package};
 
-use super::AXSTD_STD_PACKAGE;
-
-const INCREMENTAL_CLIPPY_OS_ROOT_PACKAGES: &[&str] = &[
-    AXSTD_STD_PACKAGE,
-    crate::context::STARRY_KERNEL_PACKAGE,
-    crate::context::STARRY_PACKAGE,
-];
+use super::check::ClippyDepsMode;
 
 const UNSUPPORTED_CLIPPY_PACKAGES: &[(&str, &str)] = &[
     (
@@ -51,24 +45,33 @@ pub(super) fn workspace_packages(metadata: &Metadata) -> Vec<Package> {
     packages
 }
 
+#[derive(Debug, Clone)]
+pub(super) struct SelectedClippyPackage {
+    pub(super) package: Package,
+    pub(super) deps_mode: ClippyDepsMode,
+}
+
 pub(super) fn resolve_requested_packages(
     args: &crate::ClippyArgs,
     workspace_root: &Path,
     metadata: &Metadata,
     all_packages: &[Package],
-) -> anyhow::Result<Vec<Package>> {
+) -> anyhow::Result<Vec<SelectedClippyPackage>> {
     let package_lookup: HashMap<_, _> = all_packages
         .iter()
         .map(|pkg| (pkg.name.as_str(), pkg.clone()))
         .collect();
     let known_packages: HashSet<_> = all_packages.iter().map(|pkg| pkg.name.as_str()).collect();
 
-    let selections: Vec<String> = if !args.packages.is_empty() {
+    let selections: Vec<(String, ClippyDepsMode)> = if !args.packages.is_empty() {
         validate_requested_packages(&args.packages, &known_packages)?
+            .into_iter()
+            .map(|package| (package, ClippyDepsMode::NoDeps))
+            .collect()
     } else if args.all {
         all_packages
             .iter()
-            .map(|pkg| pkg.name.to_string())
+            .map(|pkg| (pkg.name.to_string(), ClippyDepsMode::NoDeps))
             .collect()
     } else if let Some(since) = args.since.as_deref() {
         match crate::support::git::select_incremental_packages(
@@ -78,11 +81,15 @@ pub(super) fn resolve_requested_packages(
             since,
         )? {
             crate::support::git::IncrementalPackageSelection::Packages { changed, affected } => {
-                let changed_count = changed.iter().collect::<BTreeSet<_>>().len();
-                let selections = incremental_clippy_selections(changed, affected);
+                let selections =
+                    incremental_clippy_selections(changed, affected, metadata, all_packages);
+                let changed_count = selections
+                    .iter()
+                    .filter(|(_, mode)| matches!(mode, ClippyDepsMode::NoDeps))
+                    .count();
                 println!(
                     "incremental clippy since `{since}` selected {} changed package(s) and {} \
-                     affected OS root package(s)",
+                     dependent top-level package(s)",
                     changed_count,
                     selections.len() - changed_count
                 );
@@ -94,49 +101,74 @@ pub(super) fn resolve_requested_packages(
                 );
                 all_packages
                     .iter()
-                    .map(|pkg| pkg.name.to_string())
+                    .map(|pkg| (pkg.name.to_string(), ClippyDepsMode::NoDeps))
                     .collect()
             }
         }
     } else {
         all_packages
             .iter()
-            .map(|pkg| pkg.name.to_string())
+            .map(|pkg| (pkg.name.to_string(), ClippyDepsMode::NoDeps))
             .collect()
     };
 
     selections
         .into_iter()
-        .map(|package| {
+        .map(|(package, deps_mode)| {
             let package = package_lookup
                 .get(package.as_str())
                 .cloned()
                 .ok_or_else(|| anyhow::anyhow!("workspace package `{package}` not found"))?;
-            Ok(package)
+            Ok(SelectedClippyPackage { package, deps_mode })
         })
         .collect()
 }
 
 /// Build the incremental clippy selection from a `--since` diff.
 ///
-/// Changed crates and affected OS roots are linted with `--no-deps` and their
-/// full feature/target/configuration matrix. Intermediate reverse dependencies
-/// are intentionally excluded because the selected OS roots cover integration.
+/// Changed crates are linted with `--no-deps` (their own code, full feature
+/// matrix). The runnable top-level frontier of the affected set is linted
+/// *with* deps: `cargo clippy -p <crate>` lints every workspace member in that
+/// crate's dependency subtree (cargo does not cap-lints path/workspace deps), so
+/// one with-deps run covers the whole affected subtree below it.
+///
+/// The frontier is computed over `affected \ skipped`: an unsupported crate
+/// (e.g. `axvisor`) cannot run through this flow and can be the *only* route
+/// into part of the affected subtree, so removing it first re-promotes the
+/// crates it would otherwise orphan to their own runnable roots. Skipped crates
+/// are kept in `changed` on purpose: `skip_unsupported_packages` drops them
+/// later with a consistent skip message.
 pub(super) fn incremental_clippy_selections(
     changed: Vec<String>,
     affected: Vec<String>,
-) -> Vec<String> {
-    let changed = changed.into_iter().collect::<BTreeSet<_>>();
-    let affected = affected.into_iter().collect::<BTreeSet<_>>();
+    metadata: &Metadata,
+    all_packages: &[Package],
+) -> Vec<(String, ClippyDepsMode)> {
+    let skipped = all_packages
+        .iter()
+        .filter(|package| clippy_skip_reason(package).is_some())
+        .map(|package| package.name.as_str())
+        .collect::<HashSet<_>>();
+    let changed_set = changed.iter().cloned().collect::<BTreeSet<_>>();
+
+    let runnable_affected = affected
+        .into_iter()
+        .filter(|package| !skipped.contains(package.as_str()))
+        .collect::<BTreeSet<_>>();
+    let integration = crate::support::git::top_level_affected_workspace_packages(
+        metadata,
+        all_packages,
+        &runnable_affected,
+    );
 
     changed
-        .iter()
-        .cloned()
+        .into_iter()
+        .map(|package| (package, ClippyDepsMode::NoDeps))
         .chain(
-            INCREMENTAL_CLIPPY_OS_ROOT_PACKAGES
-                .iter()
-                .filter(|package| affected.contains(**package) && !changed.contains(**package))
-                .map(|package| (*package).to_string()),
+            integration
+                .into_iter()
+                .filter(|package| !changed_set.contains(package))
+                .map(|package| (package, ClippyDepsMode::WithDeps)),
         )
         .collect()
 }
@@ -167,12 +199,17 @@ fn clippy_skip_reason(package: &Package) -> Option<&str> {
         .find_map(|(name, reason)| (package.name == *name).then_some(*reason))
 }
 
-pub(super) fn skip_unsupported_packages(packages: Vec<Package>) -> Vec<Package> {
+pub(super) fn skip_unsupported_packages(
+    packages: Vec<SelectedClippyPackage>,
+) -> Vec<SelectedClippyPackage> {
     packages
         .into_iter()
         .filter(|package| {
-            if let Some(reason) = clippy_skip_reason(package) {
-                println!("skipping clippy for package `{}`: {reason}", package.name);
+            if let Some(reason) = clippy_skip_reason(&package.package) {
+                println!(
+                    "skipping clippy for package `{}`: {reason}",
+                    package.package.name
+                );
                 false
             } else {
                 true

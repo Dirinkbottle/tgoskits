@@ -25,7 +25,7 @@ impl PreparedVcpus {
         mut build_config: impl FnMut(
             VcpuPlacement,
         ) -> AxVmResult<
-            <crate::arch::current::ArchVCpu as VmArchVcpuOps>::CreateConfig,
+            <crate::arch::ArchVCpu as VmArchVcpuOps>::CreateConfig,
         >,
     ) -> AxVmResult<Self> {
         debug!("id: {vm_id}, vCPU placements: {placements:#x?}");
@@ -56,20 +56,19 @@ impl PreparedVcpus {
     pub(crate) fn setup(
         &self,
         resources: &AxVMResources,
-        config: &crate::config::AxVMConfig,
         mut build_config: impl FnMut(
             &crate::config::AxVMConfig,
             &[crate::vm::VMMemoryRegion],
         ) -> AxVmResult<
-            <crate::arch::current::ArchVCpu as VmArchVcpuOps>::SetupConfig,
+            <crate::arch::ArchVCpu as VmArchVcpuOps>::SetupConfig,
         >,
     ) -> AxVmResult {
         for vcpu in &self.vcpus {
-            let setup_config = build_config(config, &resources.memory_regions)?;
+            let setup_config = build_config(&resources.config, &resources.memory_regions)?;
             let entry = if vcpu.id() == 0 {
-                config.bsp_entry()
+                resources.config.bsp_entry()
             } else {
-                config.ap_entry()
+                resources.config.ap_entry()
             };
 
             debug!("Setting up vCPU[{}] entry at {:#x}", vcpu.id(), entry);
@@ -93,8 +92,8 @@ impl<'a> IntoIterator for &'a PreparedVcpus {
 }
 
 impl AxVMResources {
-    pub(crate) fn vcpu_placements(&self, config: &crate::config::AxVMConfig) -> Vec<VcpuPlacement> {
-        config
+    pub(crate) fn vcpu_placements(&self) -> Vec<VcpuPlacement> {
+        self.config
             .phys_cpu_ls
             .get_vcpu_affinities_pcpu_ids()
             .into_iter()

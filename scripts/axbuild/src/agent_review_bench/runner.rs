@@ -11,7 +11,6 @@ use tempfile::tempdir;
 use tokio::{process::Command, time::timeout};
 
 use super::{cases::BenchCase, sandbox::ReviewSandbox, scoring::ReviewFinding};
-use crate::support::process::retry_text_file_busy;
 
 const CODEX_REVIEW_PROMPT: &str = "$review-single-pr offline-benchmark";
 const CLAUDE_REVIEW_PROMPT: &str = "/review-single-pr offline-benchmark";
@@ -63,6 +62,7 @@ const CLAUDE_REVIEW_ALLOWED_TOOLS: &[&str] = &[
     "Bash(git grep *)",
 ];
 const CLAUDE_GRADE_TOOLS: &str = "Read";
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
 pub(super) enum AgentKind {
     #[default]
@@ -112,12 +112,10 @@ impl AgentRunner {
     }
 
     pub(super) fn version(&self) -> anyhow::Result<String> {
-        let output = retry_text_file_busy(|| {
-            std::process::Command::new(&self.program)
-                .arg("--version")
-                .output()
-        })
-        .with_context(|| format!("failed to execute {} --version", self.program.display()))?;
+        let output = std::process::Command::new(&self.program)
+            .arg("--version")
+            .output()
+            .with_context(|| format!("failed to execute {} --version", self.program.display()))?;
         if !output.status.success() {
             bail!(
                 "{} --version exited with {}",
@@ -329,7 +327,8 @@ async fn run_process(
         .stdin(Stdio::null())
         .stderr(Stdio::inherit())
         .kill_on_drop(true);
-    let mut child = retry_text_file_busy(|| command.spawn())
+    let mut child = command
+        .spawn()
         .with_context(|| format!("failed to spawn {description}"))?;
     let status = match timeout(Duration::from_secs(timeout_secs), child.wait()).await {
         Ok(status) => status.with_context(|| format!("failed to wait for {description}"))?,

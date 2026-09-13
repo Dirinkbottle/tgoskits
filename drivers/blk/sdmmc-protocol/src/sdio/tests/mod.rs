@@ -18,13 +18,12 @@ use crate::{
 };
 
 mod block_io_irq;
+mod host2_adapter;
 mod init_flow;
-mod io_card;
 mod mmc_init;
 #[cfg(feature = "rdif")]
 mod rdif_lifecycle;
 mod sd_speed;
-mod transport_adapter;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MockEvent {
@@ -40,7 +39,7 @@ struct MockHost {
     commands: Vec<Command>,
     events: Vec<MockEvent>,
     bus_width: Option<BusWidth>,
-    data_requests: Vec<(sdmmc_host::DataDirection, u32, u32)>,
+    data_requests: Vec<(sdio_host2::DataDirection, u32, u32)>,
     next_read_payload: Option<Vec<u8>>,
     read_payloads: Vec<Vec<u8>>,
     writes: Vec<Vec<u8>>,
@@ -67,26 +66,26 @@ struct MockHost {
     /// one register-state advance. This catches synchronous wrappers that
     /// submit a multi-step bus operation, advance it once, then abort it.
     multi_step_hs200_rollback: bool,
-    aborted_bus_ops: Vec<sdmmc_host::BusOp>,
+    aborted_bus_ops: Vec<sdio_host2::BusOp>,
     pending_polls: usize,
     complete_after_irq_register_retry: bool,
     completion_irq_enabled: bool,
     /// Optional monotonic clock value returned from
-    /// [`sdmmc_host::SdMmcHost::now_ms`]. Tests advance this directly to verify the
+    /// [`sdio_host2::SdioHost::now_ms`]. Tests advance this directly to verify the
     /// wall-clock timeout path; `None` keeps the legacy poll-counter
     /// behavior used by every pre-existing test.
     now_ms: Option<u64>,
 }
 
 struct MockTransactionRequest {
-    result: Option<Result<sdmmc_host::RawResponse, sdmmc_host::Error>>,
+    result: Option<Result<sdio_host2::RawResponse, sdio_host2::Error>>,
     dma: Option<dma_api::PreparedDma>,
     completed_dma: Option<dma_api::CompletedDma>,
     acknowledged_irq: bool,
 }
 
 struct MockBusRequest {
-    op: sdmmc_host::BusOp,
+    op: sdio_host2::BusOp,
     pending_advances: usize,
     done: bool,
 }
@@ -145,14 +144,14 @@ impl MockHost {
     }
 }
 
-impl sdmmc_host::SdMmcHost for MockHost {
+impl sdio_host2::SdioHost for MockHost {
     type TransactionRequest<'a> = MockTransactionRequest;
     type BusRequest = MockBusRequest;
 
     unsafe fn submit_transaction<'a>(
         &mut self,
-        mut transaction: sdmmc_host::Transaction<'a>,
-    ) -> Result<Self::TransactionRequest<'a>, sdmmc_host::Error>
+        mut transaction: sdio_host2::Transaction<'a>,
+    ) -> Result<Self::TransactionRequest<'a>, sdio_host2::Error>
     where
         Self: 'a,
     {
@@ -160,7 +159,7 @@ impl sdmmc_host::SdMmcHost for MockHost {
         self.commands.push(command);
         self.events.push(MockEvent::Command(command));
         let result = if self.replies.is_empty() {
-            Err(sdmmc_host::Error::Timeout)
+            Err(sdio_host2::Error::Timeout)
         } else {
             self.replies
                 .remove(0)
@@ -175,7 +174,7 @@ impl sdmmc_host::SdMmcHost for MockHost {
                 data.block_count.get(),
             ));
             match data.buffer {
-                sdmmc_host::DataBuffer::Read(buffer) => {
+                sdio_host2::DataBuffer::Read(buffer) => {
                     let payload = if self.read_payloads.is_empty() {
                         self.next_read_payload.take()
                     } else {
@@ -183,13 +182,13 @@ impl sdmmc_host::SdMmcHost for MockHost {
                     };
                     let Some(payload) = payload.filter(|payload| payload.len() == buffer.len())
                     else {
-                        return Err(sdmmc_host::Error::Unsupported);
+                        return Err(sdio_host2::Error::Unsupported);
                     };
                     buffer.copy_from_slice(&payload);
                 }
-                sdmmc_host::DataBuffer::Write(buffer) => self.writes.push(buffer.to_vec()),
-                sdmmc_host::DataBuffer::Dma(buffer) => {
-                    if data.direction == sdmmc_host::DataDirection::Read {
+                sdio_host2::DataBuffer::Write(buffer) => self.writes.push(buffer.to_vec()),
+                sdio_host2::DataBuffer::Dma(buffer) => {
+                    if data.direction == sdio_host2::DataDirection::Read {
                         let payload = if self.read_payloads.is_empty() {
                             self.next_read_payload.take()
                         } else {
@@ -198,7 +197,7 @@ impl sdmmc_host::SdMmcHost for MockHost {
                         let Some(payload) =
                             payload.filter(|payload| payload.len() == buffer.len().get())
                         else {
-                            return Err(sdmmc_host::Error::Unsupported);
+                            return Err(sdio_host2::Error::Unsupported);
                         };
                         unsafe {
                             buffer
@@ -221,21 +220,21 @@ impl sdmmc_host::SdMmcHost for MockHost {
 
     unsafe fn submit_transaction_owned<'a>(
         &mut self,
-        transaction: sdmmc_host::Transaction<'a>,
-    ) -> Result<Self::TransactionRequest<'a>, sdmmc_host::SubmitTransactionError<'a>>
+        transaction: sdio_host2::Transaction<'a>,
+    ) -> Result<Self::TransactionRequest<'a>, sdio_host2::SubmitTransactionError<'a>>
     where
         Self: 'a,
     {
         if let Some(data) = transaction.data.as_ref()
-            && data.direction == sdmmc_host::DataDirection::Read
+            && data.direction == sdio_host2::DataDirection::Read
         {
             let payload = self
                 .read_payloads
                 .first()
                 .or(self.next_read_payload.as_ref());
             if !payload.is_some_and(|payload| payload.len() == data.buffer.len()) {
-                return Err(sdmmc_host::SubmitTransactionError::new(
-                    sdmmc_host::Error::Unsupported,
+                return Err(sdio_host2::SubmitTransactionError::new(
+                    sdio_host2::Error::Unsupported,
                     transaction,
                 ));
             }
@@ -247,28 +246,28 @@ impl sdmmc_host::SdMmcHost for MockHost {
     fn advance_transaction<'a>(
         &mut self,
         request: &mut Self::TransactionRequest<'a>,
-        cause: sdmmc_host::ProgressCause,
-    ) -> Result<sdmmc_host::RequestProgress<sdmmc_host::RawResponse>, sdmmc_host::AdvanceRequestError>
+        cause: sdio_host2::ProgressCause,
+    ) -> Result<sdio_host2::RequestProgress<sdio_host2::RawResponse>, sdio_host2::AdvanceRequestError>
     where
         Self: 'a,
     {
         if self.complete_after_irq_register_retry {
-            if cause == sdmmc_host::ProgressCause::AcknowledgedIrq {
+            if cause == sdio_host2::ProgressCause::AcknowledgedIrq {
                 request.acknowledged_irq = true;
-                return Ok(sdmmc_host::RequestProgress::RegisterPending {
+                return Ok(sdio_host2::RequestProgress::RegisterPending {
                     retry_after: core::time::Duration::from_millis(1),
                 });
             }
-            if request.acknowledged_irq && cause == sdmmc_host::ProgressCause::RegisterRetry {
+            if request.acknowledged_irq && cause == sdio_host2::ProgressCause::RegisterRetry {
                 return complete_mock_transaction(request);
             }
         }
-        if cause != sdmmc_host::ProgressCause::AcknowledgedIrq {
-            return Ok(sdmmc_host::RequestProgress::WaitingForIrq);
+        if cause != sdio_host2::ProgressCause::AcknowledgedIrq {
+            return Ok(sdio_host2::RequestProgress::WaitingForIrq);
         }
         if self.pending_polls > 0 {
             self.pending_polls -= 1;
-            return Ok(sdmmc_host::RequestProgress::WaitingForIrq);
+            return Ok(sdio_host2::RequestProgress::WaitingForIrq);
         }
         complete_mock_transaction(request)
     }
@@ -276,7 +275,7 @@ impl sdmmc_host::SdMmcHost for MockHost {
     fn abort_transaction<'a>(
         &mut self,
         request: &mut Self::TransactionRequest<'a>,
-    ) -> Result<(), sdmmc_host::Error>
+    ) -> Result<(), sdio_host2::Error>
     where
         Self: 'a,
     {
@@ -300,27 +299,27 @@ impl sdmmc_host::SdMmcHost for MockHost {
 
     unsafe fn submit_bus_op(
         &mut self,
-        op: sdmmc_host::BusOp,
-    ) -> Result<Self::BusRequest, sdmmc_host::Error> {
+        op: sdio_host2::BusOp,
+    ) -> Result<Self::BusRequest, sdio_host2::Error> {
         match op {
-            sdmmc_host::BusOp::SetBusWidth(width) => {
+            sdio_host2::BusOp::SetBusWidth(width) => {
                 if self.reject_bit8 && matches!(width, BusWidth::Bit8) {
-                    return Err(sdmmc_host::Error::Unsupported);
+                    return Err(sdio_host2::Error::Unsupported);
                 }
                 self.bus_width = Some(width);
             }
-            sdmmc_host::BusOp::SetClock(speed) => {
+            sdio_host2::BusOp::SetClock(speed) => {
                 self.last_clock = Some(speed);
                 self.events.push(MockEvent::Clock(speed));
             }
-            sdmmc_host::BusOp::SetSignalVoltage(voltage) => {
+            sdio_host2::BusOp::SetSignalVoltage(voltage) => {
                 self.last_voltage = Some(voltage);
                 self.events.push(MockEvent::Voltage(voltage));
                 if let Some(error) = self.voltage_switch_result {
                     return Err(protocol_error_to_host(error));
                 }
             }
-            sdmmc_host::BusOp::ExecuteTuning {
+            sdio_host2::BusOp::ExecuteTuning {
                 command,
                 block_size,
             } => {
@@ -335,8 +334,8 @@ impl sdmmc_host::SdMmcHost for MockHost {
             self.multi_step_hs200_rollback
                 && matches!(
                     op,
-                    sdmmc_host::BusOp::SetSignalVoltage(SignalVoltage::V330)
-                        | sdmmc_host::BusOp::SetClock(ClockSpeed::Default)
+                    sdio_host2::BusOp::SetSignalVoltage(SignalVoltage::V330)
+                        | sdio_host2::BusOp::SetClock(ClockSpeed::Default)
                 ),
         );
         Ok(MockBusRequest {
@@ -349,22 +348,22 @@ impl sdmmc_host::SdMmcHost for MockHost {
     fn advance_bus_op(
         &mut self,
         request: &mut Self::BusRequest,
-        _cause: sdmmc_host::ProgressCause,
-    ) -> Result<sdmmc_host::RequestProgress<()>, sdmmc_host::AdvanceRequestError> {
+        _cause: sdio_host2::ProgressCause,
+    ) -> Result<sdio_host2::RequestProgress<()>, sdio_host2::AdvanceRequestError> {
         if request.done {
-            return Err(sdmmc_host::AdvanceRequestError::AlreadyCompleted);
+            return Err(sdio_host2::AdvanceRequestError::AlreadyCompleted);
         }
         if request.pending_advances > 0 {
             request.pending_advances -= 1;
-            return Ok(sdmmc_host::RequestProgress::RegisterPending {
+            return Ok(sdio_host2::RequestProgress::RegisterPending {
                 retry_after: core::time::Duration::from_micros(10),
             });
         }
         request.done = true;
-        Ok(sdmmc_host::RequestProgress::Complete(Ok(())))
+        Ok(sdio_host2::RequestProgress::Complete(Ok(())))
     }
 
-    fn abort_bus_op(&mut self, request: &mut Self::BusRequest) -> Result<(), sdmmc_host::Error> {
+    fn abort_bus_op(&mut self, request: &mut Self::BusRequest) -> Result<(), sdio_host2::Error> {
         self.aborted_bus_ops.push(request.op);
         request.done = true;
         Ok(())
@@ -377,37 +376,32 @@ impl sdmmc_host::SdMmcHost for MockHost {
 
 fn complete_mock_transaction(
     request: &mut MockTransactionRequest,
-) -> Result<sdmmc_host::RequestProgress<sdmmc_host::RawResponse>, sdmmc_host::AdvanceRequestError> {
+) -> Result<sdio_host2::RequestProgress<sdio_host2::RawResponse>, sdio_host2::AdvanceRequestError> {
     let result = request
         .result
         .take()
-        .ok_or(sdmmc_host::AdvanceRequestError::AlreadyCompleted)?;
+        .ok_or(sdio_host2::AdvanceRequestError::AlreadyCompleted)?;
     request.completed_dma = request
         .dma
         .take()
         .map(dma_api::PreparedDma::complete_without_device);
-    Ok(sdmmc_host::RequestProgress::Complete(result))
+    Ok(sdio_host2::RequestProgress::Complete(result))
 }
 
 struct MockIrq;
 
-impl SdMmcIrqHandle for MockIrq {
+impl SdioIrqHandle for MockIrq {
     type Event = ();
 
     fn handle_irq(&mut self) -> Self::Event {}
 }
 
-impl SdMmcIrqHost for MockHost {
+impl SdioIrqHost for MockHost {
     type Event = ();
     type IrqHandle = MockIrq;
-    type CardIrq = ();
 
-    fn into_parts(self) -> sdmmc_host::HostParts<Self, Self::IrqHandle, Self::CardIrq> {
-        sdmmc_host::HostParts {
-            bus: self,
-            irq: MockIrq,
-            card_irq: None,
-        }
+    fn irq_handle(&mut self) -> Self::IrqHandle {
+        MockIrq
     }
 
     fn completion_irq_enabled(&self) -> bool {
@@ -443,7 +437,7 @@ impl dma_api::DmaOp for TestDmaOp {
     ) -> Option<dma_api::DmaAllocHandle> {
         let ptr = NonNull::new(unsafe { alloc_zeroed(layout) })?;
         Some(unsafe {
-            dma_api::DmaAllocHandle::new(ptr, ptr, (ptr.as_ptr() as usize as u64).into(), layout)
+            dma_api::DmaAllocHandle::new(ptr, (ptr.as_ptr() as usize as u64).into(), layout)
         })
     }
 
@@ -487,36 +481,24 @@ impl dma_api::DmaOp for TestDmaOp {
 fn test_device_dma() -> &'static dma_api::DeviceDma {
     static DEVICE: OnceLock<dma_api::DeviceDma> = OnceLock::new();
     static OP: TestDmaOp = TestDmaOp;
-    DEVICE.get_or_init(|| {
-        dma_api::DeviceDma::new(
-            dma_api::DmaDeviceInfo::new(
-                dma_api::DmaDomainId::Direct,
-                dma_api::DmaCoherency::NonCoherent,
-                dma_api::DmaConstraints::new(u64::MAX),
-            ),
-            &OP,
-        )
-    })
+    DEVICE.get_or_init(|| dma_api::DeviceDma::new_legacy(u64::MAX, &OP))
 }
 
-fn protocol_error_to_host(error: Error) -> sdmmc_host::Error {
+fn protocol_error_to_host(error: Error) -> sdio_host2::Error {
     match error {
-        Error::Busy => sdmmc_host::Error::Busy,
-        Error::Timeout(_) => sdmmc_host::Error::Timeout,
-        Error::Crc(_) => sdmmc_host::Error::Crc,
-        Error::NoCard => sdmmc_host::Error::NoCard,
-        Error::UnsupportedCommand => sdmmc_host::Error::Unsupported,
-        Error::InvalidArgument => sdmmc_host::Error::InvalidArgument,
-        Error::Misaligned => sdmmc_host::Error::Misaligned,
-        _ => sdmmc_host::Error::Controller,
+        Error::Busy => sdio_host2::Error::Busy,
+        Error::Timeout(_) => sdio_host2::Error::Timeout,
+        Error::Crc(_) => sdio_host2::Error::Crc,
+        Error::NoCard => sdio_host2::Error::NoCard,
+        Error::UnsupportedCommand => sdio_host2::Error::Unsupported,
+        Error::InvalidArgument => sdio_host2::Error::InvalidArgument,
+        Error::Misaligned => sdio_host2::Error::Misaligned,
+        _ => sdio_host2::Error::Controller,
     }
 }
 
 #[test]
-fn base_irq_host_does_not_require_completion_rearm() {
-    fn assert_base_irq_host<H: SdMmcIrqHost>() {}
-
-    assert_base_irq_host::<MockHost>();
+fn sdio_host_irq_methods_default_to_noop() {
     let mut host = MockHost::new(Vec::new());
 
     assert_eq!(host.enable_completion_irq(), Ok(()));
@@ -576,7 +558,7 @@ fn sd_init_replies() -> Vec<Result<Response, Error>> {
     sd_init_replies_with_ocr(ocr_ready_sdhc())
 }
 
-fn disable_speed_selection(driver: &mut SdMmcCard<MockHost>) {
+fn disable_speed_selection(driver: &mut SdioSdmmc<MockHost>) {
     driver.set_sd_speed_selection_enabled(false);
 }
 
@@ -602,14 +584,14 @@ fn switch_status_payload(function: u8, supported: u8) -> Vec<u8> {
     status
 }
 
-fn poll_init_to_completion<H: SdMmcIrqHost + 'static>(
-    driver: &mut SdMmcCard<H>,
+fn poll_init_to_completion<H: SdioIrqHost + 'static>(
+    driver: &mut SdioSdmmc<H>,
 ) -> Result<CardInfo, Error> {
     poll_init_to_completion_with_preference(driver, CardInitPreference::SdFirst)
 }
 
-fn poll_init_to_completion_with_preference<H: SdMmcIrqHost + 'static>(
-    driver: &mut SdMmcCard<H>,
+fn poll_init_to_completion_with_preference<H: SdioIrqHost + 'static>(
+    driver: &mut SdioSdmmc<H>,
     preference: CardInitPreference,
 ) -> Result<CardInfo, Error> {
     let mut request = driver.submit_init_with_preference(preference)?;
@@ -621,13 +603,13 @@ fn poll_init_to_completion_with_preference<H: SdMmcIrqHost + 'static>(
     }
 }
 
-fn advance_init_once<H: SdMmcIrqHost + 'static>(
-    driver: &mut SdMmcCard<H>,
-    request: &mut SdMmcInitRequest<H>,
+fn advance_init_once<H: SdioIrqHost + 'static>(
+    driver: &mut SdioSdmmc<H>,
+    request: &mut SdioInitRequest<H>,
 ) -> Result<OperationProgress<CardInfo>, Error> {
     let cause = match driver.init_wait_kind(request) {
-        SdMmcInitWait::Irq => sdmmc_host::ProgressCause::AcknowledgedIrq,
-        SdMmcInitWait::Register => sdmmc_host::ProgressCause::RegisterRetry,
+        SdioInitWait::Irq => sdio_host2::ProgressCause::AcknowledgedIrq,
+        SdioInitWait::Register => sdio_host2::ProgressCause::RegisterRetry,
     };
     driver.advance_init_request(request, cause)
 }

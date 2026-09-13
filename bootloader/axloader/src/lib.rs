@@ -1,8 +1,5 @@
 #![cfg_attr(not(any(windows, unix)), no_std)]
 
-#[cfg(test)]
-mod control_input;
-
 #[cfg(any(windows, unix))]
 pub mod elf_image;
 

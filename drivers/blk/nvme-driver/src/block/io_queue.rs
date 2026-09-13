@@ -6,22 +6,12 @@ pub(super) struct NvmeBlockQueue {
     id: usize,
     name: &'static str,
     namespace: Namespace,
-    dma: dma_api::DmaDeviceInfo,
+    dma_mask: u64,
     page_size: usize,
     max_transfer_bytes: Option<usize>,
     depth: usize,
     queue: NvmeQueue,
     state: NvmeQueueState,
-}
-
-pub(super) struct NvmeBlockQueueConfig {
-    pub id: usize,
-    pub depth: usize,
-    pub name: &'static str,
-    pub namespace: Namespace,
-    pub dma: dma_api::DmaDeviceInfo,
-    pub page_size: usize,
-    pub max_transfer_bytes: Option<usize>,
 }
 
 struct NvmeQueueState {
@@ -44,20 +34,18 @@ struct PrpMapping {
 }
 
 impl NvmeBlockQueue {
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
-        config: NvmeBlockQueueConfig,
+        id: usize,
+        depth: usize,
+        name: &'static str,
+        namespace: Namespace,
+        dma_mask: u64,
+        page_size: usize,
+        max_transfer_bytes: Option<usize>,
         queue: NvmeQueue,
         prp_lists: Vec<CoherentArray<u64>>,
     ) -> Self {
-        let NvmeBlockQueueConfig {
-            id,
-            depth,
-            name,
-            namespace,
-            dma,
-            page_size,
-            max_transfer_bytes,
-        } = config;
         let mut slots = Vec::with_capacity(depth + 1);
         slots.resize_with(depth + 1, || RequestSlot {
             pending: false,
@@ -68,7 +56,7 @@ impl NvmeBlockQueue {
             id,
             name,
             namespace,
-            dma,
+            dma_mask,
             page_size,
             max_transfer_bytes,
             depth,
@@ -87,7 +75,7 @@ impl NvmeBlockQueue {
             id: self.id,
             device: device_info(self.name, self.namespace),
             limits: limits(
-                self.dma,
+                self.dma_mask,
                 self.page_size,
                 self.max_transfer_bytes,
                 self.namespace,
@@ -435,7 +423,7 @@ impl<'a> PrpPageAccumulator<'a> {
 }
 
 fn limits(
-    dma: dma_api::DmaDeviceInfo,
+    dma_mask: u64,
     page_size: usize,
     controller_max_transfer_bytes: Option<usize>,
     namespace: Namespace,
@@ -455,23 +443,17 @@ fn limits(
         .max(1)
         .min(u16::MAX as usize + 1) as u32;
     let max_bytes = (max_blocks as usize).saturating_mul(lba_size);
-    let current = dma.constraints();
-    let dma = dma.with_constraints(dma_api::DmaConstraints {
-        align: current.align.max(lba_size),
-        max_segment_size: Some(
-            current
-                .max_segment_size
-                .map_or(max_bytes, |limit| limit.min(max_bytes)),
-        ),
-        ..current
-    });
     QueueLimits {
-        dma,
+        dma_mask,
+        dma_domain: dma_api::DmaDomainId::legacy_global(),
+        dma_alignment: lba_size,
         dma_length_alignment: lba_size,
+        segment_boundary: None,
         max_inflight: max_inflight.max(1),
         max_submit_batch: max_inflight.max(1),
         max_blocks_per_request: max_blocks,
         max_segments: 1,
+        max_segment_size: max_bytes,
         supported_flags: RequestFlags::NONE,
         supports_flush: true,
     }
@@ -545,27 +527,12 @@ mod tests {
             lba_count: 1024,
             metadata_size: 0,
         };
-        let limits = limits(
-            dma_api::DmaDeviceInfo::new(
-                dma_api::DmaDomainId::Direct,
-                dma_api::DmaCoherency::Coherent,
-                dma_api::DmaConstraints::new(u64::MAX)
-                    .with_align(1024)
-                    .with_boundary(1024 * 1024)
-                    .with_max_segment_size(256 * 1024),
-            ),
-            4096,
-            Some(512 * 1024),
-            namespace,
-            8,
-        );
+        let limits = limits(u64::MAX, 4096, Some(512 * 1024), namespace, 8);
 
-        assert_eq!(limits.dma.coherency(), dma_api::DmaCoherency::Coherent);
-        assert_eq!(limits.dma.constraints().align, 1024);
-        assert_eq!(limits.dma.constraints().boundary, Some(1024 * 1024));
+        assert_eq!(limits.dma_alignment, 512);
         assert_eq!(limits.dma_length_alignment, 512);
         assert_eq!(limits.max_blocks_per_request, 1024);
-        assert_eq!(limits.dma.constraints().max_segment_size, Some(256 * 1024));
+        assert_eq!(limits.max_segment_size, 512 * 1024);
         assert_eq!(limits.max_segments, 1);
         assert_eq!(limits.max_submit_batch, 8);
         assert!(limits.supports_flush);

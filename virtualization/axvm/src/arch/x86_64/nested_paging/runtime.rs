@@ -108,20 +108,20 @@ impl<H: crate::host::PagingHandler + 'static> NestedPageTableOps for NestedPageT
         }?)
     }
 
-    fn map_linear(
+    fn map_region(
         &mut self,
         vaddr: GuestPhysAddr,
-        paddr: PhysAddr,
+        get_paddr: impl Fn(GuestPhysAddr) -> PhysAddr,
         size: usize,
         flags: MappingFlags,
         allow_huge: bool,
     ) -> AddrSpaceResult {
         Ok(match &mut self.inner {
             NestedPageTableInner::Ept(table) => {
-                table.map_linear(vaddr, paddr, size, flags, allow_huge)
+                table.map_region(vaddr, &get_paddr, size, flags, allow_huge)
             }
             NestedPageTableInner::Npt(table) => {
-                table.map_linear(vaddr, paddr, size, flags, allow_huge)
+                table.map_region(vaddr, &get_paddr, size, flags, allow_huge)
             }
         }?)
     }

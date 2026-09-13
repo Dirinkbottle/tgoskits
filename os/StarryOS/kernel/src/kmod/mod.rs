@@ -10,7 +10,7 @@
 //! loading an empty module).
 //!
 //! Package-name imports adapted to tgoskits (`axhal` → `ax_runtime::hal`,
-//! `axalloc` → `ax_alloc`, `axmm` → `ax_mm`, `kspin` → `ax_sync`) per
+//! `axalloc` → `ax_alloc`, `axmm` → `ax_mm`, `kspin` → `ax_kspin`) per
 //! `crate-fork-audit.md §6`. KALLSYMS lookup goes through the in-kernel
 //! `.kallsyms` blob (`crate::pseudofs::proc::KALLSYMS`), the same table
 //! `perf::kprobe` resolves names against.
@@ -27,14 +27,14 @@ use alloc::{
 
 #[cfg(target_arch = "loongarch64")]
 use ax_alloc::{UsageKind, global_allocator};
+use ax_errno::{AxError, AxResult, LinuxError};
+use ax_kspin::SpinNoPreempt;
 #[cfg(not(target_arch = "loongarch64"))]
-use ax_memory_addr::MemoryAddr;
+use ax_memory_addr::{MemoryAddr, VirtAddrRange};
 use ax_memory_addr::{PAGE_SIZE_4K, VirtAddr};
 #[cfg(not(target_arch = "loongarch64"))]
 use ax_runtime::hal::paging::MappingFlags;
 use kmod_loader::{KernelModuleHelper, ModuleLoader, ModuleOwner, SectionMemOps};
-
-use crate::{Errno, StarryError, StarryResult, sync::NoPreemptMutex};
 
 /// Marker type that satisfies `kmod_loader::KernelModuleHelper`. Stateless —
 /// every operation reaches into the tgoskits subsystems directly.
@@ -85,12 +85,11 @@ impl SectionMemOps for KmodMemSection {
             #[cfg(not(target_arch = "loongarch64"))]
             KmodMemBackend::KernelAspace => {
                 let mapping_flags = section_perms_to_mapping_flags(perms);
-                ax_runtime::kernel_mapping::protect_kernel_range(
-                    self.vaddr,
-                    PAGE_SIZE_4K * self.num_pages,
-                    mapping_flags,
-                )
-                .is_ok()
+                let kspace = ax_mm::kernel_aspace();
+                let mut guard = kspace.lock();
+                guard
+                    .protect(self.vaddr, PAGE_SIZE_4K * self.num_pages, mapping_flags)
+                    .is_ok()
             }
             #[cfg(target_arch = "loongarch64")]
             KmodMemBackend::DirectMap => {
@@ -113,15 +112,17 @@ impl Drop for KmodMemSection {
             #[cfg(not(target_arch = "loongarch64"))]
             KmodMemBackend::KernelAspace => {
                 let total = PAGE_SIZE_4K * self.num_pages;
-                ax_runtime::kernel_mapping::unmap_kernel_range(self.vaddr, total).unwrap_or_else(
-                    |_| {
+                ax_mm::kernel_aspace()
+                    .lock()
+                    .unmap(self.vaddr, total)
+                    .unwrap_or_else(|_| {
                         error!(
                             "kmod: failed to unmap module section at {:#x} ({} pages)",
                             self.vaddr.as_usize(),
                             self.num_pages
                         );
-                    },
-                );
+                    });
+                crate::mm::flush_tlb_range(self.vaddr, total);
             }
             #[cfg(target_arch = "loongarch64")]
             KmodMemBackend::DirectMap => {
@@ -142,7 +143,7 @@ unsafe extern "C" {
 }
 
 #[cfg(not(target_arch = "loongarch64"))]
-fn alloc_kmod_frames(num_pages: usize) -> StarryResult<VirtAddr> {
+fn alloc_kmod_frames(num_pages: usize) -> AxResult<VirtAddr> {
     let total = PAGE_SIZE_4K * num_pages;
     let kernel_end = (_ekernel as *const () as usize).align_up_4k();
     // The kernel virtual address space is laid out like this:
@@ -152,18 +153,25 @@ fn alloc_kmod_frames(num_pages: usize) -> StarryResult<VirtAddr> {
     // │       Kernel text/data       │ high addresses
     // ├──────────────────────────────┤
     let kmod_alloc_start = VirtAddr::from_usize(kernel_end);
-    let vaddr = ax_runtime::kernel_mapping::allocate_kernel_range(
-        kmod_alloc_start,
-        total,
-        MappingFlags::READ | MappingFlags::WRITE,
-        true,
-    )?;
+    let vaddr = {
+        let kspace = ax_mm::kernel_aspace();
+        let mut guard = kspace.lock();
+        let vaddr = guard
+            .find_free_area(
+                kmod_alloc_start,
+                total,
+                VirtAddrRange::new(guard.base(), guard.end()),
+            )
+            .ok_or(AxError::NoMemory)?;
+        guard.map_alloc(vaddr, total, MappingFlags::READ | MappingFlags::WRITE, true)?;
+        vaddr
+    };
     unsafe { core::ptr::write_bytes(vaddr.as_mut_ptr(), 0, total) };
     Ok(vaddr)
 }
 
 #[cfg(target_arch = "loongarch64")]
-fn alloc_kmod_dmw_frames(num_pages: usize) -> StarryResult<VirtAddr> {
+fn alloc_kmod_dmw_frames(num_pages: usize) -> AxResult<VirtAddr> {
     // LoongArch kernel symbols are exported from the DMW address window
     // (0x9000...). If module sections live in the page-table-backed
     // 0xffff8... kernel space, PCALA relocations against kernel symbols can
@@ -173,19 +181,16 @@ fn alloc_kmod_dmw_frames(num_pages: usize) -> StarryResult<VirtAddr> {
     let vaddr = VirtAddr::from_usize(
         global_allocator()
             .alloc_pages(num_pages, PAGE_SIZE_4K, UsageKind::VirtMem)
-            .map_err(|_| StarryError::NoMemory)?,
+            .map_err(|_| AxError::NoMemory)?,
     );
     unsafe { core::ptr::write_bytes(vaddr.as_mut_ptr(), 0, PAGE_SIZE_4K * num_pages) };
     Ok(vaddr)
 }
 
-fn linux_code_to_starry_error(code: i32) -> StarryError {
-    let errno = Errno::new(code);
-    if errno.is_valid() {
-        errno.into()
-    } else {
-        Errno::EINVAL.into()
-    }
+fn linux_code_to_ax_error(code: i32) -> AxError {
+    LinuxError::try_from(code)
+        .map(AxError::from)
+        .unwrap_or_else(|_| AxError::from(LinuxError::EINVAL))
 }
 
 impl KernelModuleHelper for KmodHelper {
@@ -244,21 +249,21 @@ impl KernelModuleHelper for KmodHelper {
 type Module = ModuleOwner<KmodHelper>;
 
 /// Registry of currently-loaded modules, keyed by `modinfo` name.
-static MODULES: NoPreemptMutex<BTreeMap<String, Module>> = NoPreemptMutex::new(BTreeMap::new());
+static MODULES: SpinNoPreempt<BTreeMap<String, Module>> = SpinNoPreempt::new(BTreeMap::new());
 
 /// Linux-style `init_module(2)`: take a `.ko` image and an optional
 /// parameter string, perform relocations, run the module's `init`
 /// function, and register the module in the global table.
-pub fn init_module(elf: &[u8], params: Option<&str>) -> StarryResult<()> {
-    let loader = ModuleLoader::<KmodHelper>::new(elf)
-        .map_err(|err| linux_code_to_starry_error(err.code()))?;
+pub fn init_module(elf: &[u8], params: Option<&str>) -> AxResult<()> {
+    let loader =
+        ModuleLoader::<KmodHelper>::new(elf).map_err(|err| linux_code_to_ax_error(err.code()))?;
     let params = match params {
-        Some(p) => CString::new(p).map_err(|_| StarryError::InvalidInput)?,
+        Some(p) => CString::new(p).map_err(|_| AxError::InvalidInput)?,
         None => CString::new("").unwrap(),
     };
     let mut owner = loader
         .load_module(params)
-        .map_err(|err| linux_code_to_starry_error(err.code()))?;
+        .map_err(|err| linux_code_to_ax_error(err.code()))?;
 
     // `name` is available as soon as `load_module()` returns, before init runs.
     let name = owner.name().to_string();
@@ -270,15 +275,15 @@ pub fn init_module(elf: &[u8], params: Option<&str>) -> StarryResult<()> {
     // `EEXIST` would leave those side effects in place with no way to roll
     // them back.
     if MODULES.lock().contains_key(&name) {
-        return Err(StarryError::AlreadyExists);
+        return Err(AxError::AlreadyExists);
     }
 
     let ret = owner
         .call_init()
-        .map_err(|err| linux_code_to_starry_error(err.code()))?;
+        .map_err(|err| linux_code_to_ax_error(err.code()))?;
     if ret != 0 {
         warn!("module `{name}` init returned {ret}");
-        return Err(StarryError::InvalidInput);
+        return Err(AxError::InvalidInput);
     }
     info!("module `{name}` loaded");
 
@@ -289,7 +294,7 @@ pub fn init_module(elf: &[u8], params: Option<&str>) -> StarryResult<()> {
     if modules.contains_key(&name) {
         drop(modules);
         owner.call_exit();
-        return Err(StarryError::AlreadyExists);
+        return Err(AxError::AlreadyExists);
     }
     modules.insert(name, owner);
     Ok(())
@@ -298,9 +303,9 @@ pub fn init_module(elf: &[u8], params: Option<&str>) -> StarryResult<()> {
 /// Linux-style `delete_module(2)`: look up by `modinfo` name, call the
 /// module's `exit`, drop the registration (which deallocates section
 /// memory via `KmodMem::drop`).
-pub fn delete_module(name: &str) -> StarryResult<()> {
+pub fn delete_module(name: &str) -> AxResult<()> {
     let mut modules = MODULES.lock();
-    let mut owner = modules.remove(name).ok_or(StarryError::NotFound)?;
+    let mut owner = modules.remove(name).ok_or(AxError::NotFound)?;
     owner.call_exit();
     warn!("module `{name}` exited");
     Ok(())

@@ -1,5 +1,3 @@
-mod common;
-
 use core::ptr::NonNull;
 use std::{string::String, sync::Mutex, vec::Vec};
 

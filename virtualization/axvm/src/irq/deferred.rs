@@ -9,7 +9,9 @@ use std::sync::{
     atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
-use crate::{AxVmError, AxVmResult, ax_err, host::task::IrqNotification, sync::MutexExt};
+use ax_std::os::arceos::modules::ax_task::IrqNotify;
+
+use crate::{AxVmResult, ax_err, sync::MutexExt};
 
 const KICK_WORKER_STACK_SIZE: usize = 0x20_000;
 
@@ -19,8 +21,8 @@ pub(crate) struct DeferredVcpuKick {
     pending_vcpus: AtomicUsize,
     worker_started: AtomicBool,
     stopping: AtomicBool,
-    notify: IrqNotification,
-    worker: Mutex<Option<crate::ThreadHandle>>,
+    notify: IrqNotify,
+    worker: Mutex<Option<crate::AxTaskRef>>,
 }
 
 impl DeferredVcpuKick {
@@ -31,38 +33,29 @@ impl DeferredVcpuKick {
             pending_vcpus: AtomicUsize::new(0),
             worker_started: AtomicBool::new(false),
             stopping: AtomicBool::new(false),
-            notify: IrqNotification::new(),
+            notify: IrqNotify::new(),
             worker: Mutex::new(None),
         })
     }
 
     /// Starts the task-context worker before an architecture enables IRQ input.
-    pub(crate) fn start(self: &Arc<Self>) -> AxVmResult {
+    pub(crate) fn start(self: &Arc<Self>) {
         let mut worker = self.worker.lock_unpoisoned();
         if worker.is_some() {
-            return Ok(());
+            return;
         }
         self.stopping.store(false, Ordering::Release);
         let state = self.clone();
-        let thread = unsafe {
-            // SAFETY: no OS extension or affinity capability is transferred;
-            // the worker closure and VM-owned state move exactly once.
-            crate::host::task::spawn_thread_with_extension_and_affinity(
-                move || state.run_worker(),
-                std::format!("VM[{}]-irq-kick", self.vm_id),
-                KICK_WORKER_STACK_SIZE,
-                None,
-                None,
-            )
-        }
-        .map_err(|error| AxVmError::host("start deferred vCPU kick worker", error))?;
-        *worker = Some(thread);
-        drop(worker);
+        let task = crate::TaskInner::new(
+            move || state.run_worker(),
+            std::format!("VM[{}]-irq-kick", self.vm_id),
+            KICK_WORKER_STACK_SIZE,
+        );
+        *worker = Some(crate::host::task::spawn_task(task));
         self.worker_started.store(true, Ordering::Release);
         if self.pending_vcpus.load(Ordering::Acquire) != 0 {
             self.notify.notify();
         }
-        Ok(())
     }
 
     /// Publishes that `vcpu_id` needs to observe controller-owned IRQ state.
@@ -81,22 +74,21 @@ impl DeferredVcpuKick {
         };
         self.pending_vcpus.fetch_or(bit, Ordering::Release);
         if self.worker_started.load(Ordering::Acquire) {
-            self.notify.notify();
+            self.notify.notify_irq();
         }
         Ok(())
     }
 
     /// Stops and joins the worker after architecture IRQ input is quiesced.
-    pub(crate) fn stop(&self) -> AxVmResult {
+    pub(crate) fn stop(&self) {
         self.worker_started.store(false, Ordering::Release);
         self.stopping.store(true, Ordering::Release);
         self.notify.notify();
         let worker = self.worker.lock_unpoisoned().take();
-        let join_result = worker.map_or(Ok(0), crate::host::task::join_thread);
+        if let Some(worker) = worker {
+            worker.join();
+        }
         self.pending_vcpus.store(0, Ordering::Release);
-        join_result
-            .map(|_exit_code| ())
-            .map_err(|error| AxVmError::host("join deferred vCPU kick worker", error))
     }
 
     fn run_worker(&self) {
@@ -107,9 +99,7 @@ impl DeferredVcpuKick {
             }
             let pending = self.pending_vcpus.swap(0, Ordering::AcqRel);
             for vcpu_id in SetBits(pending) {
-                if let Err(error) =
-                    crate::runtime::vcpus::kick_vcpu_from_published_state(self.vm_id, vcpu_id)
-                {
+                if let Err(error) = crate::runtime::vcpus::notify_vcpu(self.vm_id, vcpu_id) {
                     trace!(
                         "VM[{}] deferred IRQ kick for vCPU {vcpu_id} was not delivered: {error:?}",
                         self.vm_id

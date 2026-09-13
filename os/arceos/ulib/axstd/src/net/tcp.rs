@@ -1,10 +1,7 @@
 use ax_api::net::{self as api, AxTcpSocketHandle};
 
 use super::{SocketAddr, ToSocketAddrs};
-use crate::{
-    StdResult,
-    io::{self, prelude::*},
-};
+use crate::io::{self, prelude::*};
 
 /// A TCP stream between a local and a remote socket.
 pub struct TcpStream(AxTcpSocketHandle);
@@ -23,8 +20,8 @@ impl TcpStream {
     /// each of the addresses until a connection is successful. If none of
     /// the addresses result in a successful connection, the error returned from
     /// the last connection attempt (the last address) is returned.
-    pub fn connect<A: ToSocketAddrs>(addr: A) -> StdResult<TcpStream> {
-        super::each_addr(addr, |addr: StdResult<&SocketAddr>| {
+    pub fn connect<A: ToSocketAddrs>(addr: A) -> io::Result<TcpStream> {
+        super::each_addr(addr, |addr: io::Result<&SocketAddr>| {
             let addr = addr?;
             let socket = api::ax_tcp_socket();
             api::ax_tcp_connect(&socket, *addr)?;
@@ -33,31 +30,30 @@ impl TcpStream {
     }
 
     /// Returns the socket address of the local half of this TCP connection.
-    pub fn local_addr(&self) -> StdResult<SocketAddr> {
-        Ok(api::ax_tcp_socket_addr(&self.0)?)
+    pub fn local_addr(&self) -> io::Result<SocketAddr> {
+        api::ax_tcp_socket_addr(&self.0)
     }
 
     /// Returns the socket address of the remote peer of this TCP connection.
-    pub fn peer_addr(&self) -> StdResult<SocketAddr> {
-        Ok(api::ax_tcp_peer_addr(&self.0)?)
+    pub fn peer_addr(&self) -> io::Result<SocketAddr> {
+        api::ax_tcp_peer_addr(&self.0)
     }
 
     /// Shuts down the connection.
-    pub fn shutdown(&self) -> StdResult {
-        api::ax_tcp_shutdown(&self.0)?;
-        Ok(())
+    pub fn shutdown(&self) -> io::Result<()> {
+        api::ax_tcp_shutdown(&self.0)
     }
 }
 
 impl Read for TcpStream {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        Ok(api::ax_tcp_recv(&self.0, buf)?)
+        api::ax_tcp_recv(&self.0, buf)
     }
 }
 
 impl Write for TcpStream {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        Ok(api::ax_tcp_send(&self.0, buf)?)
+        api::ax_tcp_send(&self.0, buf)
     }
 
     fn flush(&mut self) -> io::Result<()> {
@@ -82,8 +78,8 @@ impl TcpListener {
     /// each of the addresses until one succeeds and returns the listener. If
     /// none of the addresses succeed in creating a listener, the error returned
     /// from the last attempt (the last address) is returned.
-    pub fn bind<A: ToSocketAddrs>(addr: A) -> StdResult<TcpListener> {
-        super::each_addr(addr, |addr: StdResult<&SocketAddr>| {
+    pub fn bind<A: ToSocketAddrs>(addr: A) -> io::Result<TcpListener> {
+        super::each_addr(addr, |addr: io::Result<&SocketAddr>| {
             let addr = addr?;
             let backlog = 128;
             let socket = api::ax_tcp_socket();
@@ -94,8 +90,8 @@ impl TcpListener {
     }
 
     /// Returns the local socket address of this listener.
-    pub fn local_addr(&self) -> StdResult<SocketAddr> {
-        Ok(api::ax_tcp_socket_addr(&self.0)?)
+    pub fn local_addr(&self) -> io::Result<SocketAddr> {
+        api::ax_tcp_socket_addr(&self.0)
     }
 
     /// Accept a new incoming connection from this listener.
@@ -103,8 +99,7 @@ impl TcpListener {
     /// This function will block the calling thread until a new TCP connection
     /// is established. When established, the corresponding [`TcpStream`] and the
     /// remote peer's address will be returned.
-    pub fn accept(&self) -> StdResult<(TcpStream, SocketAddr)> {
-        let (socket, address) = api::ax_tcp_accept(&self.0)?;
-        Ok((TcpStream(socket), address))
+    pub fn accept(&self) -> io::Result<(TcpStream, SocketAddr)> {
+        api::ax_tcp_accept(&self.0).map(|(a, b)| (TcpStream(a), b))
     }
 }

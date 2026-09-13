@@ -74,8 +74,20 @@ pub(super) fn map_c_app_features(
     base_features: &[String],
 ) -> anyhow::Result<Vec<String>> {
     const LIB_FEATURES: &[&str] = &[
-        "fp-simd", "alloc", "lockdep", "fs", "net", "fd", "pipe", "select", "poll", "epoll",
-        "ext4fs", "fatfs",
+        "fp-simd",
+        "irq",
+        "alloc",
+        "multitask",
+        "lockdep",
+        "fs",
+        "net",
+        "fd",
+        "pipe",
+        "select",
+        "poll",
+        "epoll",
+        "ext4fs",
+        "fatfs",
     ];
 
     let mut features = BTreeSet::new();

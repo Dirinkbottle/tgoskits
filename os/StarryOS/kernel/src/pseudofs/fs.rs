@@ -1,6 +1,7 @@
 use alloc::{string::String, sync::Arc};
 use core::{any::Any, time::Duration};
 
+use ax_kspin::SpinNoIrq;
 use axfs_ng_vfs::{
     DeviceId, DirEntry, DirNode, Filesystem, FilesystemOps, Metadata, MetadataUpdate, NodeOps,
     NodePermission, NodeType, Reference, StatFs, VfsResult, path::MAX_NAME_LEN,
@@ -8,7 +9,6 @@ use axfs_ng_vfs::{
 use slab::Slab;
 
 use super::DirMaker;
-use crate::sync::IrqMutex;
 
 /// Returns a dummy filesystem statistics.
 pub fn dummy_stat_fs(fs_type: u32) -> StatFs {
@@ -32,8 +32,8 @@ pub fn dummy_stat_fs(fs_type: u32) -> StatFs {
 pub struct SimpleFs {
     name: String,
     fs_type: u32,
-    inodes: IrqMutex<Slab<()>>,
-    root: IrqMutex<Option<DirEntry>>,
+    inodes: SpinNoIrq<Slab<()>>,
+    root: SpinNoIrq<Option<DirEntry>>,
 }
 
 impl SimpleFs {
@@ -46,8 +46,8 @@ impl SimpleFs {
         let fs = Arc::new(Self {
             name,
             fs_type,
-            inodes: IrqMutex::new(Slab::new()),
-            root: IrqMutex::new(None),
+            inodes: SpinNoIrq::new(Slab::new()),
+            root: SpinNoIrq::new(None),
         });
         let root = root(fs.clone());
         fs.set_root(DirEntry::new_dir(
@@ -88,10 +88,10 @@ impl FilesystemOps for SimpleFs {
 pub struct SimpleFsNode {
     fs: Arc<SimpleFs>,
     ino: u64,
-    // IrqMutex instead of Mutex: metadata may be read/updated on paths that
+    // SpinNoIrq instead of Mutex: metadata may be read/updated on paths that
     // are already in atomic context (IRQs disabled), so a blocking mutex would
     // trigger a might_sleep() panic.
-    pub(crate) metadata: IrqMutex<Metadata>,
+    pub(crate) metadata: SpinNoIrq<Metadata>,
 }
 
 impl SimpleFsNode {
@@ -117,7 +117,7 @@ impl SimpleFsNode {
         Self {
             fs,
             ino,
-            metadata: IrqMutex::new(metadata),
+            metadata: SpinNoIrq::new(metadata),
         }
     }
 }
@@ -180,8 +180,8 @@ impl NodeOps for SimpleFsNode {
     }
 }
 
-#[cfg(all(test, not(axtest)))]
-fn dummy_stat_fs_fields_match_expected_defaults_for_test() -> bool {
+#[cfg(axtest)]
+pub(crate) fn dummy_stat_fs_fields_match_expected_defaults_for_test() -> bool {
     let stat = dummy_stat_fs(0xdead_beef);
     stat.fs_type == 0xdead_beef
         && stat.block_size == 512
@@ -192,12 +192,4 @@ fn dummy_stat_fs_fields_match_expected_defaults_for_test() -> bool {
         && stat.free_file_count == 0
         && stat.fragment_size == 0
         && stat.mount_flags == 0
-}
-
-#[cfg(all(test, not(axtest)))]
-mod tests {
-    #[test]
-    fn dummy_stat_fs_fields_match_expected_defaults() {
-        assert!(super::dummy_stat_fs_fields_match_expected_defaults_for_test());
-    }
 }

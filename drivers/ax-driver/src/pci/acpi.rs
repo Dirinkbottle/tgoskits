@@ -34,10 +34,6 @@ fn probe_acpi_ecam(probe: ProbeAcpi<'_>) -> Result<(), OnProbeError> {
     let mut registered = false;
     for region in info.root.pci_ecam_regions() {
         debug!("ACPI MCFG PCI ECAM region: {region:?}");
-        let dma_coherent = matches!(
-            crate::binding_resolver::dma_coherency_from_acpi_cca(region.dma_coherent)?,
-            dma_api::DmaCoherency::Coherent
-        );
         super::register_ecam_controller(
             PlatformDevice {
                 descriptor: plat_dev.descriptor.clone(),
@@ -46,7 +42,6 @@ fn probe_acpi_ecam(probe: ProbeAcpi<'_>) -> Result<(), OnProbeError> {
             region.size(),
             None,
             None,
-            dma_coherent,
         )?;
         registered = true;
     }

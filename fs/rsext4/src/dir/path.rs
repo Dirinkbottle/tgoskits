@@ -20,3 +20,8 @@ pub fn normalize_path(pat: &str) -> String {
 
     result_s
 }
+
+/// Normalizes a path using the original misspelled API name.
+pub fn split_paren_child_and_translatevalid(pat: &str) -> String {
+    normalize_path(pat)
+}

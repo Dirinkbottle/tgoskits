@@ -1,21 +1,56 @@
-//! OS-independent synchronization interfaces for TGOSKits kernels and components.
+//! [ArceOS](https://github.com/arceos-org/arceos) synchronization primitives.
 //!
-//! Acquisition methods state the required execution context: ordinary spin
-//! acquisitions disable preemption, `*_irqsave` acquisitions additionally
-//! save and disable local interrupts, and raw acquisitions require an explicit
-//! unsafe contract. [`Mutex`] is always sleepable and never aliases a spin
-//! lock.
+//! Currently supported primitives:
+//!
+//! - [`Mutex`]: A mutual exclusion primitive.
+//! - mod [`spin`]: spinlocks imported from the [`ax-kspin`] crate.
+//!
+//! # Cargo Features
+//!
+//! - `multitask`: For use in the multi-threaded environments. If the feature is
+//!   not enabled, [`Mutex`] will be an alias of [`spin::SpinNoIrq`]. This
+//!   feature is enabled by default.
 
-#![no_std]
+#![cfg_attr(any(not(test), target_os = "none"), no_std)]
+#![cfg_attr(all(test, target_os = "none"), no_main)]
+#![cfg_attr(all(test, target_os = "none"), feature(custom_test_frameworks))]
+#![cfg_attr(doc, feature(doc_cfg))]
+#![cfg_attr(
+    all(test, target_os = "none"),
+    test_runner(crate::bare_metal_test_runner)
+)]
 
-mod context;
-#[doc(hidden)]
-pub mod interface;
+pub use ax_kspin as spin;
+
+#[cfg(all(test, target_os = "none"))]
+fn bare_metal_test_runner(_tests: &[&dyn Fn()]) {}
+
+#[cfg(all(test, target_os = "none"))]
+#[unsafe(no_mangle)]
+extern "C" fn _start() -> ! {
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
+#[cfg(all(test, target_os = "none"))]
+#[panic_handler]
+fn panic(_info: &core::panic::PanicInfo<'_>) -> ! {
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
+#[cfg(all(feature = "multitask", feature = "lockdep"))]
 mod lockdep;
-#[cfg(feature = "sleep")]
-mod mutex;
-mod spin;
 
-#[cfg(feature = "sleep")]
-pub use self::mutex::*;
-pub use self::{context::*, lockdep::*, spin::*};
+#[cfg(feature = "multitask")]
+mod mutex;
+
+#[cfg(not(feature = "multitask"))]
+#[cfg_attr(doc, doc(cfg(not(feature = "multitask"))))]
+pub use ax_kspin::{SpinNoIrq as Mutex, SpinNoIrqGuard as MutexGuard};
+
+#[cfg(feature = "multitask")]
+#[cfg_attr(doc, doc(cfg(feature = "multitask")))]
+pub use self::mutex::{LockSubclass, LockdepMutexExt, Mutex, MutexGuard, RawMutex};

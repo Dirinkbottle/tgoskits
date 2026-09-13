@@ -1,19 +1,10 @@
 use super::*;
 
-pub(super) const CURRENT_MODEL: ArchitectureCurrentModel = ArchitectureCurrentModel {
-    linux_current: CurrentContextSource::ArchitectureRegister,
-    unikernel_tls: CurrentContextSource::RuntimeAnchor,
-};
-
-pub(super) struct Backend;
-
-impl ArchitectureRegisterBackend for Backend {}
-
 pub(super) fn validate_environment() -> Result<(), CpuLocalError> {
     Ok(())
 }
 
-pub(super) unsafe fn install_cpu_base(area_base: usize, boot_context: usize) {
+pub(super) unsafe fn install_cpu_base(area_base: usize, boot_thread: usize) {
     if cfg!(feature = "tls") {
         unsafe { core::arch::asm!("csrw sscratch, {base}", base = in(reg) area_base) };
     } else {
@@ -21,7 +12,7 @@ pub(super) unsafe fn install_cpu_base(area_base: usize, boot_context: usize) {
             core::arch::asm!(
                 "mv tp, {current}",
                 "csrw sscratch, zero",
-                current = in(reg) boot_context,
+                current = in(reg) boot_thread,
             )
         };
     }
@@ -39,15 +30,15 @@ pub(super) unsafe fn read_cpu_base() -> Result<usize, CpuLocalError> {
             return Ok(0);
         }
         // SAFETY: LinuxCurrent tp is written only with a pinned current header.
-        unsafe { &*(current as *const ExecutionContextHeader) }
+        unsafe { &*(current as *const CurrentThreadHeader) }
             .cpu_area_base()
-            .ok_or(CpuLocalError::CurrentContextMismatch)
+            .ok_or(CpuLocalError::CurrentThreadMismatch)
     }
 }
 
-pub(super) unsafe fn read_current_context(area_base: usize) -> usize {
+pub(super) unsafe fn read_current_thread(area_base: usize) -> usize {
     if cfg!(feature = "tls") {
-        unsafe { area_runtime_anchor(area_base) }.current_context_raw()
+        unsafe { area_runtime_anchor(area_base) }.current_thread_raw()
     } else {
         let current: usize;
         unsafe { core::arch::asm!("mv {current}, tp", current = out(reg) current) };
@@ -55,7 +46,7 @@ pub(super) unsafe fn read_current_context(area_base: usize) -> usize {
     }
 }
 
-pub(super) unsafe fn write_current_context(value: usize) {
+pub(super) unsafe fn write_current_thread(value: usize) {
     if !cfg!(feature = "tls") {
         unsafe { core::arch::asm!("mv tp, {value}", value = in(reg) value) };
     }

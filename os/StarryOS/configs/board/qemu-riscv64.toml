@@ -8,6 +8,7 @@ features = [
   "ax-driver/virtio-input",
   "ax-driver/virtio-socket",
   "ax-driver/xhci-pci",
+  "ax-driver/usb-serial",
   "starry-kernel/input",
   "starry-kernel/vector",
   "starry-kernel/vsock",

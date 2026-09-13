@@ -23,47 +23,35 @@
 ### 基本使用
 
 ```rust
-use crab_usb::host::Host;
+use crab_usb::{ProbedDevice, USBHost};
 use crab_uvc::{UvcDevice, VideoFormat};
 
-#[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // 创建 USB 主机
-    let mut host = Host::new_libusb().await?;
-    
-    // 扫描并查找 UVC 设备
-    let devices = host.probe().await?;
-    for device in devices {
-        let info = device.info();
-        if UvcDevice::check(&info) {
-            let mut uvc = UvcDevice::new(device).await?;
-            
-            // 获取支持的格式
-            let formats = uvc.get_supported_formats().await?;
-            
-            // 设置视频格式
-            if let Some(format) = formats.first() {
-                uvc.set_format(format.clone()).await?;
-            }
-            
-            // 开始流传输
-            uvc.start_streaming().await?;
-            
-            // 接收视频帧
-            while let Ok(Some(frame)) = uvc.recv_frame().await {
-                println!("Received frame: {} bytes", frame.data.len());
-                // 处理视频帧数据...
-            }
-            
-            // 停止流传输
-            uvc.stop_streaming().await?;
-            break;
+async fn capture(host: &mut USBHost, device: ProbedDevice) -> Result<(), Box<dyn std::error::Error>> {
+    let info = device.into_device_info().ok_or("not a USB video device")?;
+    let mut uvc = UvcDevice::new(host.open_device(&info).await?).await?;
+
+    let format = uvc
+        .get_supported_formats()
+        .await?
+        .into_iter()
+        .next()
+        .ok_or("device advertised no supported frame mode")?;
+    uvc.set_format(format).await?; // VS PROBE -> GET_CUR(PROBE) -> VS COMMIT
+
+    let mut stream = uvc.start_streaming().await?;
+    loop {
+        for frame in stream.recv().await? {
+            println!("Received frame: {} bytes", frame.data.len());
         }
     }
-    
-    Ok(())
 }
 ```
+
+ArceOS 的 `ax-driver` 提供更高层的 `UvcVideoCapture`：在
+`PlatformUsbHost::probe_uvc_video()` 返回的对象上调用
+`start_default_streaming()` 或 `start_streaming(format)`，然后反复调用
+`recv_frame()`；结束时调用 `stop_streaming()`。
 
 ### 设置视频控制参数
 
@@ -80,29 +68,12 @@ uvc.send_control_command(VideoControlEvent::SaturationChanged(80)).await?;
 ### 支持的视频格式
 
 ```rust
-use crab_uvc::{VideoFormat, UncompressedFormat};
-
-// MJPEG 压缩格式
-let mjpeg_format = VideoFormat::Mjpeg {
-    width: 1920,
-    height: 1080,
-    frame_rate: 30,
-};
-
-// 未压缩格式
-let yuy2_format = VideoFormat::Uncompressed {
-    width: 640,
-    height: 480,
-    frame_rate: 30,
-    format_type: UncompressedFormat::Yuy2,
-};
-
-// H.264 压缩格式
-let h264_format = VideoFormat::H264 {
-    width: 1280,
-    height: 720,
-    frame_rate: 60,
-};
+let formats = uvc.get_supported_formats().await?;
+// 只能从设备实际广告的模式中选择，调用 set_format 时会保留
+// UVC 描述符中的 bFormatIndex、bFrameIndex、dwFrameInterval 和
+// dwMaxVideoFrameBufferSize。
+let format = formats.into_iter().next().ok_or("no supported format")?;
+uvc.set_format(format).await?;
 ```
 
 ## 示例程序

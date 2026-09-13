@@ -1,10 +1,9 @@
 use alloc::{boxed::Box, string::String, vec::Vec};
 
+use ax_errno::AxError;
 use fdt_edit::{Fdt, RegFixed};
 use log::warn;
-use rdif_serial::{
-    SerialParts, SplitUart, UartEmergencyTx, UartInfo, UartIrq, UartPort, UartRegisterGate,
-};
+use rdif_serial::{SplitUart, UartInfo, UartIrq, UartParts, UartPort};
 use rdrive::{Device, DeviceId, DriverGeneric, probe::acpi::AcpiInfo, register::FdtInfo};
 
 #[cfg(feature = "k3-pxa-uart")]
@@ -13,17 +12,13 @@ mod ns16550;
 mod pl011;
 mod rockchip_fiq;
 
-use crate::{BindingInfo, BindingIrq, Error, binding_info_from_acpi, binding_info_from_fdt};
+use crate::{BindingInfo, BindingIrq, binding_info_from_acpi, binding_info_from_fdt};
 
-struct ErasedSerialParts {
-    port: Box<dyn UartPort>,
-    irq: Box<dyn UartIrq>,
-    register_gate: Box<UartRegisterGate<dyn UartEmergencyTx>>,
-}
+type ErasedUartParts = UartParts<Box<dyn UartPort>, Box<dyn UartIrq>>;
 
 struct ProbedUart {
     hardware: UartInfo,
-    parts: ErasedSerialParts,
+    parts: ErasedUartParts,
 }
 
 struct PlatformSerialDevice {
@@ -33,7 +28,7 @@ struct PlatformSerialDevice {
     paddr: usize,
     initial_baudrate: u32,
     irq: Option<BindingIrq>,
-    parts: Option<ErasedSerialParts>,
+    parts: Option<ErasedUartParts>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -51,7 +46,6 @@ pub struct SerialDevice {
     pub info: SerialDeviceInfo,
     pub port: Box<dyn UartPort>,
     pub irq: Box<dyn UartIrq>,
-    pub register_gate: Box<UartRegisterGate<dyn UartEmergencyTx>>,
 }
 
 impl PlatformSerialDevice {
@@ -82,30 +76,20 @@ impl DriverGeneric for PlatformSerialDevice {
 
 fn erase_uart(raw: impl SplitUart) -> ProbedUart {
     let hardware = raw.runtime_info();
-    let SerialParts {
-        control,
-        irq,
-        emergency_tx,
-    } = raw.split();
-    let register_gate: Box<UartRegisterGate<dyn UartEmergencyTx>> =
-        Box::new(UartRegisterGate::new(emergency_tx));
+    let UartParts { port, irq } = raw.split();
     ProbedUart {
         hardware,
-        parts: ErasedSerialParts {
-            port: Box::new(control),
-            irq: Box::new(irq),
-            register_gate,
-        },
+        parts: UartParts::new(Box::new(port), Box::new(irq)),
     }
 }
 
 impl TryFrom<Device<PlatformSerialDevice>> for SerialDevice {
-    type Error = Error;
+    type Error = AxError;
 
     fn try_from(base: Device<PlatformSerialDevice>) -> Result<Self, Self::Error> {
         let device_id = base.descriptor().device_id();
-        let mut dev = base.lock().map_err(|_| Error::DeviceBusy)?;
-        let parts = dev.parts.take().ok_or(Error::DeviceAlreadyTaken)?;
+        let mut dev = base.lock().map_err(|_| AxError::BadState)?;
+        let parts = dev.parts.take().ok_or(AxError::BadState)?;
         Ok(Self {
             info: SerialDeviceInfo {
                 name: dev.name.clone(),
@@ -118,7 +102,6 @@ impl TryFrom<Device<PlatformSerialDevice>> for SerialDevice {
             },
             port: parts.port,
             irq: parts.irq,
-            register_gate: parts.register_gate,
         })
     }
 }

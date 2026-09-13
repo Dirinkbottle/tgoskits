@@ -12,14 +12,16 @@
 pub(crate) mod connection_manager;
 pub(crate) mod stream;
 
+use core::task::Context;
+
+use ax_errno::{AxError, AxResult};
 use ax_io::{IoBuf, IoBufMut, Read, Write};
-use axpoll::{ExclusiveRegistrationSink, IoEvents, Pollable, SharedRegistrationSink};
+use axpoll::{IoEvents, Pollable};
 pub use rdif_vsock::{VsockAddr, VsockConnId};
 
 pub use self::stream::VsockStreamTransport;
 use crate::{
-    ConnectStatus, NetError, NetResult, RecvOptions, SendOptions, Shutdown, Socket, SocketAddrEx,
-    SocketOps,
+    RecvOptions, SendOptions, Shutdown, Socket, SocketAddrEx, SocketOps,
     options::{Configurable, GetSocketOption, SetSocketOption},
 };
 
@@ -49,67 +51,58 @@ impl Default for VsockSocket {
 }
 
 impl Configurable for VsockSocket {
-    fn get_option_inner(&self, opt: &mut GetSocketOption) -> NetResult<bool> {
+    fn get_option_inner(&self, opt: &mut GetSocketOption) -> AxResult<bool> {
         self.transport.get_option_inner(opt)
     }
 
-    fn set_option_inner(&self, opt: SetSocketOption) -> NetResult<bool> {
+    fn set_option_inner(&self, opt: SetSocketOption) -> AxResult<bool> {
         self.transport.set_option_inner(opt)
     }
 }
 
 impl SocketOps for VsockSocket {
-    fn bind(&self, local_addr: SocketAddrEx) -> NetResult {
+    fn bind(&self, local_addr: SocketAddrEx) -> AxResult {
         let local_addr = local_addr.into_vsock()?;
         self.transport.bind(local_addr)
     }
 
-    fn start_connect(&self, remote_addr: SocketAddrEx) -> NetResult<ConnectStatus> {
+    fn connect(&self, remote_addr: SocketAddrEx) -> AxResult {
         let remote_addr = remote_addr.into_vsock()?;
-        self.transport.start_connect(remote_addr)?;
-        Ok(ConnectStatus::InProgress)
+        self.transport.connect(remote_addr)
     }
 
-    fn connect_status(&self) -> NetResult<ConnectStatus> {
-        self.transport.connect_status()
-    }
-
-    fn listen(&self, _backlog: usize) -> NetResult {
+    fn listen(&self, _backlog: usize) -> AxResult {
         self.transport.listen()
     }
 
-    fn try_accept(&self) -> NetResult<Socket> {
-        self.transport.try_accept().map(|(transport, _addr)| {
+    fn accept(&self) -> AxResult<Socket> {
+        self.transport.accept().map(|(transport, _addr)| {
             let socket = VsockSocket::from_transport(transport);
             socket.into()
         })
     }
 
-    fn try_send(&self, src: impl Read + IoBuf, options: &mut SendOptions) -> NetResult<usize> {
-        self.transport.try_send(src, options)
+    fn send(&self, src: impl Read + IoBuf, options: SendOptions) -> AxResult<usize> {
+        self.transport.send(src, options)
     }
 
-    fn try_recv(
-        &self,
-        dst: impl Write + IoBufMut,
-        options: &mut RecvOptions<'_>,
-    ) -> NetResult<usize> {
-        self.transport.try_recv(dst, options)
+    fn recv(&self, dst: impl Write + IoBufMut, options: RecvOptions<'_>) -> AxResult<usize> {
+        self.transport.recv(dst, options)
     }
 
-    fn local_addr(&self) -> NetResult<SocketAddrEx> {
+    fn local_addr(&self) -> AxResult<SocketAddrEx> {
         Ok(SocketAddrEx::Vsock(
-            self.transport.local_addr()?.ok_or(NetError::NotFound)?,
+            self.transport.local_addr()?.ok_or(AxError::NotFound)?,
         ))
     }
 
-    fn peer_addr(&self) -> NetResult<SocketAddrEx> {
+    fn peer_addr(&self) -> AxResult<SocketAddrEx> {
         Ok(SocketAddrEx::Vsock(
-            self.transport.peer_addr()?.ok_or(NetError::NotFound)?,
+            self.transport.peer_addr()?.ok_or(AxError::NotFound)?,
         ))
     }
 
-    fn shutdown(&self, how: Shutdown) -> NetResult {
+    fn shutdown(&self, how: Shutdown) -> AxResult {
         self.transport.shutdown(how)
     }
 }
@@ -119,15 +112,7 @@ impl Pollable for VsockSocket {
         self.transport.poll()
     }
 
-    unsafe fn register_shared(&self, sink: &mut dyn SharedRegistrationSink, events: IoEvents) {
-        unsafe { self.transport.register_shared(sink, events) };
-    }
-
-    unsafe fn register_exclusive(
-        &self,
-        sink: &mut dyn ExclusiveRegistrationSink,
-        events: IoEvents,
-    ) {
-        unsafe { self.transport.register_exclusive(sink, events) };
+    fn register(&self, context: &mut Context<'_>, events: IoEvents) {
+        self.transport.register(context, events);
     }
 }

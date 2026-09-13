@@ -1,7 +1,7 @@
 use alloc::vec::Vec;
 use core::fmt::Debug;
 
-use log::{debug, warn};
+use log::debug;
 use usb_if::err::TransferError;
 
 use crate::descriptors::payload_header_flags as flags;
@@ -94,53 +94,68 @@ pub struct FrameEvent {
     pub eof: bool,
     pub fid: bool,
     pub frame_number: u32,
+    pub has_error: bool,
 }
 
 /// UVC 帧解析/组装器（参考 libuvc 的 FID 翻转与 EOF 逻辑）
 #[derive(Debug)]
 pub struct FrameParser {
-    buffer: Option<Vec<u8>>,
+    buffer: Vec<u8>,
     last_fid: Option<bool>,
     last_pts: Option<u32>,
     frame_number: u32,
     error_packet_count: u32, // 统计错误包数量
+    invalid_header_count: u32,
+    frame_has_error: bool,
     frame_size: usize,
-    rsv_eof: bool, // 记录上一个包的 EOF 状态，辅助调试
+    /// The first payload after stream start may belong to a frame that began
+    /// before the host submitted its first transfer. Do not publish it.
+    synchronized: bool,
 }
 
 impl FrameParser {
     pub fn new(frame_size: usize) -> Self {
         Self {
-            buffer: Some(Vec::with_capacity(frame_size)),
+            buffer: Vec::with_capacity(frame_size),
             last_fid: None,
             frame_number: 0,
             last_pts: None,
             error_packet_count: 0,
+            invalid_header_count: 0,
+            frame_has_error: false,
             frame_size,
-            rsv_eof: false,
+            synchronized: false,
         }
     }
 
-    fn check_fid(&mut self, fid: bool) {
+    /// Updates the Frame ID state and reports whether this packet starts a new frame.
+    fn update_fid(&mut self, fid: bool) -> bool {
         let Some(last) = self.last_fid else {
             self.last_fid = Some(fid);
-            return;
+            return false;
         };
 
         if last == fid {
-            return;
+            return false;
         }
 
         debug!("FID toggled ({last} -> {fid})",);
 
         self.last_fid = Some(fid);
 
-        self.buffer = Some(Vec::with_capacity(self.frame_size));
+        self.buffer.clear();
+        self.last_pts = None;
+        self.frame_has_error = false;
+        true
     }
 
     /// 获取错误包统计信息
     pub fn error_packet_count(&self) -> u32 {
         self.error_packet_count
+    }
+
+    pub(crate) fn invalid_header_count(&self) -> u32 {
+        self.invalid_header_count
     }
 
     /// 重置错误包统计
@@ -157,20 +172,43 @@ impl FrameParser {
         let (hdr, hdr_len) = match UvcPayloadHeader::parse(data) {
             Some(v) => v,
             None => {
-                debug!(
-                    "Invalid UVC payload header, dropping packet: {} bytes",
-                    data.len()
-                );
+                self.invalid_header_count = self.invalid_header_count.wrapping_add(1);
+                if self.invalid_header_count <= 4 || self.invalid_header_count.is_multiple_of(128) {
+                    debug!(
+                        "[uvc-frame] invalid payload header: packet_bytes={} \
+                         total_invalid_headers={}",
+                        data.len(),
+                        self.invalid_header_count
+                    );
+                }
                 return Ok(None);
             }
         };
-        // debug!("UVC payload header: {:?}", hdr);
+        let starts_new_frame = self.update_fid(hdr.fid);
+        if starts_new_frame {
+            self.synchronized = true;
+        }
+
+        if !self.synchronized {
+            // The first observed transfer can start in the middle of a frame.
+            // Its bytes must not be exposed as a complete image. An EOF also
+            // supplies a boundary for cameras that do not toggle FID reliably.
+            if hdr.eof {
+                self.buffer.clear();
+                self.last_pts = None;
+                self.frame_has_error = false;
+                self.synchronized = true;
+                debug!("[uvc-frame] synchronized at initial EOF boundary");
+            }
+            return Ok(None);
+        }
+
         if hdr.has_err {
             // 记录统计信息，了解错误频率
             self.error_packet_count += 1;
             debug!(
-                "UVC payload ERR set; dropping current buffer ({} bytes), total error packets: {}",
-                self.buffer.as_ref().map_or(0, |b| b.len()),
+                "UVC payload ERR set; marking current frame ({} bytes), total error packets: {}",
+                self.buffer.len(),
                 self.error_packet_count
             );
             debug!(
@@ -186,65 +224,130 @@ impl FrameParser {
 
             // 分析错误模式
             if self.error_packet_count % 32 == 1 {
-                warn!(
+                debug!(
                     "UVC error pattern analysis: {} errors so far, current PTS={:?}, last good \
                      PTS={:?}",
                     self.error_packet_count, hdr.pts, self.last_pts
                 );
             }
 
-            self.buffer = Some(Vec::with_capacity(self.frame_size));
-            self.last_pts = None;
-            // 继续后面的包，不要因为单个错误包就停止
+            self.frame_has_error = true;
+            if hdr.eof {
+                return Ok(self.finish_frame(&hdr));
+            }
             return Ok(None);
         }
 
-        self.check_fid(hdr.fid);
-
-        let Some(ref mut buffer) = self.buffer else {
-            // 理论上不应发生
-            // warn!("Internal buffer is None, resetting");
-            self.buffer = Some(Vec::with_capacity(self.frame_size));
-            return Ok(None);
-        };
-
         // 载荷数据在头之后
         if hdr_len <= data.len() {
-            let payload = &data[hdr_len..];
-
-            // 高效地trim尾部全0：找到最后一个非0字节，直接截取
-            if let Some(last_non_zero_pos) = payload.iter().rposition(|&b| b != 0) {
-                buffer.extend_from_slice(&payload[..=last_non_zero_pos]);
-            }
+            // 负载长度来自传输完成长度，而不是内容是否为零。零字节是合法视频数据。
+            self.buffer.extend_from_slice(&data[hdr_len..]);
         }
         if let Some(pts) = hdr.pts {
             self.last_pts = Some(pts);
         }
 
         if hdr.eof {
-            if !self.rsv_eof {
-                self.rsv_eof = true;
-                self.buffer = Some(Vec::with_capacity(self.frame_size));
-                return Ok(None);
-            }
-
-            if buffer.is_empty() {
-                // 某些设备会发送空 EOF 包，忽略
-                return Ok(None);
-            }
-            let data = self.buffer.take().unwrap();
-
-            let evt = FrameEvent {
-                data,
-                pts_90khz: self.last_pts.take(),
-                eof: true,
-                fid: hdr.fid,
-                frame_number: self.frame_number,
-            };
-            self.frame_number = self.frame_number.wrapping_add(1);
-            return Ok(Some(evt));
+            return Ok(self.finish_frame(&hdr));
         }
 
         Ok(None)
+    }
+
+    fn finish_frame(&mut self, hdr: &UvcPayloadHeader) -> Option<FrameEvent> {
+        if self.buffer.is_empty() && !self.frame_has_error {
+            return None;
+        }
+        let data = core::mem::replace(&mut self.buffer, Vec::with_capacity(self.frame_size));
+        let event = FrameEvent {
+            data,
+            pts_90khz: self.last_pts.take(),
+            eof: true,
+            fid: hdr.fid,
+            frame_number: self.frame_number,
+            has_error: self.frame_has_error,
+        };
+        if event.frame_number < 4 || event.has_error {
+            debug!(
+                "[uvc-frame] complete frame={} fid={} bytes={} error={} pts={:?}",
+                event.frame_number,
+                event.fid,
+                event.data.len(),
+                event.has_error,
+                event.pts_90khz,
+            );
+        }
+        self.frame_number = self.frame_number.wrapping_add(1);
+        self.frame_has_error = false;
+        Some(event)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::FrameParser;
+
+    #[test]
+    fn discards_initial_partial_frame_before_publishing_a_complete_frame() {
+        let mut parser = FrameParser::new(2);
+
+        assert!(
+            parser
+                .push_packet(&[2, 0x00, 0x12])
+                .expect("valid partial payload packet")
+                .is_none()
+        );
+        assert!(
+            parser
+                .push_packet(&[2, 0x02, 0x34])
+                .expect("valid partial EOF packet")
+                .is_none()
+        );
+
+        assert!(
+            parser
+                .push_packet(&[2, 0x01, 0xff, 0xd8])
+                .expect("valid frame-start packet")
+                .is_none()
+        );
+        let event = parser
+            .push_packet(&[2, 0x03, 0x7f, 0x00])
+            .expect("valid payload packet")
+            .expect("EOF must complete the frame");
+
+        assert_eq!(event.data, [0xff, 0xd8, 0x7f, 0x00]);
+        assert!(event.eof);
+    }
+
+    #[test]
+    fn marks_a_completed_frame_when_a_payload_reports_an_error() {
+        let mut parser = FrameParser::new(2);
+
+        assert!(
+            parser
+                .push_packet(&[2, 0x02])
+                .expect("initial EOF synchronizes the parser")
+                .is_none()
+        );
+        assert!(
+            parser
+                .push_packet(&[2, 0x01, 0xff, 0xd8])
+                .expect("valid frame payload")
+                .is_none()
+        );
+        assert!(
+            parser
+                .push_packet(&[2, 0x41])
+                .expect("ERR payload is retained as frame metadata")
+                .is_none()
+        );
+        let event = parser
+            .push_packet(&[2, 0x03, 0xff, 0xd9])
+            .expect("valid EOF payload")
+            .expect("EOF completes the errored frame");
+
+        assert!(event.has_error);
+        assert_eq!(event.data, [0xff, 0xd8, 0xff, 0xd9]);
+        assert_eq!(parser.error_packet_count(), 1);
     }
 }

@@ -1,13 +1,13 @@
 use super::*;
 
-impl<H: SdMmcIrqHost> SdMmcCard<H> {
+impl<H: SdioIrqHost> SdioSdmmc<H> {
     pub(super) fn advance_mmc_setup(
         &mut self,
-        request: &mut SdMmcInitRequest<H>,
+        request: &mut SdioInitRequest<H>,
         cause: ProgressCause,
     ) -> Result<OperationProgress<CardInfo>, Error> {
         match request.state {
-            SdMmcInitState::PollMmcExtCsd => {
+            SdioInitState::PollMmcExtCsd => {
                 let progress = {
                     let ext_request = request
                         .ext_csd_request
@@ -54,7 +54,7 @@ impl<H: SdMmcIrqHost> SdMmcCard<H> {
                     }
                 }
             }
-            SdMmcInitState::PollMmcBusWidth => {
+            SdioInitState::PollMmcBusWidth => {
                 let switch_request = request
                     .mmc_switch_request
                     .as_mut()
@@ -65,11 +65,11 @@ impl<H: SdMmcIrqHost> SdMmcCard<H> {
                         request.mmc_switch_request = None;
                         match self
                             .host
-                            .submit_bus_op(SdMmcBusOp::SetBusWidth(request.current_bus_width))
+                            .submit_bus_op(SdioBusOp::SetBusWidth(request.current_bus_width))
                         {
                             Ok(bus_request) => {
                                 request.bus_request = Some(bus_request);
-                                request.state = SdMmcInitState::PollMmcHostBusWidth;
+                                request.state = SdioInitState::PollMmcHostBusWidth;
                                 Ok(OperationProgress::Pending)
                             }
                             Err(err) => handle_mmc_host_bus_width_error(self, request, err),
@@ -83,13 +83,13 @@ impl<H: SdMmcIrqHost> SdMmcCard<H> {
                     Err(err) if matches!(request.current_bus_width, BusWidth::Bit4) => {
                         request.mmc_switch_request = None;
                         debug!("sdio: 4-bit refused ({:?}), staying at 1-bit", err);
-                        request.state = SdMmcInitState::PrepareMmcSpeed;
+                        request.state = SdioInitState::PrepareMmcSpeed;
                         Ok(OperationProgress::Pending)
                     }
                     Err(err) => Err(err),
                 }
             }
-            SdMmcInitState::PollMmcHostBusWidth => {
+            SdioInitState::PollMmcHostBusWidth => {
                 let mut bus_request = request.bus_request.take().ok_or(Error::InvalidArgument)?;
                 match self.host.advance_bus_op(&mut bus_request, cause) {
                     Ok(OperationProgress::Pending) => {
@@ -98,13 +98,13 @@ impl<H: SdMmcIrqHost> SdMmcCard<H> {
                     }
                     Ok(OperationProgress::Complete(())) => {
                         self.bus_width = request.current_bus_width;
-                        request.state = SdMmcInitState::PrepareMmcSpeed;
+                        request.state = SdioInitState::PrepareMmcSpeed;
                         Ok(OperationProgress::Pending)
                     }
                     Err(err) => handle_mmc_host_bus_width_error(self, request, err),
                 }
             }
-            SdMmcInitState::PrepareMmcSpeed => {
+            SdioInitState::PrepareMmcSpeed => {
                 let dt = request
                     .parsed_ext_csd
                     .as_ref()
@@ -117,13 +117,13 @@ impl<H: SdMmcIrqHost> SdMmcCard<H> {
                     request.mmc_hs200_attempted = true;
                     match self
                         .host
-                        .submit_bus_op(SdMmcBusOp::SwitchVoltage(SignalVoltage::V180))
+                        .submit_bus_op(SdioBusOp::SwitchVoltage(SignalVoltage::V180))
                     {
                         Ok(bus_request) => {
                             request.bus_request = Some(bus_request);
                             request.active_bus_op =
-                                Some(SdMmcBusOp::SwitchVoltage(SignalVoltage::V180));
-                            request.state = SdMmcInitState::PollMmcHs200VoltageSwitch;
+                                Some(SdioBusOp::SwitchVoltage(SignalVoltage::V180));
+                            request.state = SdioInitState::PollMmcHs200VoltageSwitch;
                             return Ok(OperationProgress::Pending);
                         }
                         // The host has no way to actually drive the IO rail
@@ -140,7 +140,7 @@ impl<H: SdMmcIrqHost> SdMmcCard<H> {
                 }
                 self.prepare_mmc_hs52_or_complete(request)
             }
-            SdMmcInitState::PollMmcHs200VoltageSwitch => {
+            SdioInitState::PollMmcHs200VoltageSwitch => {
                 match self.advance_init_bus_op(request, cause) {
                     Ok(OperationProgress::Pending) => Ok(OperationProgress::Pending),
                     Ok(OperationProgress::Complete(())) => {
@@ -150,7 +150,7 @@ impl<H: SdMmcIrqHost> SdMmcCard<H> {
                             0x02,
                         )?;
                         request.mmc_switch_request = Some(switch_request);
-                        request.state = SdMmcInitState::PollMmcHs200Switch;
+                        request.state = SdioInitState::PollMmcHs200Switch;
                         Ok(OperationProgress::Pending)
                     }
                     Err(err) => {
@@ -159,7 +159,7 @@ impl<H: SdMmcIrqHost> SdMmcCard<H> {
                     }
                 }
             }
-            SdMmcInitState::PollMmcHs200Switch => {
+            SdioInitState::PollMmcHs200Switch => {
                 let switch_request = request
                     .mmc_switch_request
                     .as_mut()
@@ -170,13 +170,13 @@ impl<H: SdMmcIrqHost> SdMmcCard<H> {
                         request.mmc_switch_request = None;
                         match self
                             .host
-                            .submit_bus_op(SdMmcBusOp::SetClock(ClockSpeed::Hs200))
+                            .submit_bus_op(SdioBusOp::SetClock(ClockSpeed::Hs200))
                         {
                             Ok(bus_request) => {
                                 request.bus_request = Some(bus_request);
                                 request.active_bus_op =
-                                    Some(SdMmcBusOp::SetClock(ClockSpeed::Hs200));
-                                request.state = SdMmcInitState::PollMmcHs200Clock;
+                                    Some(SdioBusOp::SetClock(ClockSpeed::Hs200));
+                                request.state = SdioInitState::PollMmcHs200Clock;
                                 Ok(OperationProgress::Pending)
                             }
                             Err(err) => {
@@ -192,21 +192,21 @@ impl<H: SdMmcIrqHost> SdMmcCard<H> {
                     }
                 }
             }
-            SdMmcInitState::PollMmcHs200Clock => match self.advance_init_bus_op(request, cause) {
+            SdioInitState::PollMmcHs200Clock => match self.advance_init_bus_op(request, cause) {
                 Ok(OperationProgress::Pending) => Ok(OperationProgress::Pending),
                 Ok(OperationProgress::Complete(())) => {
                     let block_size = self.mmc_tuning_block_size()?;
-                    match self.host.submit_bus_op(SdMmcBusOp::ExecuteTuning {
+                    match self.host.submit_bus_op(SdioBusOp::ExecuteTuning {
                         cmd_index: 21,
                         block_size,
                     }) {
                         Ok(bus_request) => {
                             request.bus_request = Some(bus_request);
-                            request.active_bus_op = Some(SdMmcBusOp::ExecuteTuning {
+                            request.active_bus_op = Some(SdioBusOp::ExecuteTuning {
                                 cmd_index: 21,
                                 block_size,
                             });
-                            request.state = SdMmcInitState::PollMmcHs200Tuning;
+                            request.state = SdioInitState::PollMmcHs200Tuning;
                             Ok(OperationProgress::Pending)
                         }
                         Err(err) => {
@@ -220,12 +220,12 @@ impl<H: SdMmcIrqHost> SdMmcCard<H> {
                     self.begin_mmc_hs200_fallback(request)
                 }
             },
-            SdMmcInitState::PollMmcHs200Tuning => match self.advance_init_bus_op(request, cause) {
+            SdioInitState::PollMmcHs200Tuning => match self.advance_init_bus_op(request, cause) {
                 Ok(OperationProgress::Pending) => Ok(OperationProgress::Pending),
                 Ok(OperationProgress::Complete(())) => {
                     let status_request = self.submit_status()?;
                     request.status_request = Some(status_request);
-                    request.state = SdMmcInitState::PollMmcHs200Status;
+                    request.state = SdioInitState::PollMmcHs200Status;
                     Ok(OperationProgress::Pending)
                 }
                 Err(err) => {
@@ -233,7 +233,7 @@ impl<H: SdMmcIrqHost> SdMmcCard<H> {
                     self.begin_mmc_hs200_fallback(request)
                 }
             },
-            SdMmcInitState::PollMmcHs200Status => {
+            SdioInitState::PollMmcHs200Status => {
                 let status_request = request
                     .status_request
                     .as_mut()
@@ -252,7 +252,7 @@ impl<H: SdMmcIrqHost> SdMmcCard<H> {
                     }
                 }
             }
-            SdMmcInitState::PollMmcHs200RollbackVoltage => {
+            SdioInitState::PollMmcHs200RollbackVoltage => {
                 match self.advance_init_bus_op(request, cause) {
                     Ok(OperationProgress::Pending) => Ok(OperationProgress::Pending),
                     Ok(OperationProgress::Complete(())) => {
@@ -264,7 +264,7 @@ impl<H: SdMmcIrqHost> SdMmcCard<H> {
                     }
                 }
             }
-            SdMmcInitState::PollMmcHs200RollbackClock => {
+            SdioInitState::PollMmcHs200RollbackClock => {
                 match self.advance_init_bus_op(request, cause) {
                     Ok(OperationProgress::Pending) => Ok(OperationProgress::Pending),
                     Ok(OperationProgress::Complete(())) => {
@@ -276,7 +276,7 @@ impl<H: SdMmcIrqHost> SdMmcCard<H> {
                     }
                 }
             }
-            SdMmcInitState::PollMmcHs52Switch => {
+            SdioInitState::PollMmcHs52Switch => {
                 let switch_request = request
                     .mmc_switch_request
                     .as_mut()
@@ -287,11 +287,11 @@ impl<H: SdMmcIrqHost> SdMmcCard<H> {
                         request.mmc_switch_request = None;
                         match self
                             .host
-                            .submit_bus_op(SdMmcBusOp::SetClock(ClockSpeed::HighSpeed))
+                            .submit_bus_op(SdioBusOp::SetClock(ClockSpeed::HighSpeed))
                         {
                             Ok(bus_request) => {
                                 request.bus_request = Some(bus_request);
-                                request.state = SdMmcInitState::PollMmcHighSpeedClock;
+                                request.state = SdioInitState::PollMmcHighSpeedClock;
                             }
                             Err(_e) => {
                                 debug!("sdio: host refused HighSpeed clock ({:?})", _e);
@@ -307,7 +307,7 @@ impl<H: SdMmcIrqHost> SdMmcCard<H> {
                     }
                 }
             }
-            SdMmcInitState::PollMmcHighSpeedClock => {
+            SdioInitState::PollMmcHighSpeedClock => {
                 match self.advance_init_bus_op(request, cause) {
                     Ok(OperationProgress::Pending) => Ok(OperationProgress::Pending),
                     Ok(OperationProgress::Complete(())) => {
@@ -323,7 +323,7 @@ impl<H: SdMmcIrqHost> SdMmcCard<H> {
                     }
                 }
             }
-            SdMmcInitState::PollMmcCacheEnable => {
+            SdioInitState::PollMmcCacheEnable => {
                 let switch_request = request
                     .mmc_switch_request
                     .as_mut()
@@ -341,7 +341,7 @@ impl<H: SdMmcIrqHost> SdMmcCard<H> {
                             "sdio: enabled {} KiB volatile write cache",
                             ext_csd.cache_size_kib()
                         );
-                        request.state = SdMmcInitState::Complete;
+                        request.state = SdioInitState::Complete;
                         Ok(OperationProgress::Pending)
                     }
                     Err(error) if cache_enable_may_fall_back(error) => {
@@ -349,7 +349,7 @@ impl<H: SdMmcIrqHost> SdMmcCard<H> {
                         debug!(
                             "sdio: MMC cache enable refused ({error:?}); cache remains disabled"
                         );
-                        request.state = SdMmcInitState::Complete;
+                        request.state = SdioInitState::Complete;
                         Ok(OperationProgress::Pending)
                     }
                     Err(error) => Err(error),
@@ -361,26 +361,26 @@ impl<H: SdMmcIrqHost> SdMmcCard<H> {
 
     fn prepare_mmc_cache_or_complete(
         &mut self,
-        request: &mut SdMmcInitRequest<H>,
+        request: &mut SdioInitRequest<H>,
     ) -> Result<OperationProgress<CardInfo>, Error> {
         let ext_csd = request
             .parsed_ext_csd
             .as_ref()
             .ok_or(Error::InvalidArgument)?;
         if ext_csd.cache_size_kib() == 0 {
-            request.state = SdMmcInitState::Complete;
+            request.state = SdioInitState::Complete;
             return Ok(OperationProgress::Pending);
         }
 
         match self.submit_mmc_switch(0b11, crate::cmd::ext_csd::CACHE_CTRL as u8, 1) {
             Ok(switch_request) => {
                 request.mmc_switch_request = Some(switch_request);
-                request.state = SdMmcInitState::PollMmcCacheEnable;
+                request.state = SdioInitState::PollMmcCacheEnable;
                 Ok(OperationProgress::Pending)
             }
             Err(error) if cache_enable_may_fall_back(error) => {
                 debug!("sdio: MMC cache enable unsupported ({error:?}); cache remains disabled");
-                request.state = SdMmcInitState::Complete;
+                request.state = SdioInitState::Complete;
                 Ok(OperationProgress::Pending)
             }
             Err(error) => Err(error),
@@ -389,7 +389,7 @@ impl<H: SdMmcIrqHost> SdMmcCard<H> {
 
     fn prepare_mmc_hs52_or_complete(
         &mut self,
-        request: &mut SdMmcInitRequest<H>,
+        request: &mut SdioInitRequest<H>,
     ) -> Result<OperationProgress<CardInfo>, Error> {
         let supports_hs52 = request
             .parsed_ext_csd
@@ -403,26 +403,26 @@ impl<H: SdMmcIrqHost> SdMmcCard<H> {
 
         request.mmc_switch_request =
             Some(self.submit_mmc_switch(0b11, crate::cmd::ext_csd::HS_TIMING as u8, 1)?);
-        request.state = SdMmcInitState::PollMmcHs52Switch;
+        request.state = SdioInitState::PollMmcHs52Switch;
         Ok(OperationProgress::Pending)
     }
 
     /// Start the event-driven rollback from a partially entered HS200 mode.
     ///
-    /// `SdMmcBusOp` may require several register-state advances. Keeping the
+    /// `SdioBusOp` may require several register-state advances. Keeping the
     /// request in the init state machine preserves its ownership until the
     /// host reports completion instead of using a synchronous one-shot helper
     /// that would abort a still-pending clock or voltage transition.
     fn begin_mmc_hs200_fallback(
         &mut self,
-        request: &mut SdMmcInitRequest<H>,
+        request: &mut SdioInitRequest<H>,
     ) -> Result<OperationProgress<CardInfo>, Error> {
-        let op = SdMmcBusOp::SwitchVoltage(SignalVoltage::V330);
+        let op = SdioBusOp::SwitchVoltage(SignalVoltage::V330);
         match self.host.submit_bus_op(op) {
             Ok(bus_request) => {
                 request.bus_request = Some(bus_request);
                 request.active_bus_op = Some(op);
-                request.state = SdMmcInitState::PollMmcHs200RollbackVoltage;
+                request.state = SdioInitState::PollMmcHs200RollbackVoltage;
                 Ok(OperationProgress::Pending)
             }
             Err(err) => {
@@ -434,14 +434,14 @@ impl<H: SdMmcIrqHost> SdMmcCard<H> {
 
     fn begin_mmc_hs200_fallback_clock(
         &mut self,
-        request: &mut SdMmcInitRequest<H>,
+        request: &mut SdioInitRequest<H>,
     ) -> Result<OperationProgress<CardInfo>, Error> {
-        let op = SdMmcBusOp::SetClock(ClockSpeed::Default);
+        let op = SdioBusOp::SetClock(ClockSpeed::Default);
         match self.host.submit_bus_op(op) {
             Ok(bus_request) => {
                 request.bus_request = Some(bus_request);
                 request.active_bus_op = Some(op);
-                request.state = SdMmcInitState::PollMmcHs200RollbackClock;
+                request.state = SdioInitState::PollMmcHs200RollbackClock;
                 Ok(OperationProgress::Pending)
             }
             Err(err) => {

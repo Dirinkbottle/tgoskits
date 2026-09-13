@@ -21,7 +21,6 @@ pub(crate) fn install_machine_serial(
     tree: &mut FdtTree,
     profile: GuestSerialProfile,
     identity: Option<&GuestSerialFdtIdentity>,
-    preserved_physical_selectors: &[String],
 ) -> AxVmResult {
     let machine = crate::machine::current_machine_profile(1);
     let GuestSerialTransport::Mmio { .. } = profile.transport else {
@@ -30,14 +29,7 @@ pub(crate) fn install_machine_serial(
     let Some(interrupt_encoding) = machine.serial_fdt_interrupt else {
         return Ok(());
     };
-    install_mmio_serial_preserving(
-        tree,
-        profile,
-        interrupt_encoding,
-        identity,
-        true,
-        preserved_physical_selectors,
-    )
+    install_mmio_serial(tree, profile, interrupt_encoding, identity, true)
 }
 
 /// Adds a non-console virtual UART without changing aliases or stdout-path.
@@ -55,7 +47,7 @@ pub(crate) fn install_additional_serial(
     install_mmio_serial(tree, profile, interrupt_encoding, None, false)
 }
 
-/// Returns every physical UART node described by the firmware.
+/// Returns physical UART nodes that must remain owned by the host.
 pub(crate) fn physical_serial_paths(fdt: &Fdt) -> Vec<String> {
     let console_path = console_path(fdt);
     let mut paths = fdt
@@ -80,11 +72,6 @@ pub(crate) fn physical_serial_paths(fdt: &Fdt) -> Vec<String> {
     paths.sort();
     paths.dedup();
     paths
-}
-
-/// Returns the firmware-selected UART that must remain owned by the host.
-pub(crate) fn host_owned_serial_paths(fdt: &Fdt) -> Vec<String> {
-    console_path(fdt).into_iter().collect()
 }
 
 /// Resolves the guest virtual UART identity from the firmware-selected host UART.
@@ -379,17 +366,6 @@ fn install_mmio_serial(
     identity: Option<&GuestSerialFdtIdentity>,
     console: bool,
 ) -> AxVmResult {
-    install_mmio_serial_preserving(tree, profile, interrupt_encoding, identity, console, &[])
-}
-
-fn install_mmio_serial_preserving(
-    tree: &mut FdtTree,
-    profile: GuestSerialProfile,
-    interrupt_encoding: GuestSerialFdtInterrupt,
-    identity: Option<&GuestSerialFdtIdentity>,
-    console: bool,
-    preserved_physical_selectors: &[String],
-) -> AxVmResult {
     let GuestSerialTransport::Mmio {
         base,
         length,
@@ -409,11 +385,6 @@ fn install_mmio_serial_preserving(
 
     if console {
         let mut old_paths = physical_serial_paths(tree.inner());
-        old_paths.retain(|path| {
-            !preserved_physical_selectors
-                .iter()
-                .any(|selector| super::device::selector_includes_path(selector, path))
-        });
         old_paths.sort_by_key(|path| std::cmp::Reverse(path.matches('/').count()));
         for path in old_paths {
             tree.inner_mut().remove_by_path(&path);

@@ -2,7 +2,7 @@
 
 use alloc::boxed::Box;
 
-use ax_sync::SpinLock as Mutex;
+use ax_kspin::SpinNoIrq as Mutex;
 use axdevice_base::*;
 
 const INDEX_PORT: u16 = 0x70;
@@ -87,67 +87,58 @@ impl Device for X86CmosDevice {
         &self.resources
     }
 
-    fn read(&self, access: &DeviceAccess, _context: &mut dyn DeviceContext) -> DeviceResult<u64> {
-        validate_access(access)?;
-        let mut state = self.state.lock_irqsave();
-        match access.address() {
-            addr if addr == u64::from(INDEX_PORT) => Ok(u64::from(state.index)),
-            addr if addr == u64::from(DATA_PORT) => {
+    fn access(
+        &self,
+        access: &BusAccess,
+        _context: &mut dyn DeviceAccess,
+    ) -> Result<BusResponse, DeviceError> {
+        if access.kind != BusKind::Port || access.width != AccessWidth::Byte {
+            return Err(DeviceError::Unsupported {
+                operation: "access x86 CMOS",
+                detail: "CMOS supports byte port accesses only".into(),
+            });
+        }
+
+        let mut state = self.state.lock();
+        match (access.addr, access.is_read) {
+            (addr, false) if addr == u64::from(INDEX_PORT) => {
+                state.index = access.data as u8 & 0x7f;
+                Ok(BusResponse::Write)
+            }
+            (addr, true) if addr == u64::from(INDEX_PORT) => Ok(BusResponse::Read {
+                value: u64::from(state.index),
+            }),
+            (addr, false) if addr == u64::from(DATA_PORT) => {
+                let index = usize::from(state.index);
+                if !matches!(index, RTC_REGISTER_C | RTC_REGISTER_D) {
+                    state.bytes[index] = access.data as u8;
+                }
+                Ok(BusResponse::Write)
+            }
+            (addr, true) if addr == u64::from(DATA_PORT) => {
                 let index = usize::from(state.index);
                 let value = state.bytes[index];
                 if index == RTC_REGISTER_C {
                     state.bytes[index] = 0;
                 }
-                Ok(u64::from(value))
+                Ok(BusResponse::Read {
+                    value: u64::from(value),
+                })
             }
-            addr => Err(DeviceError::OutOfRange { addr }),
+            _ => Err(DeviceError::OutOfRange { addr: access.addr }),
         }
     }
-
-    fn write(
-        &self,
-        access: &DeviceAccess,
-        value: u64,
-        _context: &mut dyn DeviceContext,
-    ) -> DeviceResult {
-        validate_access(access)?;
-        let mut state = self.state.lock_irqsave();
-        match access.address() {
-            addr if addr == u64::from(INDEX_PORT) => {
-                state.index = value as u8 & 0x7f;
-                Ok(())
-            }
-            addr if addr == u64::from(DATA_PORT) => {
-                let index = usize::from(state.index);
-                if !matches!(index, RTC_REGISTER_C | RTC_REGISTER_D) {
-                    state.bytes[index] = value as u8;
-                }
-                Ok(())
-            }
-            addr => Err(DeviceError::OutOfRange { addr }),
-        }
-    }
-}
-
-fn validate_access(access: &DeviceAccess) -> DeviceResult {
-    if access.bus() != BusKind::Port || access.width() != AccessWidth::Byte {
-        return Err(DeviceError::Unsupported {
-            operation: "access x86 CMOS",
-            detail: "CMOS supports byte port accesses only".into(),
-        });
-    }
-    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use axdevice_base::{DeviceContext, DeviceId, DeviceVcpuId};
+    use axdevice_base::{DeviceAccess, DeviceId};
 
     use super::*;
 
     struct NoMemory;
 
-    impl DeviceContext for NoMemory {
+    impl DeviceAccess for NoMemory {
         fn device_id(&self) -> DeviceId {
             DeviceId::new(0)
         }
@@ -156,53 +147,58 @@ mod tests {
     fn read_register(device: &X86CmosDevice, register: u8) -> u8 {
         let mut memory = NoMemory;
         device
-            .write(
-                &DeviceAccess::new(
-                    DeviceVcpuId::new(0),
-                    BusKind::Port,
-                    u64::from(INDEX_PORT),
-                    AccessWidth::Byte,
-                ),
-                u64::from(register),
+            .access(
+                &BusAccess {
+                    kind: BusKind::Port,
+                    is_read: false,
+                    addr: u64::from(INDEX_PORT),
+                    width: AccessWidth::Byte,
+                    data: u64::from(register),
+                },
                 &mut memory,
             )
             .unwrap();
-        device
-            .read(
-                &DeviceAccess::new(
-                    DeviceVcpuId::new(0),
-                    BusKind::Port,
-                    u64::from(DATA_PORT),
-                    AccessWidth::Byte,
-                ),
+        match device
+            .access(
+                &BusAccess {
+                    kind: BusKind::Port,
+                    is_read: true,
+                    addr: u64::from(DATA_PORT),
+                    width: AccessWidth::Byte,
+                    data: 0,
+                },
                 &mut memory,
             )
-            .unwrap() as u8
+            .unwrap()
+        {
+            BusResponse::Read { value } => value as u8,
+            BusResponse::Write => unreachable!(),
+        }
     }
 
     fn write_register(device: &X86CmosDevice, register: u8, value: u8) {
         let mut memory = NoMemory;
         device
-            .write(
-                &DeviceAccess::new(
-                    DeviceVcpuId::new(0),
-                    BusKind::Port,
-                    u64::from(INDEX_PORT),
-                    AccessWidth::Byte,
-                ),
-                u64::from(register),
+            .access(
+                &BusAccess {
+                    kind: BusKind::Port,
+                    is_read: false,
+                    addr: u64::from(INDEX_PORT),
+                    width: AccessWidth::Byte,
+                    data: u64::from(register),
+                },
                 &mut memory,
             )
             .unwrap();
         device
-            .write(
-                &DeviceAccess::new(
-                    DeviceVcpuId::new(0),
-                    BusKind::Port,
-                    u64::from(DATA_PORT),
-                    AccessWidth::Byte,
-                ),
-                u64::from(value),
+            .access(
+                &BusAccess {
+                    kind: BusKind::Port,
+                    is_read: false,
+                    addr: u64::from(DATA_PORT),
+                    width: AccessWidth::Byte,
+                    data: u64::from(value),
+                },
                 &mut memory,
             )
             .unwrap();

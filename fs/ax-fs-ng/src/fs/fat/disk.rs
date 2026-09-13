@@ -1,8 +1,9 @@
 use alloc::{boxed::Box, sync::Arc, vec};
 use core::mem;
 
+use ax_errno::{AxError as FsBlockError, AxResult as FsBlockResult};
+
 use crate::{
-    BlockError as FsBlockError, BlockResult as FsBlockResult,
     block::{BlockRegion, FsBlockDevice, RegionBlockDevice},
     os::sync::SleepMutex,
 };
@@ -190,7 +191,7 @@ impl SeekableDiskState {
             self.block_id = self
                 .block_id
                 .checked_add(blocks as u64)
-                .ok_or(FsBlockError::InvalidState)?;
+                .ok_or(FsBlockError::BadState)?;
         }
         if !buf.is_empty() {
             read += self.read_partial(&mut buf)?;
@@ -238,7 +239,7 @@ impl SeekableDiskState {
             self.block_id = self
                 .block_id
                 .checked_add(blocks as u64)
-                .ok_or(FsBlockError::InvalidState)?;
+                .ok_or(FsBlockError::BadState)?;
         }
         if !buf.is_empty() {
             written += self.write_partial(&mut buf)?;
@@ -273,25 +274,6 @@ mod tests {
             512
         }
 
-        #[cfg(feature = "ext4")]
-        fn physical_block_size(&self) -> usize {
-            512
-        }
-
-        fn is_read_only(&self) -> bool {
-            false
-        }
-
-        #[cfg(feature = "ext4")]
-        fn supports_flush(&self) -> bool {
-            true
-        }
-
-        #[cfg(feature = "ext4")]
-        fn supports_fua(&self) -> bool {
-            false
-        }
-
         fn read_block(&mut self, block_id: u64, buf: &mut [u8]) -> FsBlockResult<()> {
             assert_eq!(block_id, 0);
             buf.copy_from_slice(&self.storage.lock().unwrap());
@@ -302,11 +284,6 @@ mod tests {
             assert_eq!(block_id, 0);
             self.storage.lock().unwrap().copy_from_slice(buf);
             Ok(())
-        }
-
-        #[cfg(feature = "ext4")]
-        fn write_block_fua(&mut self, _block_id: u64, _buf: &[u8]) -> FsBlockResult<()> {
-            Err(FsBlockError::Unsupported)
         }
 
         fn flush(&mut self) -> FsBlockResult<()> {

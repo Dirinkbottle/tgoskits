@@ -21,8 +21,6 @@ extern crate log;
 
 #[cfg(target_arch = "aarch64")]
 mod architecture;
-#[cfg(any(target_arch = "aarch64", test))]
-mod enable;
 mod timer;
 mod types;
 

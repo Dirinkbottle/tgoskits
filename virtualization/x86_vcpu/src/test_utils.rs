@@ -17,8 +17,7 @@ pub mod mock {
     use std::sync::Mutex;
 
     use x86_vlapic::{
-        X86InterruptVector, X86TimerCallback, X86VcpuId, X86VlapicError, X86VlapicHostOps,
-        X86VlapicResult, X86VmId,
+        X86InterruptVector, X86TimerCallback, X86VcpuId, X86VlapicHostOps, X86VlapicResult, X86VmId,
     };
 
     use crate::{
@@ -36,7 +35,6 @@ pub mod mock {
         memory_pool: [[u8; PAGE_SIZE_4K]; FRAME_COUNT],
         alloc_mask: u16,
         reset_counter: usize,
-        acknowledged_host_interrupt: Option<u8>,
     }
 
     impl MockMmHalState {
@@ -45,7 +43,6 @@ pub mod mock {
                 memory_pool: [[0; PAGE_SIZE_4K]; FRAME_COUNT],
                 alloc_mask: 0,
                 reset_counter: 0,
-                acknowledged_host_interrupt: None,
             }
         }
     }
@@ -145,7 +142,6 @@ pub mod mock {
             state.memory_pool = [[0; PAGE_SIZE_4K]; FRAME_COUNT];
             state.alloc_mask = 0;
             state.reset_counter += 1;
-            state.acknowledged_host_interrupt = None;
         }
 
         #[allow(dead_code)]
@@ -178,11 +174,6 @@ pub mod mock {
         }
 
         #[allow(dead_code)]
-        pub fn acknowledged_host_interrupt() -> Option<u8> {
-            GLOBAL_LOCK.lock().unwrap().acknowledged_host_interrupt
-        }
-
-        #[allow(dead_code)]
         pub fn run_test<F, R>(test: F) -> R
         where
             F: FnOnce() -> R,
@@ -194,8 +185,6 @@ pub mod mock {
     }
 
     impl X86VlapicHostOps for MockMmHal {
-        type TimerHandle = usize;
-
         fn alloc_frame() -> Option<x86_vlapic::X86HostPhysAddr> {
             Self::alloc_frame_usize().map(x86_vlapic::X86HostPhysAddr::from_usize)
         }
@@ -216,23 +205,11 @@ pub mod mock {
             0
         }
 
-        fn register_timer(
-            _deadline_nanos: u64,
-            _callback: X86TimerCallback,
-        ) -> X86VlapicResult<Self::TimerHandle> {
-            Err(X86VlapicError::TimerUnavailable)
+        fn register_timer(_deadline_nanos: u64, _callback: X86TimerCallback) -> Option<usize> {
+            None
         }
 
-        unsafe fn register_hard_timer(
-            _deadline_nanos: u64,
-            _callback: X86TimerCallback,
-        ) -> X86VlapicResult<Self::TimerHandle> {
-            Err(X86VlapicError::TimerUnavailable)
-        }
-
-        fn cancel_timer(_handle: Self::TimerHandle) -> X86VlapicResult {
-            Ok(())
-        }
+        fn cancel_timer(_token: usize) {}
 
         fn current_vm_id() -> X86VmId {
             0
@@ -300,10 +277,53 @@ pub mod mock {
             nanos
         }
 
-        fn service_pending_host_interrupt() {}
-
-        fn dispatch_acknowledged_host_interrupt(vector: u8) {
-            GLOBAL_LOCK.lock().unwrap().acknowledged_host_interrupt = Some(vector);
+        fn poll_host_interrupt() -> Option<u8> {
+            None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{X86HostOps, test_utils::mock::MockMmHal};
+
+    const PAGE_SIZE_4K: usize = 0x1000;
+    const FIRST_FRAME: usize = 0x1000;
+
+    #[test]
+    fn test_mock_allocator() {
+        MockMmHal::run_test(|| {
+            let addr1 = <MockMmHal as X86HostOps>::alloc_frame().unwrap();
+            let addr2 = <MockMmHal as X86HostOps>::alloc_frame().unwrap();
+            let addr3 = <MockMmHal as X86HostOps>::alloc_frame().unwrap();
+
+            assert_ne!(addr1.as_usize(), addr2.as_usize());
+            assert_ne!(addr2.as_usize(), addr3.as_usize());
+            assert_ne!(addr1.as_usize(), addr3.as_usize());
+
+            assert_eq!(addr1.as_usize() % PAGE_SIZE_4K, 0);
+            assert_eq!(addr2.as_usize() % PAGE_SIZE_4K, 0);
+            assert_eq!(addr3.as_usize() % PAGE_SIZE_4K, 0);
+        });
+    }
+
+    #[test]
+    fn test_mock_contiguous_allocator() {
+        MockMmHal::run_test(|| {
+            let addr = <MockMmHal as X86HostOps>::alloc_contiguous_frames(3, PAGE_SIZE_4K).unwrap();
+            assert_eq!(addr.as_usize(), FIRST_FRAME);
+            assert_eq!(MockMmHal::allocated_count(), 3);
+
+            let aligned =
+                <MockMmHal as X86HostOps>::alloc_contiguous_frames(2, PAGE_SIZE_4K * 4).unwrap();
+            assert_eq!(aligned.as_usize() % (PAGE_SIZE_4K * 4), 0);
+            assert_eq!(MockMmHal::allocated_count(), 5);
+
+            <MockMmHal as X86HostOps>::dealloc_contiguous_frames(addr, 3);
+            assert_eq!(MockMmHal::allocated_count(), 2);
+
+            <MockMmHal as X86HostOps>::dealloc_contiguous_frames(aligned, 2);
+            assert_eq!(MockMmHal::allocated_count(), 0);
+        });
     }
 }

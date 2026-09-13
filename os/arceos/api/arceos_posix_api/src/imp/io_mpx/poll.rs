@@ -1,8 +1,9 @@
 use core::ffi::c_int;
 
-use ax_hal::time::monotonic_time;
+use ax_errno::LinuxError;
+use ax_hal::time::wall_time;
 
-use crate::{PosixError, ctypes, imp::fd_ops::get_file_like};
+use crate::{ctypes, imp::fd_ops::get_file_like};
 
 const POLLIN_EVENT: i16 = ctypes::POLLIN as i16;
 const POLLOUT_EVENT: i16 = ctypes::POLLOUT as i16;
@@ -20,7 +21,7 @@ pub fn sys_poll(fds: *mut ctypes::pollfd, nfds: ctypes::nfds_t, timeout: c_int) 
     );
     syscall_body!(sys_poll, {
         if fds.is_null() && nfds > 0 {
-            return Err(PosixError::EFAULT);
+            return Err(LinuxError::EFAULT);
         }
 
         let fds_slice = if nfds > 0 {
@@ -38,9 +39,9 @@ pub fn sys_poll(fds: *mut ctypes::pollfd, nfds: ctypes::nfds_t, timeout: c_int) 
         let deadline = if timeout < 0 {
             None // block indefinitely
         } else if timeout == 0 {
-            Some(monotonic_time()) // immediate, non-blocking
+            Some(wall_time()) // immediate, non-blocking
         } else {
-            Some(monotonic_time() + core::time::Duration::from_millis(timeout as u64))
+            Some(wall_time() + core::time::Duration::from_millis(timeout as u64))
         };
 
         loop {
@@ -86,7 +87,7 @@ pub fn sys_poll(fds: *mut ctypes::pollfd, nfds: ctypes::nfds_t, timeout: c_int) 
                 return Ok(ready_count);
             }
 
-            if deadline.is_some_and(|ddl| monotonic_time() >= ddl) {
+            if deadline.is_some_and(|ddl| wall_time() >= ddl) {
                 debug!("    poll timeout!");
                 return Ok(0);
             }

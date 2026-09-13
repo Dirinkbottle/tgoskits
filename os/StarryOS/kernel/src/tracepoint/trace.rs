@@ -1,15 +1,14 @@
-use core::sync::atomic::Ordering;
-
-use ax_tracepoint::TraceCmdLineCacheSnapshot;
+use ax_sync::Mutex;
 use axfs_ng_vfs::VfsResult;
+use ktracepoint::{TraceCmdLineCacheSnapshot, TracePipeSnapshot};
 
-use crate::{pseudofs::DirectRwFsFileOps, sync::PiMutex};
+use crate::pseudofs::DirectRwFsFileOps;
 
 /// File representing the trace content.
-pub struct TraceFile(PiMutex<TraceFileState>);
+pub struct TraceFile(Mutex<TraceFileState>);
 
 struct TraceFileState {
-    snapshot: Option<super::IdentityTraceSnapshot>,
+    snapshot: Option<TracePipeSnapshot>,
     drain: super::TextDrain,
 }
 
@@ -21,7 +20,7 @@ impl TraceFileState {
         }
     }
 
-    fn reset(&mut self, snapshot: super::IdentityTraceSnapshot) {
+    fn reset(&mut self, snapshot: TracePipeSnapshot) {
         self.snapshot = Some(snapshot);
         self.drain.reset();
     }
@@ -30,7 +29,7 @@ impl TraceFileState {
 impl TraceFile {
     /// Creates a new `TraceFile` instance.
     pub const fn new() -> Self {
-        TraceFile(PiMutex::new(TraceFileState::new()))
+        TraceFile(Mutex::new(TraceFileState::new()))
     }
 }
 
@@ -61,7 +60,6 @@ impl DirectRwFsFileOps for TraceFile {
         let mut state = self.0.lock();
         state.snapshot = None;
         state.drain.reset();
-        super::TRACE_STATE.raw_epoch.fetch_add(1, Ordering::AcqRel);
         let mut trace_raw_pipe = super::TRACE_STATE.raw_pipe.lock();
         trace_raw_pipe.clear();
         Ok(buf.len())
@@ -69,7 +67,7 @@ impl DirectRwFsFileOps for TraceFile {
 }
 
 /// File representing the trace command line cache.
-pub struct TraceCmdLineFile(PiMutex<TraceCmdLineFileState>);
+pub struct TraceCmdLineFile(Mutex<TraceCmdLineFileState>);
 
 struct TraceCmdLineFileState {
     snapshot: Option<TraceCmdLineCacheSnapshot>,
@@ -93,7 +91,7 @@ impl TraceCmdLineFileState {
 impl TraceCmdLineFile {
     /// Creates a new `TraceCmdLineFile` instance.
     pub const fn new() -> Self {
-        TraceCmdLineFile(PiMutex::new(TraceCmdLineFileState::new()))
+        TraceCmdLineFile(Mutex::new(TraceCmdLineFileState::new()))
     }
 }
 

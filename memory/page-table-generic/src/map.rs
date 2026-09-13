@@ -45,7 +45,6 @@ pub struct UnmapRecursiveConfig {
     pub end_vaddr: VirtAddr,
     pub level: usize,
     pub flush: bool,
-    pub(crate) retained_root_entries: Option<(usize, usize)>,
 }
 
 impl<C> core::fmt::Debug for MapConfig<C> {
@@ -99,20 +98,8 @@ where
                     T::flush(Some(vaddr));
                 }
 
-                vaddr = VirtAddr::from_usize(vaddr.as_usize().checked_add(level_size).ok_or_else(
-                    || {
-                        PagingError::address_overflow(
-                            "Virtual address overflow in map_range_recursive",
-                        )
-                    },
-                )?);
-                paddr = PhysAddr::from_usize(paddr.as_usize().checked_add(level_size).ok_or_else(
-                    || {
-                        PagingError::address_overflow(
-                            "Physical address overflow in map_range_recursive",
-                        )
-                    },
-                )?);
+                vaddr += level_size;
+                paddr += level_size;
                 continue;
             }
 
@@ -132,20 +119,8 @@ where
                     T::flush(Some(vaddr));
                 }
 
-                vaddr = VirtAddr::from_usize(
-                    vaddr.as_usize().checked_add(T::PAGE_SIZE).ok_or_else(|| {
-                        PagingError::address_overflow(
-                            "Virtual address overflow in map_range_recursive",
-                        )
-                    })?,
-                );
-                paddr = PhysAddr::from_usize(
-                    paddr.as_usize().checked_add(T::PAGE_SIZE).ok_or_else(|| {
-                        PagingError::address_overflow(
-                            "Physical address overflow in map_range_recursive",
-                        )
-                    })?,
-                );
+                vaddr += T::PAGE_SIZE;
+                paddr += T::PAGE_SIZE;
                 continue;
             }
 
@@ -181,30 +156,11 @@ where
                 new_frame
             };
 
-            // 计算当前页表条目对应的范围结束地址。  All arithmetic is
-            // checked: a wrapped boundary could make the recursive walker
-            // revisit a low address and install aliases outside the request.
-            let entry_base = (vaddr.as_usize() / level_size)
-                .checked_mul(level_size)
-                .ok_or_else(|| {
-                    PagingError::address_overflow(
-                        "Page-table entry base overflow in map_range_recursive",
-                    )
-                })?;
-            // A sign-extended canonical address can legitimately occupy the
-            // final page-table entry.  Its mathematical entry end is 2^N,
-            // which is represented by the request's exclusive end only (and
-            // cannot be stored in a `usize` address).  Clamp that one boundary
-            // to the request end; every other overflow remains an error.
-            let current_entry_end = match entry_base.checked_add(level_size) {
-                Some(end) => end,
-                None if config.end_vaddr.as_usize() > entry_base => config.end_vaddr.as_usize(),
-                None => {
-                    return Err(PagingError::address_overflow(
-                        "Page-table entry end overflow in map_range_recursive",
-                    ));
-                }
-            };
+            // 计算当前页表条目对应的范围结束地址
+            // 使用 saturating 操作防止溢出，同时确保不超过地址空间最大值
+            let current_entry_end = (vaddr.as_usize() / level_size)
+                .saturating_add(1)
+                .saturating_mul(level_size);
             let next_level_vaddr =
                 VirtAddr::from_usize(current_entry_end.min(config.end_vaddr.as_usize()));
             let mut child_frame = child_frame;
@@ -222,24 +178,15 @@ where
             // 计算本轮映射的虚拟地址范围
             let mapped_size = next_level_vaddr - vaddr;
             vaddr = next_level_vaddr;
-            paddr = PhysAddr::from_usize(paddr.as_usize().checked_add(mapped_size).ok_or_else(
-                || {
-                    PagingError::address_overflow(
-                        "Physical address overflow in map_range_recursive",
-                    )
-                },
-            )?);
+            paddr += mapped_size;
         }
 
         Ok(())
     }
 
-    /// Recursively clears leaf mappings.
+    /// 递归取消映射的核心实现
     ///
-    /// Returns whether this frame is empty and can be reclaimed by its caller.
-    /// This is the existing generic page-table contract used by stage-2 and
-    /// single-owner domains. Stage-1 owners that require remote shootdown
-    /// confirmation use `PageTableRef::unmap_page_deferred` instead.
+    /// 返回值：bool 表示此帧是否为空（所有页表项都无效），可以回收
     pub fn unmap_range_recursive(&mut self, config: UnmapRecursiveConfig) -> PagingResult<bool> {
         let mut vaddr = config.start_vaddr;
         let mut can_reclaim = true;
@@ -256,7 +203,7 @@ where
             // An invalid leaf can still retain its physical address. Treat it
             // as occupied state and clear it instead of skipping it.
             if pte_ref.unused() {
-                vaddr = checked_advance(vaddr, level_size.min(remaining_size))?;
+                vaddr += level_size.min(remaining_size);
                 continue;
             }
 
@@ -265,7 +212,7 @@ where
                 if config.flush {
                     T::flush(Some(vaddr));
                 }
-                vaddr = checked_advance(vaddr, level_size.min(remaining_size))?;
+                vaddr += level_size.min(remaining_size);
                 continue;
             }
 
@@ -280,7 +227,7 @@ where
                     T::flush(Some(vaddr));
                 }
 
-                vaddr = checked_advance(vaddr, if is_huge { level_size } else { T::PAGE_SIZE })?;
+                vaddr += if is_huge { level_size } else { T::PAGE_SIZE };
                 continue;
             }
 
@@ -289,22 +236,7 @@ where
             let child_paddr = pte_ref.paddr(true);
 
             // 计算当前页表条目对应的范围结束地址
-            let entry_base = (vaddr.as_usize() / level_size)
-                .checked_mul(level_size)
-                .ok_or_else(|| {
-                    PagingError::address_overflow(
-                        "Page-table entry base overflow in unmap_range_recursive",
-                    )
-                })?;
-            let current_entry_end = match entry_base.checked_add(level_size) {
-                Some(end) => end,
-                None if config.end_vaddr.as_usize() > entry_base => config.end_vaddr.as_usize(),
-                None => {
-                    return Err(PagingError::address_overflow(
-                        "Page-table entry end overflow in unmap_range_recursive",
-                    ));
-                }
-            };
+            let current_entry_end = ((vaddr.as_usize() / level_size) + 1) * level_size;
             let next_level_vaddr =
                 VirtAddr::from_usize(current_entry_end.min(config.end_vaddr.as_usize()));
 
@@ -316,23 +248,18 @@ where
                     end_vaddr: next_level_vaddr,
                     level: config.level - 1,
                     flush: config.flush,
-                    retained_root_entries: None,
                 };
 
+                // 递归取消子页表映射
                 let child_can_reclaim = child_frame.unmap_range_recursive(child_config)?;
 
-                if child_can_reclaim
-                    && config
-                        .retained_root_entries
-                        .is_some_and(|(start, end)| start <= index && index < end)
-                {
-                    can_reclaim = false;
-                } else if child_can_reclaim {
+                if child_can_reclaim {
                     // 子页表完全为空，可以回收
                     // 清除指向子页表的PTE
                     pte_ref.clear();
                     allocator.dealloc_frame(child_paddr);
                 } else {
+                    // 子页表仍有有效映射，不能回收
                     can_reclaim = false;
                 }
             }
@@ -340,17 +267,22 @@ where
             vaddr = next_level_vaddr;
         }
 
+        // 检查此帧是否完全为空
         if can_reclaim {
-            can_reclaim = self.as_slice().iter().all(PageTableEntry::unused);
+            can_reclaim = self.is_frame_empty();
         }
+
         Ok(can_reclaim)
     }
-}
 
-fn checked_advance(address: VirtAddr, amount: usize) -> PagingResult<VirtAddr> {
-    address
-        .as_usize()
-        .checked_add(amount)
-        .map(VirtAddr::from_usize)
-        .ok_or_else(|| PagingError::address_overflow("page-table address advance overflow"))
+    /// 检查页表帧是否全为空（所有页表项都未使用）
+    fn is_frame_empty(&self) -> bool {
+        let entries = self.as_slice();
+        for pte in entries {
+            if !pte.unused() {
+                return false;
+            }
+        }
+        true
+    }
 }

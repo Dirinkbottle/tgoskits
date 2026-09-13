@@ -9,26 +9,13 @@ pub(crate) mod irq;
 mod paging;
 pub(crate) mod power;
 pub(crate) mod relocate;
-pub(crate) mod trap;
+mod trap;
 
 use core::ptr::null;
 
 pub(crate) use entry::_secondary_entry;
 pub use paging::Entry;
 pub use relocate::relocate;
-
-/// Control-register state installed before a CPU enters the kernel runtime.
-///
-/// This matches Linux's x86 `CR0_STATE`: paging and protected mode are active,
-/// supervisor writes honor read-only PTEs, alignment checking is available,
-/// and reset-time cache-disable state is not inherited by secondary CPUs.
-pub(super) const KERNEL_CR0_STATE: usize = x86::controlregs::Cr0::CR0_ENABLE_PAGING.bits()
-    | x86::controlregs::Cr0::CR0_ALIGNMENT_MASK.bits()
-    | x86::controlregs::Cr0::CR0_WRITE_PROTECT.bits()
-    | x86::controlregs::Cr0::CR0_NUMERIC_ERROR.bits()
-    | x86::controlregs::Cr0::CR0_EXTENSION_TYPE.bits()
-    | x86::controlregs::Cr0::CR0_MONITOR_COPROCESSOR.bits()
-    | x86::controlregs::Cr0::CR0_PROTECTED_MODE.bits();
 
 use crate::{
     ArchTrait, DCacheOp,
@@ -99,12 +86,8 @@ impl ArchTrait for Arch {
         paging::virt_to_phys(vaddr)
     }
 
-    fn virtual_address_space()
-    -> Result<crate::mem::VirtualAddressSpaceLayout, crate::mem::VirtualAddressSpaceError> {
-        crate::mem::VirtualAddressSpaceLayout::try_new(
-            crate::mem::configured_user_space(1usize << 47),
-            addrspace::KERNEL_SPACE_BASE..usize::MAX,
-        )
+    fn kernel_space() -> core::ops::Range<usize> {
+        addrspace::KERNEL_SPACE_BASE..usize::MAX
     }
 
     fn is_mmu_enabled() -> bool {
@@ -155,8 +138,32 @@ impl ArchTrait for Arch {
         _secondary_entry as *const ()
     }
 
-    fn kick_secondary_cpu(hartid: usize, entry: usize, arg: usize) -> Result<(), CpuOnError> {
-        power::kick_secondary_cpu(hartid, entry, arg)
+    fn cpu_on(hartid: usize, entry: usize, arg: usize) -> Result<(), CpuOnError> {
+        power::cpu_on(hartid, entry, arg)
+    }
+
+    fn systimer_enable() {
+        trap::timer_enable();
+    }
+
+    fn systimer_irq_enable() {
+        trap::timer_irq_enable();
+    }
+
+    fn systimer_irq_disable() {
+        trap::timer_irq_disable();
+    }
+
+    fn systimer_irq_is_enabled() -> bool {
+        trap::timer_irq_is_enabled()
+    }
+
+    fn systimer_set_interval(ticks: usize) {
+        trap::timer_set_deadline_in_ticks(ticks);
+    }
+
+    fn systimer_ack() {
+        trap::timer_ack();
     }
 
     fn systimer_freq() -> usize {
@@ -176,7 +183,21 @@ impl ArchTrait for Arch {
     }
 
     fn irq_all_set_enable(enable: bool) {
-        trap::irq_local_set_enabled(enable)
+        trap::irq_local_set_enabled(enable);
+    }
+
+    fn irq_is_enabled(irq: crate::irq::IrqId) -> bool {
+        irq == irq::systimer_irq() && trap::timer_irq_is_enabled()
+    }
+
+    fn irq_set_enable(irq: crate::irq::IrqId, enable: bool) {
+        if irq == irq::systimer_irq() {
+            if enable {
+                trap::timer_irq_enable();
+            } else {
+                trap::timer_irq_disable();
+            }
+        }
     }
 
     fn dcache_range(_op: DCacheOp, _addr: usize, _size: usize) {

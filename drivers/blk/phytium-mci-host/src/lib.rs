@@ -46,8 +46,7 @@ use sdmmc_protocol::{
     cmd::{Command, DataDirection},
     error::{Error, ErrorContext, Phase},
     sdio::host::{
-        BusWidth, ClockSpeed, HostEvent, HostEventKind, HostEventSource, SdMmcIrqHost,
-        SignalVoltage,
+        BusWidth, ClockSpeed, HostEvent, HostEventKind, HostEventSource, SdioIrqHost, SignalVoltage,
     },
 };
 
@@ -273,32 +272,32 @@ mod tests {
             polls: 0,
         };
         let mut buf = [0u8; 512];
-        let data = sdmmc_host::DataPhase::read(
+        let data = sdio_host2::DataPhase::read(
             NonZeroU16::new(512).unwrap(),
             NonZeroU32::new(1).unwrap(),
             &mut buf,
         )
         .unwrap();
-        let tx = sdmmc_host::Transaction::with_data(
+        let tx = sdio_host2::Transaction::with_data(
             sdmmc_protocol::cmd::Command::new(17, 0, ResponseType::R1),
             data,
         );
 
         let err = match unsafe {
-            <PhytiumMci as sdmmc_host::SdMmcHost>::submit_transaction(&mut host, tx)
+            <PhytiumMci as sdio_host2::SdioHost>::submit_transaction(&mut host, tx)
         } {
             Ok(_) => panic!("busy host accepted a second transaction"),
             Err(err) => err,
         };
 
-        assert_eq!(err, sdmmc_host::Error::Busy);
+        assert_eq!(err, sdio_host2::Error::Busy);
         assert!(host.pending_data.is_none());
         assert_eq!(host.data_blocks_remaining, 0);
     }
 
     #[test]
     fn command_completion_requires_acknowledged_irq_cause() {
-        use sdmmc_host::SdMmcHost;
+        use sdio_host2::SdioHost;
 
         let mut mmio = [0u32; 256];
         let base = core::ptr::NonNull::new(mmio.as_mut_ptr().cast()).unwrap();
@@ -318,18 +317,18 @@ mod tests {
         let mut request = crate::TransactionRequest::command(
             host.host2_owner(),
             request_id,
-            sdmmc_host::ResponseType::R1,
+            sdio_host2::ResponseType::R1,
         );
 
         assert_eq!(
-            host.advance_transaction(&mut request, sdmmc_host::ProgressCause::Submitted),
-            Ok(sdmmc_host::RequestProgress::WaitingForIrq)
+            host.advance_transaction(&mut request, sdio_host2::ProgressCause::Submitted),
+            Ok(sdio_host2::RequestProgress::WaitingForIrq)
         );
         assert!(!request.done);
         assert_eq!(
-            host.advance_transaction(&mut request, sdmmc_host::ProgressCause::AcknowledgedIrq,),
-            Ok(sdmmc_host::RequestProgress::Complete(Ok(
-                sdmmc_host::RawResponse::new(sdmmc_host::ResponseType::R1, [0; 4])
+            host.advance_transaction(&mut request, sdio_host2::ProgressCause::AcknowledgedIrq,),
+            Ok(sdio_host2::RequestProgress::Complete(Ok(
+                sdio_host2::RawResponse::new(sdio_host2::ResponseType::R1, [0; 4])
             )))
         );
         assert!(request.done);
@@ -337,7 +336,7 @@ mod tests {
 
     #[test]
     fn acknowledged_command_irq_advances_waiting_start_and_consumes_event() {
-        use sdmmc_host::SdMmcHost;
+        use sdio_host2::SdioHost;
 
         let mut mmio = [0u32; 256];
         let base = core::ptr::NonNull::new(mmio.as_mut_ptr().cast()).unwrap();
@@ -357,13 +356,13 @@ mod tests {
         let mut request = crate::TransactionRequest::command(
             host.host2_owner(),
             request_id,
-            sdmmc_host::ResponseType::R1b,
+            sdio_host2::ResponseType::R1b,
         );
 
         assert_eq!(
-            host.advance_transaction(&mut request, sdmmc_host::ProgressCause::AcknowledgedIrq,),
-            Ok(sdmmc_host::RequestProgress::Complete(Ok(
-                sdmmc_host::RawResponse::new(sdmmc_host::ResponseType::R1b, [0; 4])
+            host.advance_transaction(&mut request, sdio_host2::ProgressCause::AcknowledgedIrq,),
+            Ok(sdio_host2::RequestProgress::Complete(Ok(
+                sdio_host2::RawResponse::new(sdio_host2::ResponseType::R1b, [0; 4])
             )))
         );
         assert!(request.done);
@@ -371,7 +370,7 @@ mod tests {
 
     #[test]
     fn acknowledged_command_irq_survives_start_register_retry() {
-        use sdmmc_host::SdMmcHost;
+        use sdio_host2::SdioHost;
 
         const CMD_WORD: usize = 11;
         let mut mmio = [0u32; 256];
@@ -393,12 +392,12 @@ mod tests {
         let mut request = crate::TransactionRequest::command(
             host.host2_owner(),
             request_id,
-            sdmmc_host::ResponseType::None,
+            sdio_host2::ResponseType::None,
         );
 
         assert_eq!(
-            host.advance_transaction(&mut request, sdmmc_host::ProgressCause::AcknowledgedIrq,),
-            Ok(sdmmc_host::RequestProgress::RegisterPending {
+            host.advance_transaction(&mut request, sdio_host2::ProgressCause::AcknowledgedIrq,),
+            Ok(sdio_host2::RequestProgress::RegisterPending {
                 retry_after: PHYTIUM_REGISTER_RETRY_DELAY,
             })
         );
@@ -407,9 +406,9 @@ mod tests {
             mmio.as_mut_ptr().add(CMD_WORD).write_volatile(0);
         }
         assert_eq!(
-            host.advance_transaction(&mut request, sdmmc_host::ProgressCause::RegisterRetry,),
-            Ok(sdmmc_host::RequestProgress::Complete(Ok(
-                sdmmc_host::RawResponse::new(sdmmc_host::ResponseType::None, [0; 4])
+            host.advance_transaction(&mut request, sdio_host2::ProgressCause::RegisterRetry,),
+            Ok(sdio_host2::RequestProgress::Complete(Ok(
+                sdio_host2::RawResponse::new(sdio_host2::ResponseType::None, [0; 4])
             )))
         );
         assert_eq!(host.irq.state.pending_status(), 0);
@@ -418,7 +417,7 @@ mod tests {
 
     #[test]
     fn r1b_completion_waits_for_busy_release_after_command_irq() {
-        use sdmmc_host::SdMmcHost;
+        use sdio_host2::SdioHost;
 
         const STATUS_WORD: usize = 18;
         let mut mmio = [0u32; 256];
@@ -440,12 +439,12 @@ mod tests {
         let mut request = crate::TransactionRequest::command(
             host.host2_owner(),
             request_id,
-            sdmmc_host::ResponseType::R1b,
+            sdio_host2::ResponseType::R1b,
         );
 
         assert_eq!(
-            host.advance_transaction(&mut request, sdmmc_host::ProgressCause::AcknowledgedIrq,),
-            Ok(sdmmc_host::RequestProgress::RegisterPending {
+            host.advance_transaction(&mut request, sdio_host2::ProgressCause::AcknowledgedIrq,),
+            Ok(sdio_host2::RequestProgress::RegisterPending {
                 retry_after: PHYTIUM_REGISTER_RETRY_DELAY,
             })
         );
@@ -457,9 +456,9 @@ mod tests {
                 .write_volatile(crate::regs::Status::new().into_bits());
         }
         assert_eq!(
-            host.advance_transaction(&mut request, sdmmc_host::ProgressCause::RegisterRetry,),
-            Ok(sdmmc_host::RequestProgress::Complete(Ok(
-                sdmmc_host::RawResponse::new(sdmmc_host::ResponseType::R1b, [0; 4])
+            host.advance_transaction(&mut request, sdio_host2::ProgressCause::RegisterRetry,),
+            Ok(sdio_host2::RequestProgress::Complete(Ok(
+                sdio_host2::RawResponse::new(sdio_host2::ResponseType::R1b, [0; 4])
             )))
         );
         assert!(request.done);
@@ -492,7 +491,7 @@ mod tests {
 
     #[test]
     fn reset_all_restores_the_enabled_completion_irq_contract() {
-        use sdmmc_host::{BusOp, ProgressCause, RequestProgress, SdMmcHost};
+        use sdio_host2::{BusOp, ProgressCause, RequestProgress, SdioHost};
 
         const CTRL_WORD: usize = 0;
         const CMD_WORD: usize = 11;

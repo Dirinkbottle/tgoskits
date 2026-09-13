@@ -20,7 +20,7 @@ use page_table_generic::{PageTableEntry, PhysAddr, TableMeta, VirtAddr};
 pub use relocate::apply as relocate;
 
 use crate::{
-    ArchTrait, DCacheOp, SystimerArch,
+    ArchTrait, DCacheOp,
     mem::{MemAttributes, PageTableInfo, PteConfig, mmu},
     power::CpuOnError,
 };
@@ -72,7 +72,7 @@ static KERNEL_PAGE_TABLE_ADDR: AtomicUsize = AtomicUsize::new(0);
 static TIMEBASE_FREQ: AtomicUsize = AtomicUsize::new(0);
 
 #[cfg(feature = "thead-mae")]
-fn thead_mae_pte_bits(mem_attr: MemAttributes) -> usize {
+fn pte_memory_type_bits(mem_attr: MemAttributes) -> usize {
     match mem_attr {
         MemAttributes::Device => PTE_THEAD_IO,
         MemAttributes::Uncached => PTE_THEAD_NOCACHE,
@@ -81,7 +81,7 @@ fn thead_mae_pte_bits(mem_attr: MemAttributes) -> usize {
 }
 
 #[cfg(all(not(feature = "thead-mae"), feature = "svpbmt"))]
-fn thead_mae_pte_bits(mem_attr: MemAttributes) -> usize {
+fn pte_memory_type_bits(mem_attr: MemAttributes) -> usize {
     match mem_attr {
         MemAttributes::Device => PTE_PBMT_IO,
         MemAttributes::Uncached => PTE_PBMT_NC,
@@ -90,12 +90,12 @@ fn thead_mae_pte_bits(mem_attr: MemAttributes) -> usize {
 }
 
 #[cfg(not(any(feature = "thead-mae", feature = "svpbmt")))]
-fn thead_mae_pte_bits(_mem_attr: MemAttributes) -> usize {
+fn pte_memory_type_bits(_mem_attr: MemAttributes) -> usize {
     0
 }
 
 #[cfg(feature = "thead-mae")]
-fn thead_mae_mem_attr(bits: usize) -> MemAttributes {
+fn pte_memory_type(bits: usize) -> MemAttributes {
     match bits & PTE_THEAD_MT_MASK {
         PTE_THEAD_IO => MemAttributes::Device,
         PTE_THEAD_NOCACHE => MemAttributes::Uncached,
@@ -104,7 +104,7 @@ fn thead_mae_mem_attr(bits: usize) -> MemAttributes {
 }
 
 #[cfg(all(not(feature = "thead-mae"), feature = "svpbmt"))]
-fn thead_mae_mem_attr(bits: usize) -> MemAttributes {
+fn pte_memory_type(bits: usize) -> MemAttributes {
     match bits & PTE_PBMT_MASK {
         PTE_PBMT_IO => MemAttributes::Device,
         PTE_PBMT_NC => MemAttributes::Uncached,
@@ -113,7 +113,7 @@ fn thead_mae_mem_attr(bits: usize) -> MemAttributes {
 }
 
 #[cfg(not(any(feature = "thead-mae", feature = "svpbmt")))]
-fn thead_mae_mem_attr(_bits: usize) -> MemAttributes {
+fn pte_memory_type(_bits: usize) -> MemAttributes {
     MemAttributes::Normal
 }
 
@@ -145,7 +145,7 @@ impl PageTableEntry for Entry {
         if config.writable || config.dirty {
             bits |= PTE_D;
         }
-        bits |= thead_mae_pte_bits(config.mem_attr);
+        bits |= pte_memory_type_bits(config.mem_attr);
 
         bits |= ((paddr.as_usize() >> 12) & PTE_PPN_MASK) << SV39_PPN_SHIFT;
         Self(bits)
@@ -175,7 +175,7 @@ impl PageTableEntry for Entry {
             lower,
             dirty,
             global,
-            mem_attr: thead_mae_mem_attr(bits),
+            mem_attr: pte_memory_type(bits),
         }
     }
 
@@ -272,12 +272,8 @@ impl ArchTrait for Arch {
         vaddr
     }
 
-    fn virtual_address_space()
-    -> Result<crate::mem::VirtualAddressSpaceLayout, crate::mem::VirtualAddressSpaceError> {
-        crate::mem::VirtualAddressSpaceLayout::try_new(
-            crate::mem::configured_user_space(1usize << 38),
-            addrspace::PAGE_OFFSET..usize::MAX,
-        )
+    fn kernel_space() -> core::ops::Range<usize> {
+        addrspace::PAGE_OFFSET..usize::MAX
     }
 
     fn is_mmu_enabled() -> bool {
@@ -332,7 +328,7 @@ impl ArchTrait for Arch {
         _secondary_entry as *const ()
     }
 
-    fn kick_secondary_cpu(hartid: usize, entry: usize, arg: usize) -> Result<(), CpuOnError> {
+    fn cpu_on(hartid: usize, entry: usize, arg: usize) -> Result<(), CpuOnError> {
         match sbi::hart_start(hartid, entry, arg) {
             Ok(()) => Ok(()),
             Err(sbi::HartStartError::AlreadyAvailable | sbi::HartStartError::AlreadyStarted) => {
@@ -347,6 +343,52 @@ impl ArchTrait for Arch {
             ))),
         }
     }
+
+    fn systimer_enable() {
+        // Only bring the timer source into a known idle state here.
+        // IRQ masking/unmasking is controlled separately by the timer core.
+        let _ = sbi::set_timer(u64::MAX);
+    }
+
+    fn systimer_irq_enable() {
+        unsafe {
+            core::arch::asm!(
+                "csrs sie, {stie}",
+                stie = in(reg) SIE_STIE,
+                options(nostack, preserves_flags)
+            );
+        }
+    }
+
+    fn systimer_irq_disable() {
+        unsafe {
+            core::arch::asm!(
+                "csrc sie, {stie}",
+                stie = in(reg) SIE_STIE,
+                options(nostack, preserves_flags)
+            );
+        }
+    }
+
+    fn systimer_irq_is_enabled() -> bool {
+        let sie: usize;
+        unsafe {
+            core::arch::asm!("csrr {sie}, sie", sie = out(reg) sie, options(nostack, preserves_flags));
+        }
+        (sie & SIE_STIE) != 0
+    }
+
+    fn systimer_set_interval(ticks: usize) {
+        let now = Self::systimer_tick() as u64;
+        let next = if ticks == usize::MAX {
+            u64::MAX
+        } else {
+            now.saturating_add(ticks as u64).max(now + 1)
+        };
+        let _ = sbi::set_timer(next);
+    }
+
+    fn systimer_ack() {}
 
     fn systimer_freq() -> usize {
         let cached = TIMEBASE_FREQ.load(Ordering::Relaxed);
@@ -403,6 +445,20 @@ impl ArchTrait for Arch {
         }
     }
 
+    fn irq_is_enabled(irq: crate::irq::IrqId) -> bool {
+        irq == irq::systimer_irq() && Self::systimer_irq_is_enabled()
+    }
+
+    fn irq_set_enable(irq: crate::irq::IrqId, enable: bool) {
+        if irq == irq::systimer_irq() {
+            if enable {
+                Self::systimer_irq_enable();
+            } else {
+                Self::systimer_irq_disable();
+            }
+        }
+    }
+
     fn dcache_range(op: DCacheOp, addr: usize, size: usize) {
         #[cfg(feature = "thead-mae")]
         {
@@ -418,61 +474,27 @@ impl ArchTrait for Arch {
             riscv_dma_fence();
         }
     }
-}
 
-impl SystimerArch for Arch {
-    fn systimer_irq_id() -> crate::irq::IrqId {
-        irq::systimer_irq()
-    }
-
-    fn systimer_enable() {
-        // Only bring the timer source into a known idle state here.
-        // IRQ masking/unmasking is controlled separately by the timer core.
-        Self::systimer_irq_disable();
-        let _ = sbi::set_timer(u64::MAX);
-    }
-
-    fn systimer_irq_enable() {
-        unsafe {
-            core::arch::asm!(
-                "csrs sie, {stie}",
-                stie = in(reg) SIE_STIE,
-                options(nostack, preserves_flags)
-            );
+    unsafe fn efi_enter_kernel(system_table: *const ::core::ffi::c_void) -> bool {
+        #[cfg(efi)]
+        {
+            crate::efi_stub::setup_service(system_table);
+            let Some(hart_id) = efi::boot_hart_id() else {
+                println!("Failed to get RISC-V UEFI boot hart ID.");
+                return false;
+            };
+            println!("RISC-V UEFI boot hart ID: {hart_id}.");
+            let Some(fdt_addr) = crate::fdt::fdt_addr_phys() else {
+                println!("RISC-V UEFI did not provide a valid FDT.");
+                return false;
+            };
+            unsafe { crate::arch::entry::enter_from_efi(hart_id, fdt_addr) }
         }
-    }
-
-    fn systimer_irq_disable() {
-        unsafe {
-            core::arch::asm!(
-                "csrc sie, {stie}",
-                stie = in(reg) SIE_STIE,
-                options(nostack, preserves_flags)
-            );
+        #[cfg(not(efi))]
+        {
+            let _ = system_table;
+            false
         }
-    }
-
-    fn systimer_irq_is_enabled() -> bool {
-        let sie: usize;
-        unsafe {
-            core::arch::asm!("csrr {sie}, sie", sie = out(reg) sie, options(nostack, preserves_flags));
-        }
-        (sie & SIE_STIE) != 0
-    }
-
-    fn systimer_set_deadline(deadline_ticks: u64) {
-        let now = Self::systimer_tick() as u64;
-        let next = deadline_ticks.max(now.saturating_add(1));
-        let _ = sbi::set_timer(next);
-    }
-
-    fn systimer_requires_irq_quiesce() -> bool {
-        false
-    }
-
-    fn systimer_cancel_oneshot() {
-        Self::systimer_irq_disable();
-        let _ = sbi::set_timer(crate::timer::riscv64_interval::stopped_deadline());
     }
 }
 

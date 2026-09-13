@@ -357,10 +357,13 @@ mod tests {
             })
         );
     }
+}
 
-    #[test]
-    fn pci_enumeration_constants_cover_all_slots_and_functions() {
-        assert_eq!(MAX_DEVICE, 31);
-        assert_eq!(MAX_FUNCTION, 7);
-    }
+#[cfg(all(axtest, feature = "axtest"))]
+pub(crate) fn pci_constants_hold_for_test() -> bool {
+    // Test PCI constants
+    assert_eq!(MAX_DEVICE, 31);
+    assert_eq!(MAX_FUNCTION, 7);
+
+    true
 }

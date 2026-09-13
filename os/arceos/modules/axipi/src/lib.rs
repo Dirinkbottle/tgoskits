@@ -2,13 +2,8 @@
 //!
 //! Logical pending state belongs to each subsystem. A publisher must make its
 //! state visible with Release ordering before calling [`notify_cpu`]. The IPI
-//! controller must be acknowledged before entering the logical handler; the
-//! handler then calls [`claim_current_delivery`] before it observes and drains
-//! scheduler work or hard calls. This matches Linux's IPI doorbell ordering and
-//! lets a publication racing with draining obtain a fresh physical edge.
-//! [`IpiNotification::Coalesced`] acknowledges only that a physical edge is
-//! armed or its controller send is in flight; it does not acknowledge
-//! completion of any logical work.
+//! handler calls [`claim_current_delivery`] before checking those owners, so a
+//! publication racing with draining obtains a fresh physical edge.
 
 #![cfg_attr(not(test), no_std)]
 
@@ -27,6 +22,7 @@ use ax_hal::{
 use ax_lazyinit::LazyInit;
 
 mod hard_call;
+pub mod legacy;
 mod notification;
 
 #[cfg(test)]
@@ -81,6 +77,7 @@ pub fn init() {
         });
     }
 
+    legacy::init_current_queue();
     endpoint(CpuId(this_cpu_id()))
         .expect("current CPU must have a preallocated IPI endpoint")
         .state
@@ -121,16 +118,22 @@ pub fn wait_for_all_cpus_ready() {
 
 /// Returns whether `cpu_id` can receive and drain IPI work.
 pub fn is_cpu_ready(cpu_id: usize) -> bool {
-    endpoint(CpuId(cpu_id)).is_ok_and(|endpoint| {
-        endpoint_delivery_ready(endpoint.state.load(Ordering::Acquire)).unwrap_or(false)
-    })
+    endpoint(CpuId(cpu_id))
+        .is_ok_and(|endpoint| endpoint.state.load(Ordering::Acquire) == IPI_CPU_READY)
 }
 
-fn endpoint_delivery_ready(state: u8) -> Result<bool, u8> {
-    match state {
-        IPI_CPU_READY => Ok(true),
-        IPI_CPU_NOT_READY | IPI_CPU_INITIALIZING => Ok(false),
-        _ => Err(state),
+/// Waits through an in-progress endpoint transition and reports readiness.
+pub fn wait_until_cpu_ready(cpu_id: usize) -> bool {
+    let Ok(endpoint) = endpoint(CpuId(cpu_id)) else {
+        return false;
+    };
+    loop {
+        match endpoint.state.load(Ordering::Acquire) {
+            IPI_CPU_READY => return true,
+            IPI_CPU_NOT_READY => return false,
+            IPI_CPU_INITIALIZING => core::hint::spin_loop(),
+            _ => unreachable!("invalid IPI endpoint state"),
+        }
     }
 }
 
@@ -138,11 +141,7 @@ fn endpoint_delivery_ready(state: u8) -> Result<bool, u8> {
 ///
 /// The caller must publish its logical pending state or payload with Release
 /// ordering before calling this function. A delivery error does not consume or
-/// clear that owner state. [`IpiNotification::Coalesced`] means that a physical
-/// edge is already armed or its controller send is in flight, not that the
-/// caller's logical work has been drained. The in-flight case must remain
-/// wait-free because an IRQ may preempt the sender and publish more work for the
-/// same destination.
+/// clear that owner state.
 pub fn notify_cpu(cpu: CpuId) -> Result<IpiNotification, IrqError> {
     validate_target_cpu(cpu)?;
     endpoint(cpu)?.edge.notify(|| {
@@ -155,12 +154,7 @@ pub fn notify_cpu(cpu: CpuId) -> Result<IpiNotification, IrqError> {
     })
 }
 
-/// Claims the acknowledged physical delivery before logical owners are
-/// inspected.
-///
-/// The platform IRQ entry must have already cleared or priority-dropped the
-/// controller state for this IPI. Otherwise a racing publisher can re-arm the
-/// software edge while the controller still treats the old IPI as in service.
+/// Claims the current physical delivery before logical owners are inspected.
 pub fn claim_current_delivery() {
     endpoint(CpuId(this_cpu_id()))
         .expect("current CPU must have a preallocated IPI endpoint")
@@ -169,11 +163,6 @@ pub fn claim_current_delivery() {
 }
 
 /// Executes a raw operation synchronously on one CPU without allocation.
-///
-/// A remote caller spin-waits until the target completes the operation. This is
-/// intended for bounded, one-off hard-IRQ work, not bulk delivery or sustained
-/// pressure. A subsystem with queued work should publish its own logical state
-/// and use [`notify_cpu`] to coalesce physical delivery.
 ///
 /// # Safety
 ///
@@ -211,8 +200,7 @@ pub unsafe fn call_on_cpu(
 /// Drains at most 64 caller-owned hard calls on the current CPU.
 ///
 /// Any bounded remainder obtains a self-notification unless another publisher
-/// has already armed a fresh edge. This budget provides interrupt-transport
-/// fairness; it does not make [`call_on_cpu`] a batching interface.
+/// has already armed a fresh edge.
 pub fn drain_hard_calls() -> Result<(), IrqError> {
     let outcome = endpoint(CpuId(this_cpu_id()))?
         .hard_calls
@@ -226,7 +214,7 @@ pub fn drain_hard_calls() -> Result<(), IrqError> {
 
 pub(crate) fn validate_target_cpu(cpu: CpuId) -> Result<(), IrqError> {
     endpoint(cpu)?;
-    if !ax_hal::irq::is_cpu_online(cpu.0) || !is_cpu_ready(cpu.0) {
+    if !ax_hal::irq::is_cpu_online(cpu.0) || !wait_until_cpu_ready(cpu.0) {
         return Err(IrqError::CpuOffline);
     }
     Ok(())
@@ -239,12 +227,7 @@ fn endpoint(cpu: CpuId) -> Result<&'static CpuEndpoint, IrqError> {
         .ok_or(IrqError::InvalidCpu)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{IPI_CPU_INITIALIZING, endpoint_delivery_ready};
-
-    #[test]
-    fn initializing_endpoint_is_not_a_delivery_target() {
-        assert_eq!(endpoint_delivery_ready(IPI_CPU_INITIALIZING), Ok(false));
-    }
+pub(crate) fn remote_cpu_area(cpu: CpuId) -> Result<ax_percpu::PerCpuArea, IrqError> {
+    let index = ax_percpu::CpuIndex::try_from(cpu.0).map_err(|_| IrqError::InvalidCpu)?;
+    ax_percpu::area(index).map_err(|_| IrqError::CpuOffline)
 }

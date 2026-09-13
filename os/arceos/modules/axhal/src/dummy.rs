@@ -1,11 +1,12 @@
 //! Dummy implementation of platform-related interfaces defined in [`axplat`].
 
+#[cfg(feature = "irq")]
+use ax_plat::irq::{HwIrq, IpiTarget, IrqError, IrqId, IrqIf, IrqNumber, IrqSource, TrapVector};
 use ax_plat::{
-    console::{ConsoleDeviceIdError, ConsoleDeviceIdResult, ConsoleHandoffResult, ConsoleIf},
+    console::{ConsoleDeviceIdError, ConsoleDeviceIdResult, ConsoleIf},
     impl_plat_interface,
     init::InitIf,
-    irq::{HwIrq, IpiTarget, IrqError, IrqId, IrqIf, IrqNumber, IrqSource, TrapVector},
-    mem::{CpuSharedMemoryModel, DCacheOp, IomapAttrs, IomapDecision, IomapError, MemIf, RawRange},
+    mem::{DCacheOp, IomapAttrs, IomapDecision, IomapError, MemIf, RawRange},
     power::PowerIf,
     time::TimeIf,
 };
@@ -15,6 +16,7 @@ struct DummyConsole;
 struct DummyMem;
 struct DummyTime;
 struct DummyPower;
+#[cfg(feature = "irq")]
 struct DummyIrq;
 
 #[impl_plat_interface]
@@ -44,26 +46,17 @@ impl ConsoleIf for DummyConsole {
         Err(ConsoleDeviceIdError::NotSpecified)
     }
 
-    fn begin_runtime_handoff() -> ConsoleHandoffResult {
-        Ok(())
-    }
+    fn claim_runtime_output() {}
 
-    fn commit_runtime_handoff() -> ConsoleHandoffResult {
-        Ok(())
-    }
-
-    fn rollback_runtime_handoff() -> ConsoleHandoffResult {
-        Ok(())
-    }
-
-    fn fail_runtime_handoff_closed() {}
-
+    #[cfg(feature = "irq")]
     fn irq_num() -> Option<IrqId> {
         None
     }
 
+    #[cfg(feature = "irq")]
     fn set_input_irq_enabled(_enabled: bool) {}
 
+    #[cfg(feature = "irq")]
     fn handle_irq() -> ax_plat::console::ConsoleIrqEvent {
         ax_plat::console::ConsoleIrqEvent::empty()
     }
@@ -71,10 +64,6 @@ impl ConsoleIf for DummyConsole {
 
 #[impl_plat_interface]
 impl MemIf for DummyMem {
-    fn cpu_shared_memory_model() -> CpuSharedMemoryModel {
-        CpuSharedMemoryModel::Coherent
-    }
-
     fn phys_ram_ranges() -> &'static [RawRange] {
         &[]
     }
@@ -103,12 +92,8 @@ impl MemIf for DummyMem {
         pa!(0)
     }
 
-    fn virtual_address_space()
-    -> Result<ax_plat::mem::VirtualAddressSpaceLayout, ax_plat::mem::VirtualAddressSpaceError> {
-        ax_plat::mem::VirtualAddressSpaceLayout::try_new(
-            ax_memory_addr::VirtAddrRange::new(va!(0), va!(1usize << 47)),
-            ax_memory_addr::VirtAddrRange::new(va!(0), va!(0)),
-        )
+    fn kernel_aspace() -> (ax_memory_addr::VirtAddr, usize) {
+        (va!(0), 0)
     }
 
     fn user_aspace_needs_kernel_mappings() -> bool {
@@ -117,9 +102,9 @@ impl MemIf for DummyMem {
 
     fn dcache_range(_op: DCacheOp, _addr: ax_memory_addr::VirtAddr, _size: usize) {}
 
-    fn dma_coherent_before_map_uncached(_addr: ax_memory_addr::VirtAddr, _size: usize) {}
+    fn dma_coherent_before_make_uncached(_addr: ax_memory_addr::VirtAddr, _size: usize) {}
 
-    fn dma_coherent_before_unmap_uncached(_addr: ax_memory_addr::VirtAddr, _size: usize) {}
+    fn dma_coherent_before_restore_cached(_addr: ax_memory_addr::VirtAddr, _size: usize) {}
 
     fn dma_coherent_after_mapping_update() {}
 }
@@ -134,10 +119,6 @@ impl TimeIf for DummyTime {
         ticks
     }
 
-    fn scheduler_clock_raw_nanos() -> u64 {
-        0
-    }
-
     fn nanos_to_ticks(nanos: u64) -> u64 {
         nanos
     }
@@ -150,22 +131,19 @@ impl TimeIf for DummyTime {
         0
     }
 
+    #[cfg(feature = "irq")]
     fn irq_num() -> IrqId {
         IrqNumber(0).expect("dummy legacy IRQ exceeds legacy IRQ width")
     }
 
+    #[cfg(feature = "irq")]
     fn set_oneshot_timer(_deadline_ns: u64) {}
-    fn oneshot_timer_requires_irq_quiesce() -> bool {
-        false
-    }
-    fn resume_oneshot_timer(_deadline_ns: u64) {}
-    fn cancel_oneshot_timer() {}
 }
 
 #[impl_plat_interface]
 impl PowerIf for DummyPower {
     #[cfg(feature = "smp")]
-    fn cpu_boot(_cpu_id: usize) {}
+    fn cpu_boot(_cpu_id: usize, _stack_top_paddr: usize) {}
 
     fn system_off() -> ! {
         unimplemented!()
@@ -180,6 +158,7 @@ impl PowerIf for DummyPower {
     }
 }
 
+#[cfg(feature = "irq")]
 #[impl_plat_interface]
 impl IrqIf for DummyIrq {
     fn prepare(_vector: TrapVector) {}
@@ -211,7 +190,7 @@ impl IrqIf for DummyIrq {
         Err(ax_plat::irq::IrqError::Unsupported)
     }
 
-    fn handle(_irq: TrapVector, _origin: ax_plat::irq::IrqOrigin) -> Option<IrqId> {
+    fn handle(_irq: TrapVector) -> Option<IrqId> {
         None
     }
 

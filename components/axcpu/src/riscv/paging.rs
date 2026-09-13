@@ -32,6 +32,10 @@ bitflags::bitflags! {
         const C = 1 << 62;
         #[cfg(feature = "xuantie-c9xx")]
         const SO = 1 << 63;
+        #[cfg(feature = "svpbmt")]
+        const PBMT_NC = 1 << 61;
+        #[cfg(feature = "svpbmt")]
+        const PBMT_IO = 1 << 62;
     }
 }
 
@@ -42,6 +46,11 @@ pub struct Rv64Pte(u64);
 
 impl Rv64Pte {
     const PHYS_ADDR_MASK: u64 = (1 << 54) - (1 << 10);
+
+    #[cfg(test)]
+    pub(crate) const fn raw_for_test(self) -> u64 {
+        self.0
+    }
 
     fn flags(self) -> RvPteFlags {
         RvPteFlags::from_bits_truncate(self.0)
@@ -76,6 +85,14 @@ impl Rv64Pte {
                 flags |= RvPteFlags::SH | RvPteFlags::B;
             } else {
                 flags |= RvPteFlags::SH | RvPteFlags::B | RvPteFlags::C;
+            }
+        }
+        #[cfg(all(not(feature = "xuantie-c9xx"), feature = "svpbmt"))]
+        {
+            if config.contains(MappingFlags::DEVICE) {
+                flags |= RvPteFlags::PBMT_IO;
+            } else if config.contains(MappingFlags::UNCACHED) {
+                flags |= RvPteFlags::PBMT_NC;
             }
         }
         flags
@@ -121,6 +138,14 @@ impl PageTableEntry for Rv64Pte {
             if flags.contains(RvPteFlags::SO) {
                 config |= MappingFlags::DEVICE;
             } else if !flags.contains(RvPteFlags::C) {
+                config |= MappingFlags::UNCACHED;
+            }
+        }
+        #[cfg(all(not(feature = "xuantie-c9xx"), feature = "svpbmt"))]
+        {
+            if flags.contains(RvPteFlags::PBMT_IO) {
+                config |= MappingFlags::DEVICE;
+            } else if flags.contains(RvPteFlags::PBMT_NC) {
                 config |= MappingFlags::UNCACHED;
             }
         }

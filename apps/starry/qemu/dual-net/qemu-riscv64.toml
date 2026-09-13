@@ -2,8 +2,6 @@ args = [
     "-nographic",
     "-m",
     "512M",
-    "-smp",
-    "4",
     "-cpu",
     "rv64",
     "-device",

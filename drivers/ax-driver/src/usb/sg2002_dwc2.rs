@@ -20,7 +20,7 @@ use sg200x_bsp::{
     },
 };
 
-use super::{ProbeFdtUsbHost, usb_device_dma, usb_runtime};
+use super::{ProbeFdtUsbHost, usb_kernel};
 use crate::mmio::iomap;
 
 const DRIVER_NAME: &str = "usb-sg2002-dwc2";
@@ -106,8 +106,7 @@ fn probe(probe: ProbeFdt<'_>) -> Result<(), OnProbeError> {
     let ctrl = map_reg(resources.ctrl, DWC2_MMIO_DEFAULT_SIZE)?;
     let host = USBHost::new_dwc2(Dwc2NewParams {
         mmio: ctrl,
-        dma: usb_device_dma(crate::binding_resolver::dma_coherency_from_fdt(info)),
-        kernel: usb_runtime(),
+        kernel: usb_kernel(),
         params: resources.params,
     })
     .map_err(|err| {

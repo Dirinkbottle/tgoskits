@@ -4,6 +4,7 @@
 use crate::ax_err_type;
 
 pub mod fdt;
+pub mod guest_platform;
 pub mod images;
 mod policy;
 mod prepared;
@@ -17,7 +18,7 @@ pub use prepared::{PreparedGuestBoot, prepare_guest_boot};
 
 /// Initializes architecture-owned guest firmware resources.
 pub fn init_guest_boot_resources() {
-    crate::arch::current::init_guest_boot_resources();
+    crate::arch::init_guest_boot_resources();
 }
 
 /// Build-time image bytes supplied by the hypervisor application.

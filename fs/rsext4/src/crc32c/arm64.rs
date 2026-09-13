@@ -41,6 +41,8 @@ use core::arch::aarch64::{__crc32cb, __crc32cd, __crc32ch, __crc32cw};
 #[inline]
 #[allow(dead_code)]
 pub fn has_hardware_crc32() -> bool {
+    use log::warn;
+
     let mut reg_val: u64;
     unsafe {
         // mrs: Move from System Register to general purpose register
@@ -49,9 +51,15 @@ pub fn has_hardware_crc32() -> bool {
 
     // Bits [19:16] encode CRC32 feature support.
     let crc_field = (reg_val >> 16) & 0xF;
-
+    warn!("ID_AA64ISAR0_EL1[19:16]: {crc_field:#x}");
     // `>= 1` means CRC32 and CRC32C instructions are present.
-    crc_field >= 1
+    if crc_field >= 1 {
+        warn!("Hardware CRC32C support detected.");
+        true
+    } else {
+        warn!("No hardware CRC32C support.");
+        false
+    }
 }
 
 /// Computes CRC32C with ARMv8 hardware instructions.

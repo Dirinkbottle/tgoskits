@@ -1,52 +1,42 @@
 #![cfg(not(target_os = "none"))]
 
-use crab_uvc::{UncompressedFormat, UvcDeviceState, VideoControlEvent, VideoFormat};
+use crab_uvc::{
+    UncompressedFormat, UvcDeviceState, VideoControlEvent, VideoFormat, VideoFormatType,
+};
 
 #[test]
 fn test_video_format_creation() {
-    let mjpeg_format = VideoFormat::Mjpeg {
+    let mjpeg_format = VideoFormat {
         width: 1920,
         height: 1080,
         frame_rate: 30,
+        format_type: VideoFormatType::Mjpeg,
+        max_frame_size: 1_048_576,
     };
 
-    match mjpeg_format {
-        VideoFormat::Mjpeg {
-            width,
-            height,
-            frame_rate,
-        } => {
-            assert_eq!(width, 1920);
-            assert_eq!(height, 1080);
-            assert_eq!(frame_rate, 30);
-        }
-        _ => panic!("Unexpected format type"),
-    }
+    assert_eq!(mjpeg_format.width, 1920);
+    assert_eq!(mjpeg_format.height, 1080);
+    assert_eq!(mjpeg_format.frame_rate, 30);
+    assert!(matches!(mjpeg_format.format_type, VideoFormatType::Mjpeg));
 }
 
 #[test]
 fn test_uncompressed_format_creation() {
-    let yuy2_format = VideoFormat::Uncompressed {
+    let yuy2_format = VideoFormat {
         width: 640,
         height: 480,
         frame_rate: 30,
-        format_type: UncompressedFormat::Yuy2,
+        format_type: VideoFormatType::Uncompressed(UncompressedFormat::Yuy2),
+        max_frame_size: 614_400,
     };
 
-    match yuy2_format {
-        VideoFormat::Uncompressed {
-            width,
-            height,
-            frame_rate,
-            format_type,
-        } => {
-            assert_eq!(width, 640);
-            assert_eq!(height, 480);
-            assert_eq!(frame_rate, 30);
-            assert_eq!(format_type, UncompressedFormat::Yuy2);
-        }
-        _ => panic!("Unexpected format type"),
-    }
+    assert_eq!(yuy2_format.width, 640);
+    assert_eq!(yuy2_format.height, 480);
+    assert_eq!(yuy2_format.frame_rate, 30);
+    assert_eq!(
+        yuy2_format.format_type,
+        VideoFormatType::Uncompressed(UncompressedFormat::Yuy2)
+    );
 }
 
 #[test]
@@ -90,24 +80,30 @@ fn test_device_states() {
 
 #[test]
 fn test_format_equality() {
-    let format1 = VideoFormat::Mjpeg {
+    let format1 = VideoFormat {
         width: 640,
         height: 480,
         frame_rate: 30,
+        format_type: VideoFormatType::Mjpeg,
+        max_frame_size: 262_144,
     };
 
-    let format2 = VideoFormat::Mjpeg {
+    let format2 = VideoFormat {
         width: 640,
         height: 480,
         frame_rate: 30,
+        format_type: VideoFormatType::Mjpeg,
+        max_frame_size: 262_144,
     };
 
     assert_eq!(format1, format2);
 
-    let format3 = VideoFormat::Mjpeg {
+    let format3 = VideoFormat {
         width: 1280,
         height: 720,
         frame_rate: 30,
+        format_type: VideoFormatType::Mjpeg,
+        max_frame_size: 524_288,
     };
 
     assert_ne!(format1, format3);

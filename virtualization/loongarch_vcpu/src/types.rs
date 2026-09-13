@@ -7,7 +7,6 @@ pub enum LoongArchVcpuError {
     InvalidInput,
     Unsupported,
     BadState,
-    TimerUnavailable,
 }
 
 macro_rules! define_addr_type {

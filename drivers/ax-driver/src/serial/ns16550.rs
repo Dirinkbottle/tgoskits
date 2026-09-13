@@ -64,15 +64,8 @@ fn probe(probe: ProbeFdt<'_>) -> Result<(), OnProbeError> {
 
     for compatible in node.compatibles() {
         if compatible == "snps,dw-apb-uart" {
-            let default_clock = if node
-                .compatibles()
-                .any(|compatible| compatible == "rockchip,rk3588-uart")
-            {
-                serial_ns16550::dw_apb::RK3588_UART_CLOCK
-            } else {
-                serial_ns16550::dw_apb::SG2002_UART_CLOCK
-            };
-            let clock_freq = prop_u32(node, "clock-frequency").unwrap_or(default_clock);
+            let clock_freq = prop_u32(node, "clock-frequency")
+                .unwrap_or(serial_ns16550::dw_apb::SG2002_UART_CLOCK);
             let raw = serial_ns16550::DwApbUart::new_raw(mmio_base, clock_freq);
             serial = Some(erase_uart(raw));
             break;

@@ -9,7 +9,7 @@ use std::{
 
 use buddy_slab_allocator::{
     __reset_global_allocator_singleton_for_tests, GlobalAllocator, PerCpuSlab, SlabPoolTrait,
-    interface::BuddySlabIf,
+    eii::{slab_pool_impl, virt_to_phys_impl},
 };
 use rand::{SeedableRng, rngs::StdRng};
 
@@ -80,17 +80,14 @@ fn test_slab_pool_ref() -> &'static TestSlabPool {
     })
 }
 
-struct TestBuddySlabIf;
+#[virt_to_phys_impl]
+fn test_virt_to_phys(vaddr: usize) -> usize {
+    lowmem_map(vaddr)
+}
 
-#[ax_crate_interface::impl_interface]
-impl BuddySlabIf for TestBuddySlabIf {
-    fn virt_to_phys(vaddr: usize) -> usize {
-        lowmem_map(vaddr)
-    }
-
-    fn slab_pool() -> &'static dyn SlabPoolTrait {
-        test_slab_pool_ref()
-    }
+#[slab_pool_impl]
+fn test_slab_pool() -> &'static dyn SlabPoolTrait {
+    test_slab_pool_ref()
 }
 
 pub fn set_current_cpu(cpu: usize) {

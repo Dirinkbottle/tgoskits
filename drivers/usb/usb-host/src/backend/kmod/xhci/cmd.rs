@@ -1,7 +1,6 @@
 use alloc::sync::Arc;
 
-use ax_sync::{SpinLock as Mutex, SpinRwLock as RwLock};
-use dma_api::DmaDirection;
+use ax_kspin::{SpinRaw as Mutex, SpinRwLock as RwLock};
 use mbarrier::wmb;
 use usb_if::err::TransferError;
 use xhci::{
@@ -17,7 +16,7 @@ pub struct CommandRing(Arc<Mutex<Inner>>);
 
 impl CommandRing {
     pub fn new(
-        direction: DmaDirection,
+        direction: crate::osal::DmaDirection,
         dma: &Kernel,
         reg: Arc<RwLock<XhciRegisters>>,
     ) -> crate::err::Result<Self> {
@@ -27,20 +26,17 @@ impl CommandRing {
     }
 
     pub fn bus_addr(&self) -> crate::BusAddr {
-        // SAFETY: command-ring access excludes local xHCI event re-entry.
-        let inner = unsafe { self.0.lock_raw() };
+        let inner = self.0.lock();
         inner.ring.bus_addr()
     }
 
     pub fn cycle(&self) -> bool {
-        // SAFETY: command-ring access excludes local xHCI event re-entry.
-        let inner = unsafe { self.0.lock_raw() };
+        let inner = self.0.lock();
         inner.ring.cycle()
     }
 
     pub fn finished_handle(&self) -> Finished<CommandCompletion> {
-        // SAFETY: command-ring access excludes local xHCI event re-entry.
-        let inner = unsafe { self.0.lock_raw() };
+        let inner = self.0.lock();
         inner.ring.finished_handle()
     }
 
@@ -50,8 +46,7 @@ impl CommandRing {
     ) -> Result<CommandCompletion, TransferError> {
         trace!("[xhci-cmd] submit begin: {trb:?}");
         let fur = {
-            // SAFETY: command submission excludes local xHCI event re-entry.
-            let mut inner = unsafe { self.0.lock_raw() };
+            let mut inner = self.0.lock();
             let trb_addr = inner.ring.enque_command(trb);
             trace!("[xhci-cmd] TRB queued: addr={:#x}", trb_addr.raw());
             let fur = inner.ring.take_finished_future(trb_addr);

@@ -72,45 +72,45 @@ const PHYTIUM_CLOCK_POLLS: u32 = 1_000_000;
 impl PhytiumMci {
     pub(super) fn prepare_host2_bus_op(
         &self,
-        op: sdmmc_host::BusOp,
-    ) -> Result<BusRequestState, sdmmc_host::Error> {
+        op: sdio_host2::BusOp,
+    ) -> Result<BusRequestState, sdio_host2::Error> {
         match op {
-            sdmmc_host::BusOp::ResetAll => Ok(BusRequestState::ResetAll {
+            sdio_host2::BusOp::ResetAll => Ok(BusRequestState::ResetAll {
                 state: PhytiumResetState::Start,
                 restore_completion_irq: self.completion_irq_enabled(),
             }),
-            sdmmc_host::BusOp::ResetCommandLine => Err(sdmmc_host::Error::Unsupported),
-            sdmmc_host::BusOp::ResetDataLine => Ok(BusRequestState::ResetDataLine {
+            sdio_host2::BusOp::ResetCommandLine => Err(sdio_host2::Error::Unsupported),
+            sdio_host2::BusOp::ResetDataLine => Ok(BusRequestState::ResetDataLine {
                 started: false,
                 polls: 0,
             }),
-            sdmmc_host::BusOp::PowerOn => Ok(BusRequestState::PowerOn),
-            sdmmc_host::BusOp::PowerOff => Ok(BusRequestState::PowerOff),
-            sdmmc_host::BusOp::SetClock(speed) => {
+            sdio_host2::BusOp::PowerOn => Ok(BusRequestState::PowerOn),
+            sdio_host2::BusOp::PowerOff => Ok(BusRequestState::PowerOff),
+            sdio_host2::BusOp::SetClock(speed) => {
                 let timing =
                     timing::TimingTable::sd_for_speed(speed).map_err(map_protocol_error)?;
                 Ok(BusRequestState::SetClock(PhytiumClockState::Start {
                     timing,
                 }))
             }
-            sdmmc_host::BusOp::SetClockHz(_) => Err(sdmmc_host::Error::Unsupported),
-            sdmmc_host::BusOp::SetBusWidth(width) => Ok(BusRequestState::SetBusWidth(width)),
-            sdmmc_host::BusOp::SetSignalVoltage(voltage) => {
+            sdio_host2::BusOp::SetClockHz(_) => Err(sdio_host2::Error::Unsupported),
+            sdio_host2::BusOp::SetBusWidth(width) => Ok(BusRequestState::SetBusWidth(width)),
+            sdio_host2::BusOp::SetSignalVoltage(voltage) => {
                 uhs_bits_after_voltage(self.regs.uhs().read(), voltage)
                     .map_err(map_protocol_error)?;
                 Ok(BusRequestState::SetSignalVoltage(
                     PhytiumVoltageState::Start(voltage),
                 ))
             }
-            sdmmc_host::BusOp::ExecuteTuning { .. } => Err(sdmmc_host::Error::Unsupported),
-            _ => Err(sdmmc_host::Error::Unsupported),
+            sdio_host2::BusOp::ExecuteTuning { .. } => Err(sdio_host2::Error::Unsupported),
+            _ => Err(sdio_host2::Error::Unsupported),
         }
     }
 
     pub(super) fn advance_host2_bus_state(
         &mut self,
         state: &mut BusRequestState,
-    ) -> Result<sdmmc_host::RequestProgress<()>, sdmmc_host::Error> {
+    ) -> Result<sdio_host2::RequestProgress<()>, sdio_host2::Error> {
         match state {
             BusRequestState::ResetAll {
                 state,
@@ -121,16 +121,16 @@ impl PhytiumMci {
             }
             BusRequestState::PowerOn => {
                 self.regs.pwren().write(1);
-                Ok(sdmmc_host::RequestProgress::Complete(Ok(())))
+                Ok(sdio_host2::RequestProgress::Complete(Ok(())))
             }
             BusRequestState::PowerOff => {
                 self.regs.pwren().write(0);
-                Ok(sdmmc_host::RequestProgress::Complete(Ok(())))
+                Ok(sdio_host2::RequestProgress::Complete(Ok(())))
             }
             BusRequestState::SetClock(clock) => self.advance_host2_clock(clock),
             BusRequestState::SetBusWidth(width) => {
                 PhytiumMci::set_bus_width(self, *width);
-                Ok(sdmmc_host::RequestProgress::Complete(Ok(())))
+                Ok(sdio_host2::RequestProgress::Complete(Ok(())))
             }
             BusRequestState::SetSignalVoltage(voltage) => self.advance_host2_voltage(voltage),
         }
@@ -140,7 +140,7 @@ impl PhytiumMci {
         &mut self,
         state: &mut PhytiumResetState,
         restore_completion_irq: bool,
-    ) -> Result<sdmmc_host::RequestProgress<()>, sdmmc_host::Error> {
+    ) -> Result<sdio_host2::RequestProgress<()>, sdio_host2::Error> {
         match state {
             PhytiumResetState::Start => {
                 self.regs.clkena().write(crate::regs::ClkEna::new());
@@ -210,7 +210,7 @@ impl PhytiumMci {
             PhytiumResetState::InitClock(clock) => {
                 let progress = self.advance_host2_clock(clock)?;
                 if restore_completion_irq
-                    && matches!(progress, sdmmc_host::RequestProgress::Complete(Ok(())))
+                    && matches!(progress, sdio_host2::RequestProgress::Complete(Ok(())))
                 {
                     self.enable_completion_irq();
                 }
@@ -223,13 +223,13 @@ impl PhytiumMci {
         &mut self,
         started: &mut bool,
         polls: &mut u32,
-    ) -> Result<sdmmc_host::RequestProgress<()>, sdmmc_host::Error> {
+    ) -> Result<sdio_host2::RequestProgress<()>, sdio_host2::Error> {
         if !*started {
             self.regs.ctrl().update(|r| r.with_fifo_reset(true));
             *started = true;
         }
         if !self.regs.ctrl().read().fifo_reset() {
-            return Ok(sdmmc_host::RequestProgress::Complete(Ok(())));
+            return Ok(sdio_host2::RequestProgress::Complete(Ok(())));
         }
         if *polls >= PHYTIUM_RESET_POLLS {
             return Err(map_protocol_error(Error::Timeout(ErrorContext::new(
@@ -243,7 +243,7 @@ impl PhytiumMci {
     fn advance_host2_clock(
         &mut self,
         state: &mut PhytiumClockState,
-    ) -> Result<sdmmc_host::RequestProgress<()>, sdmmc_host::Error> {
+    ) -> Result<sdio_host2::RequestProgress<()>, sdio_host2::Error> {
         match state {
             PhytiumClockState::Start { timing } => {
                 self.use_hold_reg = timing.use_hold;
@@ -290,7 +290,7 @@ impl PhytiumMci {
             }
             PhytiumClockState::WaitEnable { polls } => {
                 if self.update_clock_complete(polls)? {
-                    return Ok(sdmmc_host::RequestProgress::Complete(Ok(())));
+                    return Ok(sdio_host2::RequestProgress::Complete(Ok(())));
                 }
                 Ok(register_pending())
             }
@@ -300,7 +300,7 @@ impl PhytiumMci {
     fn advance_host2_voltage(
         &mut self,
         state: &mut PhytiumVoltageState,
-    ) -> Result<sdmmc_host::RequestProgress<()>, sdmmc_host::Error> {
+    ) -> Result<sdio_host2::RequestProgress<()>, sdio_host2::Error> {
         match state {
             PhytiumVoltageState::Start(voltage) => {
                 let next = uhs_bits_after_voltage(self.regs.uhs().read(), *voltage)
@@ -312,7 +312,7 @@ impl PhytiumMci {
             }
             PhytiumVoltageState::WaitUpdate { polls } => {
                 if self.update_clock_complete(polls)? {
-                    return Ok(sdmmc_host::RequestProgress::Complete(Ok(())));
+                    return Ok(sdio_host2::RequestProgress::Complete(Ok(())));
                 }
                 Ok(register_pending())
             }
@@ -329,7 +329,7 @@ impl PhytiumMci {
         );
     }
 
-    fn update_clock_complete(&self, polls: &mut u32) -> Result<bool, sdmmc_host::Error> {
+    fn update_clock_complete(&self, polls: &mut u32) -> Result<bool, sdio_host2::Error> {
         if !self.regs.cmd().read().start_cmd() {
             return Ok(true);
         }
@@ -344,15 +344,15 @@ impl PhytiumMci {
     pub(super) fn check_host2_bus_request(
         &self,
         request: &BusRequest,
-    ) -> Result<(), sdmmc_host::AdvanceRequestError> {
+    ) -> Result<(), sdio_host2::AdvanceRequestError> {
         if request.done {
-            return Err(sdmmc_host::AdvanceRequestError::AlreadyCompleted);
+            return Err(sdio_host2::AdvanceRequestError::AlreadyCompleted);
         }
         if request.owner != self.host2_owner() {
-            return Err(sdmmc_host::AdvanceRequestError::WrongOwner);
+            return Err(sdio_host2::AdvanceRequestError::WrongOwner);
         }
         if self.host2_active_id != Some(request.id) {
-            return Err(sdmmc_host::AdvanceRequestError::StaleGeneration);
+            return Err(sdio_host2::AdvanceRequestError::StaleGeneration);
         }
         Ok(())
     }
@@ -364,7 +364,7 @@ impl PhytiumMci {
     pub(super) fn abort_host2_bus_state(
         &mut self,
         state: &mut BusRequestState,
-    ) -> Result<(), sdmmc_host::Error> {
+    ) -> Result<(), sdio_host2::Error> {
         match state {
             BusRequestState::ResetAll { .. }
             | BusRequestState::SetClock(_)

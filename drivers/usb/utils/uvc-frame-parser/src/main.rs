@@ -194,6 +194,7 @@ fn parse_video_format_from_log(line: &str) -> Result<VideoFormat, Box<dyn std::e
             height: height as u16,
             frame_rate,
             format_type: VideoFormatType::Mjpeg,
+            max_frame_size: 0,
         })
     } else if line.contains("Uncompressed") {
         let width = extract_field_value(line, "width")?;
@@ -218,6 +219,7 @@ fn parse_video_format_from_log(line: &str) -> Result<VideoFormat, Box<dyn std::e
             height: height as u16,
             frame_rate,
             format_type: VideoFormatType::Uncompressed(format_type),
+            max_frame_size: 0,
         })
     } else if line.contains("H264") {
         let width = extract_field_value(line, "width")?;
@@ -229,6 +231,7 @@ fn parse_video_format_from_log(line: &str) -> Result<VideoFormat, Box<dyn std::e
             height: height as u16,
             frame_rate,
             format_type: VideoFormatType::H264,
+            max_frame_size: 0,
         })
     } else {
         Err("Unsupported video format in log".into())

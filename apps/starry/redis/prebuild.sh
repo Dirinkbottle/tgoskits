@@ -107,7 +107,7 @@ run_guest_apk() {
 }
 
 extract_rootfs() {
-    debugfs -R "rdump / $staging_root" "$rootfs" >/dev/null
+    debugfs -R "rdump / $staging_root" "$rootfs"
 }
 
 install_redis_package() {

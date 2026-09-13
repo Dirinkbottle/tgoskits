@@ -28,10 +28,9 @@ impl Read for StdinRaw {
 
 impl Write for StdoutRaw {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        Ok(ax_api::stdio::ax_console_write_bytes(buf)?)
+        ax_api::stdio::ax_console_write_bytes(buf)
     }
     fn flush(&mut self) -> io::Result<()> {
-        ax_api::stdio::ax_console_flush()?;
         Ok(())
     }
 }
@@ -75,13 +74,13 @@ impl Read for Stdin {
         if buf.is_empty() || read_len > 0 {
             return Ok(read_len);
         }
-        // Sleep until the runtime RX worker publishes progress, then retry.
+        // try again until we got something
         loop {
-            ax_api::stdio::ax_console_wait_readable()?;
             let read_len = self.inner.lock().read(buf)?;
             if read_len > 0 {
                 return Ok(read_len);
             }
+            crate::thread::yield_now();
         }
     }
 }
@@ -174,8 +173,8 @@ pub fn stdout() -> Stdout {
 #[doc(hidden)]
 pub fn __print_impl(args: core::fmt::Arguments) {
     if cfg!(feature = "smp") {
-        // The runtime serializes formatted user output on the sleepable TTY
-        // path; kernel logs use a separate non-blocking mailbox.
+        // synchronize using the lock in ax-log, to avoid interleaving
+        // with kernel logs
         ax_api::stdio::ax_console_write_fmt(args).unwrap();
     } else {
         stdout().lock().write_fmt(args).unwrap();

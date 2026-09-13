@@ -11,7 +11,7 @@ fn idmac_interrupt_mask_matches_linux_phytium_error_contract() {
 use core::ptr::NonNull;
 
 use ::alloc::{alloc, boxed::Box};
-use sdmmc_protocol::{block::BlockProgress, sdio::host::SdMmcIrqHandle};
+use sdmmc_protocol::{block::BlockProgress, sdio::host::SdioIrqHandle};
 
 use crate::regs::RIntSts;
 
@@ -22,14 +22,7 @@ struct NoopDmaBuffer;
 
 impl NoopDmaBuffer {
     fn progress() -> DmaProgress {
-        let dma = DeviceDma::new(
-            dma_api::DmaDeviceInfo::new(
-                dma_api::DmaDomainId::Direct,
-                dma_api::DmaCoherency::NonCoherent,
-                dma_api::DmaConstraints::new(u64::MAX),
-            ),
-            &TEST_DMA,
-        );
+        let dma = DeviceDma::new_legacy(u64::MAX, &TEST_DMA);
         let buffer = CpuDmaBuffer::new_zero(
             &dma,
             NonZeroUsize::new(BLOCK_SIZE).unwrap(),
@@ -60,9 +53,7 @@ impl dma_api::DmaOp for TestDma {
     ) -> Option<dma_api::DmaAllocHandle> {
         let ptr = unsafe { alloc::alloc_zeroed(layout) };
         let ptr = NonNull::new(ptr)?;
-        Some(unsafe {
-            dma_api::DmaAllocHandle::new(ptr, ptr, (ptr.as_ptr() as u64).into(), layout)
-        })
+        Some(unsafe { dma_api::DmaAllocHandle::new(ptr, (ptr.as_ptr() as u64).into(), layout) })
     }
 
     unsafe fn dealloc_contiguous(&self, handle: dma_api::DmaAllocHandle) {
@@ -76,9 +67,7 @@ impl dma_api::DmaOp for TestDma {
     ) -> Option<dma_api::DmaAllocHandle> {
         let ptr = unsafe { alloc::alloc_zeroed(layout) };
         let ptr = NonNull::new(ptr)?;
-        Some(unsafe {
-            dma_api::DmaAllocHandle::new(ptr, ptr, (ptr.as_ptr() as u64).into(), layout)
-        })
+        Some(unsafe { dma_api::DmaAllocHandle::new(ptr, (ptr.as_ptr() as u64).into(), layout) })
     }
 
     unsafe fn dealloc_coherent(
@@ -276,7 +265,7 @@ fn stop_completion_consumes_fast_cmd12_irq_without_second_wakeup() {
             &mut request,
             id,
             &mut slot,
-            sdmmc_host::ProgressCause::AcknowledgedIrq,
+            sdio_host2::ProgressCause::AcknowledgedIrq,
         )
         .unwrap(),
         DataCommandProgress::Complete(Response::Empty)
@@ -287,14 +276,7 @@ fn stop_completion_consumes_fast_cmd12_irq_without_second_wakeup() {
 
 #[test]
 fn request_slot_returns_completed_owned_dma_once() {
-    let dma = DeviceDma::new(
-        dma_api::DmaDeviceInfo::new(
-            dma_api::DmaDomainId::Direct,
-            dma_api::DmaCoherency::NonCoherent,
-            dma_api::DmaConstraints::new(u64::MAX),
-        ),
-        &TEST_DMA,
-    );
+    let dma = DeviceDma::new_legacy(u64::MAX, &TEST_DMA);
     let buffer = dma_api::CpuDmaBuffer::new_zero(
         &dma,
         NonZeroUsize::new(BLOCK_SIZE).unwrap(),

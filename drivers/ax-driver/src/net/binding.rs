@@ -1,13 +1,12 @@
 extern crate alloc;
 
-use alloc::{boxed::Box, format};
+use alloc::boxed::Box;
 
-use dma_api::DeviceDma;
-use rd_net::{NetDevice, NetError};
+use rd_net::{Interface, NetError};
 use rdrive::{Device, DriverGeneric, probe::OnProbeError};
 
 use crate::{
-    BindingInfo, binding_info_from_acpi, binding_info_from_fdt,
+    BindingInfo, BindingIrq, binding_info_from_acpi, binding_info_from_fdt,
     registration::{BoundDevice, register_bound_device},
 };
 #[cfg(feature = "pci")]
@@ -16,32 +15,20 @@ use crate::{PciIrqRequirement, binding_info_from_pci};
 pub struct PlatformNetDevice {
     name: &'static str,
     info: BindingInfo,
-    device: Option<Box<dyn NetDevice>>,
-    dma: Option<DeviceDma>,
+    net: Option<rd_net::Net>,
 }
 
 impl PlatformNetDevice {
-    fn new(
-        name: &'static str,
-        device: Box<dyn NetDevice>,
-        dma: DeviceDma,
-        info: BindingInfo,
-    ) -> Self {
+    fn new(name: &'static str, net: rd_net::Net, info: BindingInfo) -> Self {
         Self {
             name,
             info,
-            device: Some(device),
-            dma: Some(dma),
+            net: Some(net),
         }
     }
 
-    fn take_net(&mut self) -> Option<TakenNetDevice> {
-        Some(TakenNetDevice {
-            name: self.name,
-            prepared_device: self.device.take()?,
-            dma: self.dma.take()?,
-            irq_sources: self.info.irq_sources().to_vec(),
-        })
+    pub fn take_net(&mut self) -> Option<(rd_net::Net, &'static str, Option<BindingIrq>)> {
+        Some((self.net.take()?, self.name, self.info.irq_cloned()))
     }
 
     pub fn binding_info(&self) -> &BindingInfo {
@@ -53,20 +40,9 @@ impl PlatformNetDevice {
     }
 }
 
-/// A platform network device removed exactly once from the probe registry.
-pub struct TakenNetDevice {
-    /// Stable platform registration name.
-    pub name: &'static str,
-    /// Portable device to consume into queue/control parts.
-    pub prepared_device: Box<dyn NetDevice>,
-    /// DMA capability used to allocate queue buffer pools.
-    pub dma: DeviceDma,
-    /// Complete driver source-id to platform IRQ mapping.
-    pub irq_sources: alloc::vec::Vec<crate::BindingIrqBinding>,
-}
-
-/// Removes one registered platform network device.
-pub fn take_net_device(device: Device<PlatformNetDevice>) -> Result<TakenNetDevice, NetError> {
+pub fn take_rd_net_device(
+    device: Device<PlatformNetDevice>,
+) -> Result<(rd_net::Net, &'static str, Option<BindingIrq>), NetError> {
     let mut dev = device
         .lock()
         .map_err(|_| NetError::Other(Box::new(rd_net::KError::Unknown("device locked"))))?;
@@ -87,71 +63,80 @@ impl BoundDevice for PlatformNetDevice {
 }
 
 pub trait PlatformDeviceNet {
+    fn register_net<T>(self, name: &'static str, dev: T) -> Option<usize>
+    where
+        T: Interface + 'static;
+
     fn register_net_with_info<T>(
         self,
         name: &'static str,
         dev: T,
-        dma: DeviceDma,
         info: BindingInfo,
-    ) -> Result<(), OnProbeError>
+    ) -> Option<usize>
     where
-        T: NetDevice + 'static;
+        T: Interface + 'static;
 }
 
 impl PlatformDeviceNet for rdrive::PlatformDevice {
+    fn register_net<T>(self, name: &'static str, dev: T) -> Option<usize>
+    where
+        T: Interface + 'static,
+    {
+        self.register_net_with_info(name, dev, BindingInfo::empty())
+    }
+
     fn register_net_with_info<T>(
         self,
         name: &'static str,
         dev: T,
-        dma: DeviceDma,
         info: BindingInfo,
-    ) -> Result<(), OnProbeError>
+    ) -> Option<usize>
     where
-        T: NetDevice + 'static,
+        T: Interface + 'static,
     {
-        register_net_with_info(self, name, dev, dma, info)
+        register_net_with_info(self, name, dev, info)
     }
 }
 
 pub trait ProbeFdtNet {
-    fn register_net<T>(self, name: &'static str, dev: T) -> Result<(), OnProbeError>
+    fn register_net<T>(self, name: &'static str, dev: T) -> Result<Option<usize>, OnProbeError>
     where
-        T: NetDevice + 'static;
+        T: Interface + 'static;
 }
 
 impl ProbeFdtNet for rdrive::probe::fdt::ProbeFdt<'_> {
-    fn register_net<T>(self, name: &'static str, dev: T) -> Result<(), OnProbeError>
+    fn register_net<T>(self, name: &'static str, dev: T) -> Result<Option<usize>, OnProbeError>
     where
-        T: NetDevice + 'static,
+        T: Interface + 'static,
     {
-        let dma = axklib::dma::device(dma_api::DmaDeviceInfo::new(
-            dma_api::DmaDomainId::Direct,
-            crate::binding_resolver::dma_coherency_from_fdt(self.info()),
-            dma_api::DmaConstraints::new(u64::MAX),
-        ));
         let info = binding_info_from_fdt(self.info())?;
-        register_net_with_info(self.into_platform_device(), name, dev, dma, info)
+        Ok(register_net_with_info(
+            self.into_platform_device(),
+            name,
+            dev,
+            info,
+        ))
     }
 }
 
 pub trait ProbeAcpiNet {
-    fn register_net<T>(self, name: &'static str, dev: T) -> Result<(), OnProbeError>
+    fn register_net<T>(self, name: &'static str, dev: T) -> Result<Option<usize>, OnProbeError>
     where
-        T: NetDevice + 'static;
+        T: Interface + 'static;
 }
 
 impl ProbeAcpiNet for rdrive::probe::acpi::ProbeAcpi<'_> {
-    fn register_net<T>(self, name: &'static str, dev: T) -> Result<(), OnProbeError>
+    fn register_net<T>(self, name: &'static str, dev: T) -> Result<Option<usize>, OnProbeError>
     where
-        T: NetDevice + 'static,
+        T: Interface + 'static,
     {
-        let dma = axklib::dma::device(dma_api::DmaDeviceInfo::new(
-            dma_api::DmaDomainId::Direct,
-            crate::binding_resolver::dma_coherency_from_acpi(self.info())?,
-            dma_api::DmaConstraints::new(u64::MAX),
-        ));
         let info = binding_info_from_acpi(self.info())?;
-        register_net_with_info(self.into_platform_device(), name, dev, dma, info)
+        Ok(register_net_with_info(
+            self.into_platform_device(),
+            name,
+            dev,
+            info,
+        ))
     }
 }
 
@@ -162,9 +147,9 @@ pub trait ProbePciNet {
         name: &'static str,
         dev: T,
         requirement: PciIrqRequirement,
-    ) -> Result<(), OnProbeError>
+    ) -> Result<Option<usize>, OnProbeError>
     where
-        T: NetDevice + 'static;
+        T: Interface + 'static;
 }
 
 #[cfg(feature = "pci")]
@@ -174,13 +159,17 @@ impl ProbePciNet for rdrive::probe::pci::ProbePci<'_> {
         name: &'static str,
         dev: T,
         requirement: PciIrqRequirement,
-    ) -> Result<(), OnProbeError>
+    ) -> Result<Option<usize>, OnProbeError>
     where
-        T: NetDevice + 'static,
+        T: Interface + 'static,
     {
-        let dma = crate::pci::device_dma(self.info(), u64::MAX);
         let info = binding_info_from_pci(self.info(), requirement)?;
-        register_net_with_info(self.into_platform_device(), name, dev, dma, info)
+        Ok(register_net_with_info(
+            self.into_platform_device(),
+            name,
+            dev,
+            info,
+        ))
     }
 }
 
@@ -188,20 +177,11 @@ fn register_net_with_info<T>(
     plat_dev: rdrive::PlatformDevice,
     name: &'static str,
     dev: T,
-    dma: DeviceDma,
     info: BindingInfo,
-) -> Result<(), OnProbeError>
+) -> Option<usize>
 where
-    T: NetDevice + 'static,
+    T: Interface + 'static,
 {
-    if info.irq_sources().is_empty() {
-        return Err(OnProbeError::other(format!(
-            "network device {name} requires at least one IRQ binding"
-        )));
-    }
-    register_bound_device(
-        plat_dev,
-        PlatformNetDevice::new(name, Box::new(dev), dma, info),
-    );
-    Ok(())
+    let net = rd_net::Net::new(dev, axklib::dma::op());
+    register_bound_device(plat_dev, PlatformNetDevice::new(name, net, info))
 }

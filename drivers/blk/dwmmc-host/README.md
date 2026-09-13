@@ -34,7 +34,7 @@ use dma_api::DeviceDma;
 use dwmmc_host::{DwMmc, IDMAC_MAX_BLOCKS, IDMAC_MAX_TRANSFER_SIZE};
 use sdmmc_protocol::{
     rdif::{config::BlockConfig, device::BlockDevice},
-    sdio::{SdMmcIrqHost, init::CardInitPreference, native::SdMmcCard},
+    sdio::{card::SdioSdmmc, init::CardInitPreference},
 };
 
 // SAFETY: the mapped register file is valid and exclusively owned.
@@ -47,14 +47,9 @@ let config = BlockConfig::dma("dwmmc", 0, &dma)
     .with_max_segment_size(IDMAC_MAX_TRANSFER_SIZE);
 host.configure_dma(dma)?;
 
-let parts = host.into_parts();
-let card = SdMmcCard::new(parts.bus);
-let controller = BlockDevice::new_initializing(
-    card,
-    parts.irq,
-    config,
-    CardInitPreference::SdFirst,
-);
+let card = SdioSdmmc::new(host);
+let controller =
+    BlockDevice::new_initializing(card, config, CardInitPreference::SdFirst);
 // Transfer `controller` and its resolved IRQ source to the block runtime.
 # Ok::<(), sdmmc_protocol::Error>(())
 ```

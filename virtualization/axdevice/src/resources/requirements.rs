@@ -5,7 +5,7 @@ use core::fmt;
 
 use axdevice_base::*;
 
-use crate::{DeviceManagerError, DeviceManagerResult, PciFunctionRequirement};
+use crate::{DeviceManagerError, DeviceManagerResult};
 
 /// A model-defined resource name such as `registers` or `irq`.
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -197,7 +197,6 @@ impl DeviceRequirement {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct DeviceRequirements {
     entries: Vec<DeviceRequirement>,
-    pci_function: Option<PciFunctionRequirement>,
 }
 
 impl DeviceRequirements {
@@ -205,7 +204,6 @@ impl DeviceRequirements {
     pub const fn new() -> Self {
         Self {
             entries: Vec::new(),
-            pci_function: None,
         }
     }
 
@@ -296,29 +294,9 @@ impl DeviceRequirements {
         Ok(self)
     }
 
-    /// Declares that this ordinary graph node is one PCI function.
-    pub fn with_pci_function(
-        mut self,
-        requirement: PciFunctionRequirement,
-    ) -> DeviceManagerResult<Self> {
-        if self.pci_function.is_some() {
-            return Err(DeviceManagerError::ResourceConflict {
-                operation: "declare PCI function",
-                detail: "a device node may declare at most one PCI function".into(),
-            });
-        }
-        self.pci_function = Some(requirement);
-        Ok(self)
-    }
-
     /// Returns requirements in model declaration order.
     pub fn entries(&self) -> &[DeviceRequirement] {
         &self.entries
-    }
-
-    /// Returns this node's optional PCI function requirement.
-    pub const fn pci_function(&self) -> Option<&PciFunctionRequirement> {
-        self.pci_function.as_ref()
     }
 
     fn insert(&mut self, requirement: DeviceRequirement) -> DeviceManagerResult {

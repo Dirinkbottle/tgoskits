@@ -15,14 +15,25 @@
 use core::{any::Any, ffi::c_int, mem::size_of};
 
 use ax_driver::jpeg::{self, mpp, registers};
+use ax_runtime::hal::cpu::asm::user_copy;
+use ax_sync::Mutex;
 use axfs_ng_vfs::{DeviceId, VfsError, VfsResult};
 
-use crate::{
-    file::dmabuf::resolve_contiguous_dmabuf,
-    mm::{UserConstPtr, UserPtr},
-    pseudofs::DeviceOps,
-    sync::PiMutex,
-};
+use crate::{file::dmabuf::resolve_contiguous_dmabuf, pseudofs::DeviceOps};
+
+fn copy_from_user(dst: *mut u8, src: *const u8, size: usize) -> VfsResult<()> {
+    if unsafe { user_copy(dst, src, size) } != 0 {
+        return Err(VfsError::InvalidData);
+    }
+    Ok(())
+}
+
+fn copy_to_user(dst: *mut u8, src: *const u8, size: usize) -> VfsResult<()> {
+    if unsafe { user_copy(dst, src, size) } != 0 {
+        return Err(VfsError::InvalidData);
+    }
+    Ok(())
+}
 
 /// Char-device id for `/dev/mpp_service` (opened by path; id is informational).
 pub const MPP_SERVICE_DEVICE_ID: DeviceId = DeviceId::new(0xF1, 0x10);
@@ -39,14 +50,14 @@ struct TaskState {
 
 /// The `/dev/mpp_service` device.
 pub struct MppService {
-    state: PiMutex<TaskState>,
+    state: Mutex<TaskState>,
 }
 
 impl MppService {
     /// Create the device (one global session; MPP serializes one decode at a time).
     pub fn new() -> Self {
         Self {
-            state: PiMutex::new(TaskState {
+            state: Mutex::new(TaskState {
                 session: mpp::MppSession::new(),
                 read_dst: 0,
             }),
@@ -73,7 +84,7 @@ impl DeviceOps for MppService {
         self
     }
 
-    fn ioctl(&self, current: &crate::task::UserTaskRef, cmd: u32, arg: usize) -> VfsResult<usize> {
+    fn ioctl(&self, cmd: u32, arg: usize) -> VfsResult<usize> {
         // Only the V1 request layout is implemented; V2 uses a different record
         // and must not be parsed as V1.
         if cmd != mpp::MPP_IOC_CFG_V1 {
@@ -86,8 +97,8 @@ impl DeviceOps for MppService {
         let mut state = self.state.lock();
         // Walk the chained request records (MULTI_MSG ... LAST_MSG).
         for i in 0..mpp::MAX_MSG_NUM {
-            let req = read_request(current, arg + i * size_of::<mpp::MppRequest>())?;
-            handle_request(current, &mut state, &req)?;
+            let req = read_request(arg + i * size_of::<mpp::MppRequest>())?;
+            handle_request(&mut state, &req)?;
             if req.flag & mpp::flags::LAST_MSG != 0 || req.flag & mpp::flags::MULTI_MSG == 0 {
                 break;
             }
@@ -96,57 +107,56 @@ impl DeviceOps for MppService {
     }
 }
 
-fn read_request(current: &crate::task::UserTaskRef, uaddr: usize) -> VfsResult<mpp::MppRequest> {
-    // SAFETY: `MppRequest` is a `repr(C)` aggregate of integer fields with no
-    // padding, so every possible userspace byte pattern is a valid value.
-    unsafe { UserConstPtr::<mpp::MppRequest>::from(uaddr).read_abi(current) }
-        .map_err(|_| VfsError::InvalidData)
+fn read_request(uaddr: usize) -> VfsResult<mpp::MppRequest> {
+    let mut req = mpp::MppRequest::default();
+    copy_from_user(
+        (&mut req) as *mut mpp::MppRequest as *mut u8,
+        uaddr as *const u8,
+        size_of::<mpp::MppRequest>(),
+    )?;
+    Ok(req)
 }
 
-fn write_u32_to_user(
-    current: &crate::task::UserTaskRef,
-    uaddr: usize,
-    value: u32,
-) -> VfsResult<()> {
-    UserPtr::<u32>::from(uaddr)
-        .write(current, value)
-        .map_err(|_| VfsError::InvalidData)
+fn write_u32_to_user(uaddr: usize, value: u32) -> VfsResult<()> {
+    copy_to_user(
+        uaddr as *mut u8,
+        (&value) as *const u32 as *const u8,
+        size_of::<u32>(),
+    )
 }
 
-fn handle_request(
-    current: &crate::task::UserTaskRef,
-    state: &mut TaskState,
-    req: &mpp::MppRequest,
-) -> VfsResult<()> {
+fn handle_request(state: &mut TaskState, req: &mpp::MppRequest) -> VfsResult<()> {
     let data = req.data_ptr as usize;
     match req.cmd {
         mpp::cmd::PROBE_HW_SUPPORT => {
-            write_u32_to_user(current, data, mpp::HW_SUPPORT_JPEG_DEC)?;
+            write_u32_to_user(data, mpp::HW_SUPPORT_JPEG_DEC)?;
         }
         mpp::cmd::QUERY_HW_ID => {
-            write_u32_to_user(current, data, jpeg::read_id().unwrap_or(0))?;
+            write_u32_to_user(data, jpeg::read_id().unwrap_or(0))?;
         }
         mpp::cmd::QUERY_CMD_SUPPORT => {
             // No command-support table is offered; write back 0 (rather than
             // leaving the user buffer untouched) so MPP's capability probe reads a
             // defined value and falls back to the old-kernel command path.
-            write_u32_to_user(current, data, 0)?;
+            write_u32_to_user(data, 0)?;
         }
         mpp::cmd::INIT_CLIENT_TYPE => {
-            let client = UserConstPtr::<u32>::from(data)
-                .read(current)
-                .map_err(|_| VfsError::InvalidData)?;
+            let mut client: u32 = 0;
+            copy_from_user(
+                (&mut client) as *mut u32 as *mut u8,
+                data as *const u8,
+                size_of::<u32>(),
+            )?;
             state
                 .session
                 .init_client_type(client)
                 .map_err(|_| VfsError::InvalidInput)?;
         }
         mpp::cmd::SET_REG_WRITE => {
+            let mut words = [0u32; registers::REG_COUNT];
             let n = (req.size as usize / 4).min(registers::REG_COUNT);
-            let words = UserConstPtr::<u32>::from(data)
-                .read_slice(current, n)
-                .map_err(|_| VfsError::InvalidData)?;
-            state.session.set_reg_write(&words);
+            copy_from_user(words.as_mut_ptr() as *mut u8, data as *const u8, n * 4)?;
+            state.session.set_reg_write(&words[..n]);
         }
         mpp::cmd::SET_REG_READ => {
             state.read_dst = data;
@@ -155,18 +165,15 @@ fn handle_request(
         mpp::cmd::SET_REG_ADDR_OFFSET => {
             let elem = size_of::<mpp::RegOffset>();
             let cnt = (req.size as usize / elem).min(mpp::MAX_REG_OFFSETS);
-            // SAFETY: `RegOffset` is `repr(C)` with exactly two `u32` fields,
-            // so every possible userspace byte pattern is a valid value.
-            let elems =
-                unsafe { UserConstPtr::<mpp::RegOffset>::from(data).read_abi_slice(current, cnt) }
-                    .map_err(|_| VfsError::InvalidData)?;
+            let mut elems = [mpp::RegOffset::default(); mpp::MAX_REG_OFFSETS];
+            copy_from_user(elems.as_mut_ptr() as *mut u8, data as *const u8, cnt * elem)?;
             state
                 .session
-                .add_reg_offsets(&elems)
+                .add_reg_offsets(&elems[..cnt])
                 .map_err(|_| VfsError::InvalidInput)?;
         }
         mpp::cmd::POLL_HW_FINISH | mpp::cmd::POLL_HW_IRQ => {
-            run_decode(current, state)?;
+            run_decode(state)?;
         }
         mpp::cmd::RESET_SESSION => {
             state.session.reset();
@@ -179,7 +186,7 @@ fn handle_request(
     Ok(())
 }
 
-fn run_decode(current: &crate::task::UserTaskRef, state: &mut TaskState) -> VfsResult<()> {
+fn run_decode(state: &mut TaskState) -> VfsResult<()> {
     state
         .session
         .resolve_addresses(resolve_fd)
@@ -192,9 +199,11 @@ fn run_decode(current: &crate::task::UserTaskRef, state: &mut TaskState) -> VfsR
     let (first, count) = state.session.read_window();
     if state.read_dst != 0 && count > 0 && first < registers::REG_COUNT {
         let count = count.min(registers::REG_COUNT - first);
-        UserPtr::<u32>::from(state.read_dst)
-            .write_slice(current, &readback[first..first + count])
-            .map_err(|_| VfsError::InvalidData)?;
+        copy_to_user(
+            state.read_dst as *mut u8,
+            readback[first..].as_ptr() as *const u8,
+            count * 4,
+        )?;
     }
 
     state.session.clear_task();
@@ -210,7 +219,7 @@ fn resolve_fd(fd: u32) -> Option<u32> {
         warn!("mpp_service: register fd {fd} is not a resolvable dma-buf");
         return None;
     };
-    // The decoder is limited to 32-bit device addresses; reject buffers above
+    // The decoder is 32-bit (device_with_mask(u32::MAX)); reject buffers above
     // 4 GiB rather than silently truncating the address. /dev/dma_heap buffers
     // are allocated below 4 GiB (dma32), so this should not trigger.
     let phys = buf.phys_base();

@@ -8,12 +8,8 @@ use axdevice_base::{AccessWidth, DeviceError};
 use axvm_types::AddressSpacePolicy;
 use rdif_clk::ClockMmioWriteProtection;
 
-use crate::{
-    config::*,
-    host::shared_mmio::{MmioRegisterAccess, SharedMmioDevice},
-    machine::*,
-    *,
-};
+use super::shared_mmio::{MmioRegisterAccess, SharedMmioDevice};
+use crate::{config::*, machine::*, *};
 
 fn clock_references_for_plan(config: &AxVMConfig) -> Vec<GuestClockReference> {
     if config.address_space_policy() != AddressSpacePolicy::Passthrough {
@@ -253,10 +249,6 @@ impl DeviceModel for SharedProviderModel {
             1,
             ResourceRequest::Fixed(self.region.base as u64),
         )
-    }
-
-    fn firmware(&self) -> DeviceFirmwareSpec {
-        DeviceFirmwareSpec::None
     }
 
     fn build(&self, context: &mut DeviceBuildContext<'_>) -> DeviceManagerResult<DeviceBundle> {

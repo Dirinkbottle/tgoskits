@@ -7,12 +7,12 @@ extern crate log;
 
 use core::ptr::NonNull;
 
-use ax_lazyinit::OnceLock;
 // The registry is not hard-IRQ safe, but it is also used by runtime discovery
 // paths that must not trigger task preemption hooks on lock release.
-use ax_sync::{RawSpinLockGuard, SpinLock as Mutex};
+use ax_kspin::SpinRaw as Mutex;
 pub use fdt_edit::{Fdt, Phandle};
 use register::{DriverRegister, ProbeLevel, ProbePriority};
+use spin::Once;
 
 mod descriptor;
 pub mod driver;
@@ -21,6 +21,9 @@ mod id;
 mod lock;
 mod manager;
 mod osal;
+
+#[cfg(all(axtest, feature = "axtest"))]
+pub mod axtest;
 
 pub mod probe;
 pub mod register;
@@ -36,7 +39,7 @@ pub use rdrive_macros::*;
 
 use crate::{error::DriverError, probe::OnProbeError};
 
-static CONTAINER: OnceLock<Mutex<Manager>> = OnceLock::new();
+static CONTAINER: Once<Mutex<Manager>> = Once::new();
 
 #[derive(Debug, Clone)]
 pub enum Platform {
@@ -60,12 +63,6 @@ unsafe impl Send for PlatformSource {}
 
 pub(crate) fn container() -> &'static Mutex<Manager> {
     CONTAINER.get().expect("rdrive not init")
-}
-
-fn lock_container() -> RawSpinLockGuard<'static, Manager> {
-    // SAFETY: registry operations run in serialized discovery/runtime paths
-    // which preserve the legacy raw-lock exclusion contract.
-    unsafe { container().lock_raw() }
 }
 
 pub fn is_initialized() -> bool {
@@ -111,7 +108,7 @@ pub(crate) fn edit<F, T>(f: F) -> T
 where
     F: FnOnce(&mut Manager) -> T,
 {
-    let mut g = lock_container();
+    let mut g = container().lock();
     f(&mut g)
 }
 
@@ -119,7 +116,7 @@ pub(crate) fn read<F, T>(f: F) -> T
 where
     F: FnOnce(&Manager) -> T,
 {
-    let g = lock_container();
+    let g = container().lock();
     f(&g)
 }
 
@@ -290,17 +287,6 @@ pub fn acpi_spcr_console_device_id() -> Option<DeviceId> {
 
 pub fn with_fdt<T>(f: impl FnOnce(&Fdt) -> T) -> Option<T> {
     probe::fdt::try_system().map(|system| f(system.fdt()))
-}
-
-/// Borrow the live device tree for the lifetime of the program.
-///
-/// The FDT is parsed once at init and never mutated, so this hands out a
-/// `'static` reference with no lock and no copy. Prefer this over
-/// `with_fdt(Clone::clone)`, which deep-copies the entire blob on every call —
-/// a real cost when hot paths (e.g. concurrent device probes resolving phandles)
-/// call it repeatedly.
-pub fn fdt_ref() -> Option<&'static Fdt> {
-    probe::fdt::try_system().map(|system| system.fdt())
 }
 
 /// Macro for generating a driver module.

@@ -26,8 +26,7 @@ pub(super) enum RootManifestChange {
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub(super) struct LocalRootManifestChange {
-    pub(super) dependency_keys: BTreeSet<String>,
-    pub(super) local_packages: BTreeSet<String>,
+    pub(super) dependencies: BTreeSet<String>,
     pub(super) members: BTreeSet<PathBuf>,
 }
 
@@ -93,8 +92,7 @@ pub(super) fn classify_root_manifest_change(
 
     let old_dependencies = workspace_dependencies(&old);
     let new_dependencies = workspace_dependencies(&new);
-    let mut changed_keys = BTreeSet::new();
-    let mut changed_local_packages = BTreeSet::new();
+    let mut changed = BTreeSet::new();
     for dependency_key in old_dependencies
         .keys()
         .chain(new_dependencies.keys())
@@ -105,21 +103,22 @@ pub(super) fn classify_root_manifest_change(
         if old_dependency == new_dependency {
             continue;
         }
-        changed_keys.insert(dependency_key.to_string());
         let old_package = old_dependency.and_then(|dependency| {
             local_workspace_dependency_package_name(dependency_key, dependency)
         });
         let new_package = new_dependency.and_then(|dependency| {
             local_workspace_dependency_package_name(dependency_key, dependency)
         });
-        changed_local_packages.extend(old_package);
-        changed_local_packages.extend(new_package);
+        if old_package.is_none() && new_package.is_none() {
+            return Ok(RootManifestChange::Hard);
+        }
+        changed.extend(old_package);
+        changed.extend(new_package);
     }
 
     Ok(RootManifestChange::LocalWorkspace(
         LocalRootManifestChange {
-            dependency_keys: changed_keys,
-            local_packages: changed_local_packages,
+            dependencies: changed,
             members: changed_members,
         },
     ))

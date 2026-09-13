@@ -55,13 +55,11 @@ impl FwCfgPioDevice {
         })
     }
 
-    fn port_offset(&self, access: &DeviceAccess) -> Result<(PortWindow, usize), DeviceError> {
-        if access.bus() != BusKind::Port || access.address() > u64::from(u16::MAX) {
-            return Err(DeviceError::OutOfRange {
-                addr: access.address(),
-            });
+    fn port_offset(&self, access: &BusAccess) -> Result<(PortWindow, usize), DeviceError> {
+        if access.kind != BusKind::Port || access.addr > u64::from(u16::MAX) {
+            return Err(DeviceError::OutOfRange { addr: access.addr });
         }
-        let port = access.address() as u16;
+        let port = access.addr as u16;
         if let Some(offset) = port.checked_sub(self.selector_base)
             && offset < self.selector_size
         {
@@ -72,24 +70,21 @@ impl FwCfgPioDevice {
         {
             return Ok((PortWindow::Dma, usize::from(offset)));
         }
-        Err(DeviceError::OutOfRange {
-            addr: access.address(),
-        })
+        Err(DeviceError::OutOfRange { addr: access.addr })
     }
 
     fn write_dma(
         &self,
         offset: usize,
-        access: &DeviceAccess,
-        value: u64,
-        context: &mut dyn DeviceContext,
-    ) -> DeviceResult {
+        access: &BusAccess,
+        context: &mut dyn DeviceAccess,
+    ) -> Result<BusResponse, DeviceError> {
         let Some(descriptor) = self
             .inner
-            .write_dma_port(offset, access.width(), value as usize)
+            .write_dma_port(offset, access.width, access.data as usize)
             .map_err(DeviceError::from)?
         else {
-            return Ok(());
+            return Ok(BusResponse::Write);
         };
         let context = RefCell::new(context);
         self.inner
@@ -109,7 +104,7 @@ impl FwCfgPioDevice {
                 },
             )
             .map_err(DeviceError::from)?;
-        Ok(())
+        Ok(BusResponse::Write)
     }
 }
 
@@ -127,35 +122,27 @@ impl Device for FwCfgPioDevice {
         &self.resources
     }
 
-    fn read(&self, access: &DeviceAccess, _context: &mut dyn DeviceContext) -> DeviceResult<u64> {
-        let (window, offset) = self.port_offset(access)?;
-        match (window, offset) {
-            (PortWindow::SelectorData, 0) => Ok(u64::from(self.inner.read_selector())),
-            (PortWindow::SelectorData, 1) => Ok(self.inner.read_data(access.width()) as u64),
-            (PortWindow::Dma, _) => Ok(0),
-            _ => Err(DeviceError::OutOfRange {
-                addr: access.address(),
-            }),
-        }
-    }
-
-    fn write(
+    fn access(
         &self,
-        access: &DeviceAccess,
-        value: u64,
-        context: &mut dyn DeviceContext,
-    ) -> DeviceResult {
+        access: &BusAccess,
+        context: &mut dyn DeviceAccess,
+    ) -> Result<BusResponse, DeviceError> {
         let (window, offset) = self.port_offset(access)?;
-        match (window, offset) {
-            (PortWindow::SelectorData, 0) => {
-                self.inner.select(value as u16);
-                Ok(())
-            }
-            (PortWindow::SelectorData, 1) => Ok(()),
-            (PortWindow::Dma, offset) => self.write_dma(offset, access, value, context),
-            _ => Err(DeviceError::OutOfRange {
-                addr: access.address(),
+        match (window, access.is_read, offset) {
+            (PortWindow::SelectorData, true, 0) => Ok(BusResponse::Read {
+                value: u64::from(self.inner.read_selector()),
             }),
+            (PortWindow::SelectorData, true, 1) => Ok(BusResponse::Read {
+                value: self.inner.read_data(access.width) as u64,
+            }),
+            (PortWindow::SelectorData, false, 0) => {
+                self.inner.select(access.data as u16);
+                Ok(BusResponse::Write)
+            }
+            (PortWindow::SelectorData, false, 1) => Ok(BusResponse::Write),
+            (PortWindow::Dma, true, _) => Ok(BusResponse::Read { value: 0 }),
+            (PortWindow::Dma, false, offset) => self.write_dma(offset, access, context),
+            _ => Err(DeviceError::OutOfRange { addr: access.addr }),
         }
     }
 }

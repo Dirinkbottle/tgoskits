@@ -18,7 +18,7 @@ const DEFAULT_RING_PAGES: usize = 2;
 
 #[derive(Clone, Copy)]
 #[repr(transparent)]
-pub(crate) struct TrbData([u32; TRB_LEN]);
+pub struct TrbData([u32; TRB_LEN]);
 
 impl TrbData {
     pub fn to_raw(self) -> [u32; TRB_LEN] {
@@ -40,12 +40,15 @@ impl From<transfer::Allowed> for TrbData {
     }
 }
 
-pub(crate) struct Ring {
+pub struct Ring {
     link: bool,
-    trbs: CoherentArray<TrbData>,
-    i: usize,
-    cycle: bool,
+    pub trbs: CoherentArray<TrbData>,
+    pub i: usize,
+    pub cycle: bool,
 }
+
+unsafe impl Send for Ring {}
+unsafe impl Sync for Ring {}
 
 impl Ring {
     pub fn new_with_len(
@@ -89,10 +92,6 @@ impl Ring {
 
     pub fn bus_addr(&self) -> BusAddr {
         self.trbs.dma_addr().as_u64().into()
-    }
-
-    pub(crate) fn read_trb(&self, index: usize) -> Option<TrbData> {
-        self.trbs.read_cpu(index)
     }
 
     pub fn enque_command(&mut self, mut trb: command::Allowed) -> BusAddr {

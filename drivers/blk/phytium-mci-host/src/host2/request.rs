@@ -17,12 +17,12 @@ pub struct TransactionRequest<'a> {
 }
 
 pub(super) enum TransactionRequestKind {
-    Command { response: sdmmc_host::ResponseType },
-    Data { response: sdmmc_host::ResponseType },
+    Command { response: sdio_host2::ResponseType },
+    Data { response: sdio_host2::ResponseType },
 }
 
 impl<'a> TransactionRequest<'a> {
-    pub(crate) fn command(owner: usize, id: u64, response: sdmmc_host::ResponseType) -> Self {
+    pub(crate) fn command(owner: usize, id: u64, response: sdio_host2::ResponseType) -> Self {
         Self {
             owner,
             id,
@@ -37,7 +37,7 @@ impl<'a> TransactionRequest<'a> {
         owner: usize,
         id: u64,
         request: DataRequest<'a>,
-        response: sdmmc_host::ResponseType,
+        response: sdio_host2::ResponseType,
     ) -> Self {
         Self {
             owner,
@@ -62,11 +62,11 @@ impl PhytiumMci {
 
     pub(super) fn pending_transaction_progress(
         &self,
-    ) -> sdmmc_host::RequestProgress<sdmmc_host::RawResponse> {
+    ) -> sdio_host2::RequestProgress<sdio_host2::RawResponse> {
         if self.command_needs_register_retry() {
             register_pending()
         } else {
-            sdmmc_host::RequestProgress::WaitingForIrq
+            sdio_host2::RequestProgress::WaitingForIrq
         }
     }
 
@@ -96,15 +96,15 @@ impl PhytiumMci {
     pub(super) fn check_host2_transaction_request(
         &self,
         request: &TransactionRequest<'_>,
-    ) -> Result<(), sdmmc_host::AdvanceRequestError> {
+    ) -> Result<(), sdio_host2::AdvanceRequestError> {
         if request.done {
-            return Err(sdmmc_host::AdvanceRequestError::AlreadyCompleted);
+            return Err(sdio_host2::AdvanceRequestError::AlreadyCompleted);
         }
         if request.owner != self.host2_owner() {
-            return Err(sdmmc_host::AdvanceRequestError::WrongOwner);
+            return Err(sdio_host2::AdvanceRequestError::WrongOwner);
         }
         if self.host2_active_id != Some(request.id) {
-            return Err(sdmmc_host::AdvanceRequestError::StaleGeneration);
+            return Err(sdio_host2::AdvanceRequestError::StaleGeneration);
         }
         Ok(())
     }
@@ -118,7 +118,7 @@ impl PhytiumMci {
     pub(super) fn abort_host2_transaction_request(
         &mut self,
         request: &mut TransactionRequest<'_>,
-    ) -> Result<(), sdmmc_host::Error> {
+    ) -> Result<(), sdio_host2::Error> {
         let result = if let Some(data) = request.data.as_mut() {
             if let Some(active) = data.request.take() {
                 let id = active.id();

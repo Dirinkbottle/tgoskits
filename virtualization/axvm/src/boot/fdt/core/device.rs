@@ -27,46 +27,20 @@ use crate::config::AxVMConfig;
 type NodeCache = BTreeMap<String, Vec<NodeId>>;
 type PhandleMap = BTreeMap<u32, (String, BTreeMap<String, u32>)>;
 
-/// Returns whether a passthrough selector includes the node at `node_path`.
-///
-/// A selector includes both the node named by the selector and its descendants,
-/// but not a similarly prefixed sibling such as `/peripherals-extra`.
-pub(crate) fn selector_includes_path(selector: &str, node_path: &str) -> bool {
-    selector == node_path
-        || node_path
-            .strip_prefix(selector)
-            .is_some_and(|suffix| selector == "/" || suffix.starts_with('/'))
-}
-
 /// Return all passthrough device paths, including descendants and phandle dependencies.
 pub fn find_all_passthrough_devices(vm_cfg: &AxVMConfig, fdt: &Fdt) -> Vec<String> {
-    let initial_device_names = vm_cfg
+    let initial_device_count = vm_cfg.pass_through_devices().len();
+    let node_cache = build_optimized_node_cache(fdt);
+    let initial_device_names: Vec<String> = vm_cfg
         .pass_through_devices()
         .iter()
         .map(|dev| dev.name.clone())
-        .collect::<Vec<_>>();
-    let excluded_device_paths = vm_cfg
-        .excluded_devices()
-        .iter()
-        .flatten()
-        .cloned()
-        .collect::<Vec<_>>();
-    find_all_passthrough_devices_from_paths(&initial_device_names, &excluded_device_paths, fdt)
-}
-
-/// Return passthrough paths selected by configuration, including dependencies.
-pub(crate) fn find_all_passthrough_devices_from_paths(
-    initial_device_names: &[String],
-    excluded_device_paths: &[String],
-    fdt: &Fdt,
-) -> Vec<String> {
-    let initial_device_count = initial_device_names.len();
-    let node_cache = build_optimized_node_cache(fdt);
+        .collect();
     let mut configured_device_names: BTreeSet<String> =
         initial_device_names.iter().cloned().collect();
     let mut additional_device_names = Vec::new();
 
-    for device_name in initial_device_names {
+    for device_name in &initial_device_names {
         let descendant_paths = get_descendant_nodes_by_path(&node_cache, device_name);
         trace!(
             "Found {} descendant paths for {}",
@@ -103,10 +77,16 @@ pub(crate) fn find_all_passthrough_devices_from_paths(
         }
     }
 
-    let mut all_excluded_devices = excluded_device_paths.to_vec();
-    let mut processed_excluded: BTreeSet<String> = excluded_device_paths.iter().cloned().collect();
+    let excluded_device_path: Vec<String> = vm_cfg
+        .excluded_devices()
+        .iter()
+        .flatten()
+        .cloned()
+        .collect();
+    let mut all_excluded_devices = excluded_device_path.clone();
+    let mut processed_excluded: BTreeSet<String> = excluded_device_path.iter().cloned().collect();
 
-    for device_path in excluded_device_paths {
+    for device_path in &excluded_device_path {
         for descendant_path in get_descendant_nodes_by_path(&node_cache, device_path) {
             if processed_excluded.insert(descendant_path.clone()) {
                 all_excluded_devices.push(descendant_path);
@@ -115,28 +95,18 @@ pub(crate) fn find_all_passthrough_devices_from_paths(
     }
     info!("Found excluded devices: {all_excluded_devices:?}");
 
-    let mut all_device_names = initial_device_names.to_vec();
+    let mut all_device_names = initial_device_names;
     all_device_names.extend(additional_device_names);
     all_device_names.extend(dependency_device_names);
 
     if !all_excluded_devices.is_empty() {
         let excluded_set: BTreeSet<String> = all_excluded_devices.into_iter().collect();
         all_device_names.retain(|device_name| {
-            let directly_excluded = excluded_set.contains(device_name);
-            let covers_excluded_subtree = !directly_excluded
-                && excluded_device_paths.iter().any(|excluded_path| {
-                    node_cache.contains_key(excluded_path)
-                        && is_path_or_ancestor(device_name, excluded_path)
-                });
-            if directly_excluded {
+            let should_keep = !excluded_set.contains(device_name);
+            if !should_keep {
                 info!("Excluding device: {device_name}");
-            } else if covers_excluded_subtree {
-                info!(
-                    "Excluding passthrough ancestor {device_name} because it covers a disabled \
-                     device subtree"
-                );
             }
-            !directly_excluded && !covers_excluded_subtree
+            should_keep
         });
     }
 
@@ -148,13 +118,6 @@ pub(crate) fn find_all_passthrough_devices_from_paths(
         all_device_names.len().saturating_sub(initial_device_count)
     );
     all_device_names
-}
-
-fn is_path_or_ancestor(candidate: &str, path: &str) -> bool {
-    candidate == path
-        || path
-            .strip_prefix(candidate)
-            .is_some_and(|suffix| candidate == "/" || suffix.starts_with('/'))
 }
 
 pub fn build_optimized_node_cache(fdt: &Fdt) -> NodeCache {

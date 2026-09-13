@@ -1,5 +1,3 @@
-#[cfg(not(feature = "arm-el2"))]
-mod asid;
 mod context;
 
 pub mod asm;

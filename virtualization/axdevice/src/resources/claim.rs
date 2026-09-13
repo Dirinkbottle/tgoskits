@@ -9,7 +9,7 @@ use alloc::{
 };
 use core::fmt;
 
-use ax_sync::{RawSpinLockGuard, SpinLock};
+use ax_kspin::SpinRaw;
 use axdevice_base::{ControllerInputId, HostIrqId, InterruptControllerId};
 
 use super::{resolved::*, *};
@@ -37,7 +37,7 @@ struct ClaimRecord {
 #[derive(Debug)]
 pub(super) struct ResourceClaimDomain {
     device_ids: BTreeSet<String>,
-    records: SpinLock<BTreeMap<ClaimKey, ClaimRecord>>,
+    records: SpinRaw<BTreeMap<ClaimKey, ClaimRecord>>,
 }
 
 impl ResourceClaimDomain {
@@ -59,14 +59,8 @@ impl ResourceClaimDomain {
         }
         Arc::new(Self {
             device_ids: devices.keys().cloned().collect(),
-            records: SpinLock::new(records),
+            records: SpinRaw::new(records),
         })
-    }
-
-    fn records(&self) -> RawSpinLockGuard<'_, BTreeMap<ClaimKey, ClaimRecord>> {
-        // SAFETY: claim state transitions are entered through the serialized
-        // VM resource planner and exclude local re-entry.
-        unsafe { self.records.lock_raw() }
     }
 
     pub(super) fn issue_device(
@@ -80,7 +74,7 @@ impl ResourceClaimDomain {
             });
         }
 
-        let mut records = self.records();
+        let mut records = self.records.lock();
         let keys: Vec<ClaimKey> = records
             .keys()
             .filter(|key| key.device_id == device_id)
@@ -119,7 +113,7 @@ impl ResourceClaimDomain {
         to: ClaimState,
         operation: &'static str,
     ) -> DeviceManagerResult {
-        let mut records = self.records();
+        let mut records = self.records.lock();
         let record = records
             .get_mut(key)
             .ok_or_else(|| DeviceManagerError::ResourceNotFound {
@@ -134,7 +128,7 @@ impl ResourceClaimDomain {
     }
 
     fn rollback(&self, key: &ClaimKey, from: ClaimState) {
-        if let Some(record) = self.records().get_mut(key)
+        if let Some(record) = self.records.lock().get_mut(key)
             && record.state == from
         {
             record.state = ClaimState::Planned;
@@ -142,7 +136,7 @@ impl ResourceClaimDomain {
     }
 
     pub(super) fn verify_leased(&self) -> DeviceManagerResult {
-        if let Some((key, state)) = self.records().iter().find_map(|(key, record)| {
+        if let Some((key, state)) = self.records.lock().iter().find_map(|(key, record)| {
             (record.state != ClaimState::Leased).then_some((key, record.state))
         }) {
             return Err(claim_state_error("commit VM resource plan", key, state));
@@ -155,7 +149,8 @@ impl ResourceClaimDomain {
         controller: InterruptControllerId,
         input: ControllerInputId,
     ) -> Option<String> {
-        self.records()
+        self.records
+            .lock()
             .iter()
             .find_map(|(key, record)| match record.resource {
                 ResolvedResource::WiredIrq(irq)
@@ -168,7 +163,8 @@ impl ResourceClaimDomain {
     }
 
     pub(super) fn owner_of_host_irq(&self, irq: HostIrqId) -> Option<String> {
-        self.records()
+        self.records
+            .lock()
             .iter()
             .find_map(|(key, record)| match record.resource {
                 ResolvedResource::HostIrq(existing) if existing == irq => {

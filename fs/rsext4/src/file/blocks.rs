@@ -1,25 +1,30 @@
 use super::*;
 
 /// Builds block mappings and enables checksums for external extent nodes.
-pub fn build_file_block_mapping_with_inode_num<B: BlockIo>(
+pub fn build_file_block_mapping_with_inode_num<B: BlockDevice>(
     fs: &mut Ext4FileSystem,
     inode: &mut Ext4Inode,
     inode_num: InodeNumber,
     data_blocks: &[AbsoluteBN],
     block_dev: &mut Jbd2Dev<B>,
-) -> Ext4Result<()> {
+) {
     if data_blocks.is_empty() {
         inode.i_blocks_lo = 0;
         inode.l_i_blocks_high = 0;
         inode.i_block = [0; 15];
-        return Ok(());
+        return;
     }
 
     if fs.superblock.has_extents() {
         // Prefer extents and merge contiguous physical blocks into the same run.
         inode.i_flags |= Ext4Inode::EXT4_EXTENTS_FL;
         inode.i_block = [0; 15];
-        inode.write_extend_header();
+
+        // Make sure the embedded root header exists before inserting extents.
+        if !inode.have_extend_header_and_use_extend() {
+            inode.i_flags |= Ext4Inode::EXT4_EXTENTS_FL;
+            inode.write_extend_header();
+        }
 
         let mut exts_vec: Vec<Ext4Extent> = Vec::new();
 
@@ -53,17 +58,12 @@ pub fn build_file_block_mapping_with_inode_num<B: BlockIo>(
 
         // Insert the computed extents through `ExtentTree` so the inode root
         // receives the same serialized structure as runtime writes.
-        let mut tree = ExtentTree::with_filesystem(inode, fs, inode_num);
+        let mut tree = ExtentTree::with_checksum(inode, &fs.superblock, inode_num);
         for extend in exts_vec {
-            tree.insert_extent(fs, extend, block_dev)?;
+            tree.insert_extent(fs, extend, block_dev)
+                .expect("Extent insert failed!");
         }
     } else {
-        if data_blocks.len() > 12 {
-            return Err(Ext4Error::unsupported());
-        }
-        for (logical, physical) in data_blocks.iter().enumerate() {
-            inode.i_block[logical] = physical.to_u32()?;
-        }
+        error!("not support traditional block pointer");
     }
-    Ok(())
 }

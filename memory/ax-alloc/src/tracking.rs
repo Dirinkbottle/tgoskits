@@ -5,7 +5,7 @@ use core::{
     sync::atomic::{AtomicBool, Ordering},
 };
 
-use ax_sync::SpinLock;
+use ax_kspin::SpinNoIrq;
 use axbacktrace::Backtrace;
 
 pub(crate) static TRACKING_ENABLED: AtomicBool = AtomicBool::new(false);
@@ -34,7 +34,7 @@ pub(crate) struct GlobalState {
     pub generation: u64,
 }
 
-static STATE: SpinLock<GlobalState> = SpinLock::new(GlobalState {
+static STATE: SpinNoIrq<GlobalState> = SpinNoIrq::new(GlobalState {
     map: BTreeMap::new(),
     generation: 0,
 });
@@ -55,7 +55,7 @@ pub fn tracking_enabled() -> bool {
 }
 
 pub(crate) fn with_state<R>(f: impl FnOnce(Option<&mut GlobalState>) -> R) -> R {
-    let _guard = ax_sync::PreemptGuard::new();
+    let _guard = ax_kernel_guard::NoPreempt::new();
     // SAFETY: the guard prevents migration throughout all accesses below.
     unsafe {
         ax_percpu::with_cpu_pin(|pin| {
@@ -64,7 +64,7 @@ pub(crate) fn with_state<R>(f: impl FnOnce(Option<&mut GlobalState>) -> R) -> R 
             }
 
             IN_GLOBAL_ALLOCATOR.write_current(pin, true);
-            let mut state = STATE.lock_irqsave();
+            let mut state = STATE.lock();
             let result = f(Some(&mut state));
             drop(state);
             IN_GLOBAL_ALLOCATOR.write_current(pin, false);
@@ -81,7 +81,7 @@ pub(crate) fn with_state<R>(f: impl FnOnce(Option<&mut GlobalState>) -> R) -> R 
 ///
 /// See [`allocations_in`].
 pub fn current_generation() -> u64 {
-    STATE.lock_irqsave().generation
+    STATE.lock().generation
 }
 
 /// Visits all allocations made by the global allocator within the given

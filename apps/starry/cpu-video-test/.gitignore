@@ -1,6 +1,0 @@
-target/
-*.o
-*.raw
-*.rgb
-*.gray
-*.pcm

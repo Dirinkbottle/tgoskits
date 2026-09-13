@@ -61,8 +61,10 @@ fn parse_blocks_extracts_frames_with_prefix_noise() {
 [0.002] BACKTRACE_END
 "#;
     let blocks = parse_blocks(text).unwrap();
+    assert_eq!(blocks.len(), 1);
     assert_eq!(blocks[0].kind, "panic");
     assert_eq!(blocks[0].arch.as_deref(), Some("x86_64"));
+    assert_eq!(blocks[0].frames.len(), 2);
     assert_eq!(blocks[0].frames[0].idx, 0);
     assert_eq!(blocks[0].frames[0].ip, 0x1000);
     assert_eq!(blocks[0].frames[0].fp, Some(0x2000));
@@ -75,7 +77,9 @@ BACKTRACE_BEGIN kind=trap arch=riscv64
 BT 0 ip=0xdead fp=0xbeef
 "#;
     let blocks = parse_blocks(text).unwrap();
+    assert_eq!(blocks.len(), 1);
     assert_eq!(blocks[0].kind, "trap");
+    assert_eq!(blocks[0].frames.len(), 1);
 }
 
 #[test]
@@ -88,6 +92,7 @@ BT 0 ip=0x3000 fp=0x4000
 BACKTRACE_END
 "#;
     let blocks = parse_blocks(text).unwrap();
+    assert_eq!(blocks.len(), 2);
     assert_eq!(blocks[0].kind, "panic");
     assert_eq!(blocks[1].kind, "trap");
 }
@@ -100,6 +105,7 @@ BT_ERROR requires_alloc
 BACKTRACE_END
 "#;
     let blocks = parse_blocks(text).unwrap();
+    assert_eq!(blocks.len(), 1);
     assert_eq!(blocks[0].kind, "panic");
     assert_eq!(blocks[0].errors, vec!["requires_alloc".to_string()]);
     assert!(blocks[0].frames.is_empty());
@@ -113,6 +119,8 @@ BT 0 ip=0xdead
 BACKTRACE_END
 "#;
     let blocks = parse_blocks(text).unwrap();
+    assert_eq!(blocks.len(), 1);
+    assert_eq!(blocks[0].frames.len(), 1);
     assert_eq!(blocks[0].frames[0].ip, 0xdead);
     assert_eq!(blocks[0].frames[0].fp, None);
 }
@@ -323,7 +331,9 @@ fn block_capture_writes_only_complete_blocks() {
     assert!(text.contains("BACKTRACE_END"));
 
     let blocks = parse_blocks(&text).unwrap();
+    assert_eq!(blocks.len(), 1);
     assert_eq!(blocks[0].kind, "raw");
+    assert_eq!(blocks[0].frames.len(), 1);
 }
 
 #[test]
@@ -379,6 +389,7 @@ BACKTRACE_END\n",
 
     let text = fs::read_to_string(&log_path).unwrap();
     let blocks = parse_blocks(&text).unwrap();
+    assert_eq!(blocks.len(), 2);
     assert_eq!(blocks[0].kind, "panic");
     assert_eq!(blocks[1].kind, "trap");
 }
@@ -399,6 +410,7 @@ BACKTRACE_END\n",
 
     let text = fs::read_to_string(&log_path).unwrap();
     let blocks = parse_blocks(&text).unwrap();
+    assert_eq!(blocks.len(), 1);
     assert_eq!(blocks[0].errors, vec!["requires_alloc".to_string()]);
 }
 
@@ -453,6 +465,7 @@ BACKTRACE_END\n",
     capture.finish().unwrap();
     assert!(!log_path.is_file());
     let blocks = pending.lock().unwrap();
+    assert_eq!(blocks.len(), 1);
     assert!(blocks[0][0].contains("BACKTRACE_BEGIN"));
 }
 

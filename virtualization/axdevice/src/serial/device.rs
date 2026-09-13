@@ -3,8 +3,8 @@
 use alloc::{boxed::Box, sync::Arc};
 
 use axdevice_base::{
-    AccessWidth, BusKind, Device, DeviceAccess, DeviceContext, DeviceError, InterruptTriggerMode,
-    IrqLine, Resource,
+    AccessWidth, BusAccess, BusKind, BusResponse, Device, DeviceAccess, DeviceError,
+    InterruptTriggerMode, IrqLine, Resource,
 };
 
 use crate::{
@@ -47,46 +47,25 @@ impl Device for Uart16550PortDevice {
         &self.resources
     }
 
-    fn read(
+    fn access(
         &self,
-        access: &DeviceAccess,
-        _context: &mut dyn DeviceContext,
-    ) -> Result<u64, DeviceError> {
-        let offset = self.offset(access)?;
-        self.core.read(offset, AccessWidth::Byte)
-    }
-
-    fn write(
-        &self,
-        access: &DeviceAccess,
-        value: u64,
-        _context: &mut dyn DeviceContext,
-    ) -> Result<(), DeviceError> {
-        let offset = self.offset(access)?;
-        self.core.write(offset, AccessWidth::Byte, value)
-    }
-}
-
-impl Uart16550PortDevice {
-    fn offset(&self, access: &DeviceAccess) -> Result<usize, DeviceError> {
-        if access.bus() != BusKind::Port {
-            return Err(DeviceError::OutOfRange {
-                addr: access.address(),
-            });
+        access: &BusAccess,
+        _context: &mut dyn DeviceAccess,
+    ) -> Result<BusResponse, DeviceError> {
+        if access.kind != BusKind::Port {
+            return Err(DeviceError::OutOfRange { addr: access.addr });
         }
-        let offset = u16::try_from(access.address())
+        let offset = u16::try_from(access.addr)
             .ok()
             .and_then(|port| port.checked_sub(self.base))
-            .ok_or(DeviceError::OutOfRange {
-                addr: access.address(),
-            })? as usize;
-        if access.width() != AccessWidth::Byte {
+            .ok_or(DeviceError::OutOfRange { addr: access.addr })? as usize;
+        if access.width != AccessWidth::Byte {
             return Err(DeviceError::InvalidWidth {
                 expected: AccessWidth::Byte,
-                actual: access.width(),
+                actual: access.width,
             });
         }
-        Ok(offset)
+        handle_16550(&self.core, offset, access)
     }
 }
 
@@ -137,41 +116,21 @@ impl Device for Uart16550MmioDevice {
         &self.resources
     }
 
-    fn read(
+    fn access(
         &self,
-        access: &DeviceAccess,
-        _context: &mut dyn DeviceContext,
-    ) -> Result<u64, DeviceError> {
-        self.core.read(self.register(access)?, AccessWidth::Byte)
-    }
-
-    fn write(
-        &self,
-        access: &DeviceAccess,
-        value: u64,
-        _context: &mut dyn DeviceContext,
-    ) -> Result<(), DeviceError> {
-        self.core
-            .write(self.register(access)?, AccessWidth::Byte, value)
-    }
-}
-
-impl Uart16550MmioDevice {
-    fn register(&self, access: &DeviceAccess) -> Result<usize, DeviceError> {
-        if access.bus() != BusKind::Mmio {
-            return Err(DeviceError::OutOfRange {
-                addr: access.address(),
-            });
+        access: &BusAccess,
+        _context: &mut dyn DeviceAccess,
+    ) -> Result<BusResponse, DeviceError> {
+        if access.kind != BusKind::Mmio {
+            return Err(DeviceError::OutOfRange { addr: access.addr });
         }
         let offset = access
-            .address()
+            .addr
             .checked_sub(self.base)
-            .ok_or(DeviceError::OutOfRange {
-                addr: access.address(),
-            })?;
-        usize::try_from(offset >> self.register_shift).map_err(|_| DeviceError::OutOfRange {
-            addr: access.address(),
-        })
+            .ok_or(DeviceError::OutOfRange { addr: access.addr })?;
+        let register = usize::try_from(offset >> self.register_shift)
+            .map_err(|_| DeviceError::OutOfRange { addr: access.addr })?;
+        handle_16550(&self.core, register, access)
     }
 }
 
@@ -219,40 +178,28 @@ impl Device for Pl011MmioDevice {
         &self.resources
     }
 
-    fn read(
+    fn access(
         &self,
-        access: &DeviceAccess,
-        _context: &mut dyn DeviceContext,
-    ) -> Result<u64, DeviceError> {
-        self.core.read(self.offset(access)?, access.width())
-    }
-
-    fn write(
-        &self,
-        access: &DeviceAccess,
-        value: u64,
-        _context: &mut dyn DeviceContext,
-    ) -> Result<(), DeviceError> {
-        self.core.write(self.offset(access)?, access.width(), value)
-    }
-}
-
-impl Pl011MmioDevice {
-    fn offset(&self, access: &DeviceAccess) -> Result<usize, DeviceError> {
-        if access.bus() != BusKind::Mmio {
-            return Err(DeviceError::OutOfRange {
-                addr: access.address(),
-            });
+        access: &BusAccess,
+        _context: &mut dyn DeviceAccess,
+    ) -> Result<BusResponse, DeviceError> {
+        if access.kind != BusKind::Mmio {
+            return Err(DeviceError::OutOfRange { addr: access.addr });
         }
         let offset = access
-            .address()
+            .addr
             .checked_sub(self.base)
-            .ok_or(DeviceError::OutOfRange {
-                addr: access.address(),
-            })?;
-        usize::try_from(offset).map_err(|_| DeviceError::OutOfRange {
-            addr: access.address(),
-        })
+            .ok_or(DeviceError::OutOfRange { addr: access.addr })?;
+        let offset =
+            usize::try_from(offset).map_err(|_| DeviceError::OutOfRange { addr: access.addr })?;
+        if access.is_read {
+            self.core
+                .read(offset, access.width)
+                .map(|value| BusResponse::Read { value })
+        } else {
+            self.core.write(offset, access.width, access.data)?;
+            Ok(BusResponse::Write)
+        }
     }
 }
 
@@ -314,6 +261,22 @@ where
     DeviceBundle::new()
         .with_registration(DeviceRegistration::Device(device.clone()))
         .with_registration(DeviceRegistration::Pollable(device))
+}
+
+fn handle_16550(
+    core: &Uart16550,
+    register: usize,
+    access: &BusAccess,
+) -> Result<BusResponse, DeviceError> {
+    // QEMU's serial-mm adapter uses the access address only to select the
+    // register and always transfers the low byte to the 16550 core.
+    if access.is_read {
+        core.read(register, AccessWidth::Byte)
+            .map(|value| BusResponse::Read { value })
+    } else {
+        core.write(register, AccessWidth::Byte, access.data)?;
+        Ok(BusResponse::Write)
+    }
 }
 
 fn irq_resource(irq_id: usize) -> Resource {
@@ -392,8 +355,7 @@ mod tests {
             backend.clone(),
             level_irq(365),
         );
-        let source = axdevice_base::DeviceVcpuId::new(0);
-        let mut context = axdevice_base::NoopDeviceContext::new(axdevice_base::DeviceId::new(0));
+        let mut context = axdevice_base::NoopDeviceAccess::new(axdevice_base::DeviceId::new(0));
 
         for width in [
             AccessWidth::Byte,
@@ -402,9 +364,14 @@ mod tests {
             AccessWidth::Qword,
         ] {
             device
-                .write(
-                    &DeviceAccess::new(source, BusKind::Mmio, BASE, width),
-                    0xfeed_0000_0000_005a,
+                .access(
+                    &BusAccess {
+                        kind: BusKind::Mmio,
+                        is_read: false,
+                        addr: BASE,
+                        width,
+                        data: 0xfeed_0000_0000_005a,
+                    },
                     &mut context,
                 )
                 .unwrap();
@@ -412,30 +379,47 @@ mod tests {
         assert_eq!(backend.output.lock().unwrap().as_slice(), b"ZZZZ");
 
         device
-            .write(
-                &DeviceAccess::new(source, BusKind::Mmio, BASE + 4, AccessWidth::Byte),
-                1,
+            .access(
+                &BusAccess {
+                    kind: BusKind::Mmio,
+                    is_read: false,
+                    addr: BASE + 4,
+                    width: AccessWidth::Byte,
+                    data: 1,
+                },
                 &mut context,
             )
             .unwrap();
-        assert_eq!(
+        assert!(matches!(
             device
-                .read(
-                    &DeviceAccess::new(source, BusKind::Mmio, BASE + 4, AccessWidth::Byte),
+                .access(
+                    &BusAccess {
+                        kind: BusKind::Mmio,
+                        is_read: true,
+                        addr: BASE + 4,
+                        width: AccessWidth::Byte,
+                        data: 0,
+                    },
                     &mut context,
                 )
                 .unwrap(),
-            1
-        );
+            BusResponse::Read { value: 1 }
+        ));
 
-        assert_eq!(
+        assert!(matches!(
             device
-                .read(
-                    &DeviceAccess::new(source, BusKind::Mmio, BASE + 0x88, AccessWidth::Dword,),
+                .access(
+                    &BusAccess {
+                        kind: BusKind::Mmio,
+                        is_read: true,
+                        addr: BASE + 0x88,
+                        width: AccessWidth::Dword,
+                        data: 0,
+                    },
                     &mut context,
                 )
                 .unwrap(),
-            0
-        );
+            BusResponse::Read { value: 0 }
+        ));
     }
 }

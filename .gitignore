@@ -45,6 +45,7 @@ __pycache__/
 /.cargo/.config-local.toml
 .axconfig*
 *.img
+!.claude/skills/*
 /tmp/*
 *.vi
 
@@ -54,19 +55,13 @@ __pycache__/
 .board*
 
 # Tooling artifacts
-.direnv/
-.ci-cache/
 .codex
-/.agents/*
-!/.agents/skills/
-!/.agents/skills/**
+.agents
 .image.toml
 coverage/
 third_party/
 os/StarryOS-REF
-.DS_Store
-*.tmp
-*.swp
+.Ds_Store
 starry-*.log
 loongarch64-axvisor-guest-tests.md
 

@@ -1,6 +1,6 @@
 use super::*;
 
-impl sdmmc_host::SdMmcHost for Sdhci {
+impl sdio_host2::SdioHost for Sdhci {
     type TransactionRequest<'a>
         = TransactionRequest<'a>
     where
@@ -9,14 +9,14 @@ impl sdmmc_host::SdMmcHost for Sdhci {
 
     unsafe fn submit_transaction<'a>(
         &mut self,
-        transaction: sdmmc_host::Transaction<'a>,
-    ) -> Result<Self::TransactionRequest<'a>, sdmmc_host::Error>
+        transaction: sdio_host2::Transaction<'a>,
+    ) -> Result<Self::TransactionRequest<'a>, sdio_host2::Error>
     where
         Self: 'a,
     {
         self.check_not_poisoned().map_err(map_protocol_error)?;
         if !self.physical_bus_idle() {
-            return Err(sdmmc_host::Error::Busy);
+            return Err(sdio_host2::Error::Busy);
         }
         let owner = self.host2_owner();
         let id = self.start_host2_request();
@@ -36,10 +36,10 @@ impl sdmmc_host::SdMmcHost for Sdhci {
                 let block_size = u32::from(phase.block_size.get());
                 let block_count = phase.block_count.get();
                 let request = match phase.buffer {
-                    sdmmc_host::DataBuffer::Read(buf) => {
-                        if !matches!(phase.direction, sdmmc_host::DataDirection::Read) {
+                    sdio_host2::DataBuffer::Read(buf) => {
+                        if !matches!(phase.direction, sdio_host2::DataDirection::Read) {
                             self.finish_host2_request(id);
-                            return Err(sdmmc_host::Error::InvalidArgument);
+                            return Err(sdio_host2::Error::InvalidArgument);
                         }
                         self.submit_borrowed_read_data(
                             &transaction.command,
@@ -48,10 +48,10 @@ impl sdmmc_host::SdMmcHost for Sdhci {
                             block_count,
                         )
                     }
-                    sdmmc_host::DataBuffer::Write(buf) => {
-                        if !matches!(phase.direction, sdmmc_host::DataDirection::Write) {
+                    sdio_host2::DataBuffer::Write(buf) => {
+                        if !matches!(phase.direction, sdio_host2::DataDirection::Write) {
                             self.finish_host2_request(id);
-                            return Err(sdmmc_host::Error::InvalidArgument);
+                            return Err(sdio_host2::Error::InvalidArgument);
                         }
                         self.submit_borrowed_write_data(
                             &transaction.command,
@@ -60,9 +60,9 @@ impl sdmmc_host::SdMmcHost for Sdhci {
                             block_count,
                         )
                     }
-                    sdmmc_host::DataBuffer::Dma(_) => {
+                    sdio_host2::DataBuffer::Dma(_) => {
                         self.finish_host2_request(id);
-                        return Err(sdmmc_host::Error::InvalidArgument);
+                        return Err(sdio_host2::Error::InvalidArgument);
                     }
                 }
                 .inspect_err(|_| self.finish_host2_request(id))
@@ -74,29 +74,29 @@ impl sdmmc_host::SdMmcHost for Sdhci {
 
     unsafe fn submit_transaction_owned<'a>(
         &mut self,
-        transaction: sdmmc_host::Transaction<'a>,
-    ) -> Result<Self::TransactionRequest<'a>, sdmmc_host::SubmitTransactionError<'a>>
+        transaction: sdio_host2::Transaction<'a>,
+    ) -> Result<Self::TransactionRequest<'a>, sdio_host2::SubmitTransactionError<'a>>
     where
         Self: 'a,
     {
         if let Err(err) = self.check_not_poisoned() {
-            return Err(sdmmc_host::SubmitTransactionError::new(
+            return Err(sdio_host2::SubmitTransactionError::new(
                 map_protocol_error(err),
                 transaction,
             ));
         }
         if !matches!(
             transaction.data.as_ref().map(|data| &data.buffer),
-            Some(sdmmc_host::DataBuffer::Dma(_))
+            Some(sdio_host2::DataBuffer::Dma(_))
         ) {
-            return Err(sdmmc_host::SubmitTransactionError::new(
-                sdmmc_host::Error::Unsupported,
+            return Err(sdio_host2::SubmitTransactionError::new(
+                sdio_host2::Error::Unsupported,
                 transaction,
             ));
         }
         if !self.physical_bus_idle() {
-            return Err(sdmmc_host::SubmitTransactionError::new(
-                sdmmc_host::Error::Busy,
+            return Err(sdio_host2::SubmitTransactionError::new(
+                sdio_host2::Error::Busy,
                 transaction,
             ));
         }
@@ -109,23 +109,23 @@ impl sdmmc_host::SdMmcHost for Sdhci {
         };
         let block_size = u32::from(phase.block_size.get());
         let block_count = phase.block_count.get();
-        let sdmmc_host::DataBuffer::Dma(buffer) = phase.buffer else {
+        let sdio_host2::DataBuffer::Dma(buffer) = phase.buffer else {
             unreachable!("checked for DMA data buffer above")
         };
         let protocol_direction = match phase.direction {
-            sdmmc_host::DataDirection::Read => DataDirection::Read,
-            sdmmc_host::DataDirection::Write => DataDirection::Write,
+            sdio_host2::DataDirection::Read => DataDirection::Read,
+            sdio_host2::DataDirection::Write => DataDirection::Write,
             _ => {
                 self.finish_host2_request(host2_id);
-                let data = sdmmc_host::DataPhase {
+                let data = sdio_host2::DataPhase {
                     direction: phase.direction,
                     block_size: phase.block_size,
                     block_count: phase.block_count,
-                    buffer: sdmmc_host::DataBuffer::Dma(buffer),
+                    buffer: sdio_host2::DataBuffer::Dma(buffer),
                 };
-                return Err(sdmmc_host::SubmitTransactionError::new(
-                    sdmmc_host::Error::Unsupported,
-                    sdmmc_host::Transaction::with_data(transaction.command, data),
+                return Err(sdio_host2::SubmitTransactionError::new(
+                    sdio_host2::Error::Unsupported,
+                    sdio_host2::Transaction::with_data(transaction.command, data),
                 ));
             }
         };
@@ -136,31 +136,31 @@ impl sdmmc_host::SdMmcHost for Sdhci {
             protocol_direction,
         ) {
             self.finish_host2_request(host2_id);
-            let tx = sdmmc_host::Transaction::with_data(
+            let tx = sdio_host2::Transaction::with_data(
                 transaction.command,
-                sdmmc_host::DataPhase {
+                sdio_host2::DataPhase {
                     direction: phase.direction,
                     block_size: phase.block_size,
                     block_count: phase.block_count,
-                    buffer: sdmmc_host::DataBuffer::Dma(buffer),
+                    buffer: sdio_host2::DataBuffer::Dma(buffer),
                 },
             );
-            return Err(sdmmc_host::SubmitTransactionError::new(
-                sdmmc_host::Error::Unsupported,
+            return Err(sdio_host2::SubmitTransactionError::new(
+                sdio_host2::Error::Unsupported,
                 tx,
             ));
         }
         let Some(dma) = self.dma.take() else {
             self.finish_host2_request(host2_id);
-            let data = sdmmc_host::DataPhase {
+            let data = sdio_host2::DataPhase {
                 direction: phase.direction,
                 block_size: phase.block_size,
                 block_count: phase.block_count,
-                buffer: sdmmc_host::DataBuffer::Dma(buffer),
+                buffer: sdio_host2::DataBuffer::Dma(buffer),
             };
-            return Err(sdmmc_host::SubmitTransactionError::new(
-                sdmmc_host::Error::Unsupported,
-                sdmmc_host::Transaction::with_data(transaction.command, data),
+            return Err(sdio_host2::SubmitTransactionError::new(
+                sdio_host2::Error::Unsupported,
+                sdio_host2::Transaction::with_data(transaction.command, data),
             ));
         };
         let mut slot = BlockRequestSlot::default();
@@ -189,15 +189,15 @@ impl sdmmc_host::SdMmcHost for Sdhci {
                 self.finish_host2_request(host2_id);
                 let error = err.error;
                 let buffer = err.into_buffer();
-                let data = sdmmc_host::DataPhase {
+                let data = sdio_host2::DataPhase {
                     direction: phase.direction,
                     block_size: phase.block_size,
                     block_count: phase.block_count,
-                    buffer: sdmmc_host::DataBuffer::Dma(buffer),
+                    buffer: sdio_host2::DataBuffer::Dma(buffer),
                 };
-                Err(sdmmc_host::SubmitTransactionError::new(
+                Err(sdio_host2::SubmitTransactionError::new(
                     map_protocol_error(error),
-                    sdmmc_host::Transaction::with_data(transaction.command, data),
+                    sdio_host2::Transaction::with_data(transaction.command, data),
                 ))
             }
         }
@@ -206,16 +206,16 @@ impl sdmmc_host::SdMmcHost for Sdhci {
     fn advance_transaction<'a>(
         &mut self,
         request: &mut Self::TransactionRequest<'a>,
-        cause: sdmmc_host::ProgressCause,
-    ) -> Result<sdmmc_host::RequestProgress<sdmmc_host::RawResponse>, sdmmc_host::AdvanceRequestError>
+        cause: sdio_host2::ProgressCause,
+    ) -> Result<sdio_host2::RequestProgress<sdio_host2::RawResponse>, sdio_host2::AdvanceRequestError>
     where
         Self: 'a,
     {
         self.check_host2_transaction_request(request)?;
-        let acknowledged_irq = cause == sdmmc_host::ProgressCause::AcknowledgedIrq;
+        let acknowledged_irq = cause == sdio_host2::ProgressCause::AcknowledgedIrq;
         request.acknowledged_irq |= acknowledged_irq;
         if !acknowledged_irq && !self.command_needs_register_retry() {
-            return Ok(sdmmc_host::RequestProgress::WaitingForIrq);
+            return Ok(sdio_host2::RequestProgress::WaitingForIrq);
         }
         match request.kind {
             TransactionRequestKind::Command { response } if !acknowledged_irq => {
@@ -227,24 +227,24 @@ impl sdmmc_host::SdMmcHost for Sdhci {
                         match self.take_command_response() {
                             Ok(response_value) => {
                                 self.complete_host2_transaction_request(request);
-                                Ok(sdmmc_host::RequestProgress::Complete(Ok(
+                                Ok(sdio_host2::RequestProgress::Complete(Ok(
                                     response_value.to_raw_response(response)
                                 )))
                             }
                             Err(error) => {
                                 self.complete_host2_transaction_request(request);
-                                Ok(sdmmc_host::RequestProgress::Complete(Err(
+                                Ok(sdio_host2::RequestProgress::Complete(Err(
                                     map_protocol_error(error),
                                 )))
                             }
                         }
                     }
                     Ok(sdmmc_protocol::CommandProgress::Complete) => {
-                        Ok(sdmmc_host::RequestProgress::WaitingForIrq)
+                        Ok(sdio_host2::RequestProgress::WaitingForIrq)
                     }
                     Err(error) => {
                         self.complete_host2_transaction_request(request);
-                        Ok(sdmmc_host::RequestProgress::Complete(Err(
+                        Ok(sdio_host2::RequestProgress::Complete(Err(
                             map_protocol_error(error),
                         )))
                     }
@@ -256,13 +256,13 @@ impl sdmmc_host::SdMmcHost for Sdhci {
                 }
                 Ok(sdmmc_protocol::CommandResponseProgress::Complete(resp)) => {
                     self.complete_host2_transaction_request(request);
-                    Ok(sdmmc_host::RequestProgress::Complete(Ok(
+                    Ok(sdio_host2::RequestProgress::Complete(Ok(
                         resp.to_raw_response(response)
                     )))
                 }
                 Err(err) => {
                     self.complete_host2_transaction_request(request);
-                    Ok(sdmmc_host::RequestProgress::Complete(Err(
+                    Ok(sdio_host2::RequestProgress::Complete(Err(
                         map_protocol_error(err),
                     )))
                 }
@@ -270,8 +270,8 @@ impl sdmmc_host::SdMmcHost for Sdhci {
             TransactionRequestKind::Data { response } => {
                 let Some(data) = request.data.as_mut() else {
                     let recovery = self.abort_host2_transaction_request(request).err();
-                    return Ok(sdmmc_host::RequestProgress::Complete(Err(
-                        recovery.unwrap_or(sdmmc_host::Error::InvalidArgument)
+                    return Ok(sdio_host2::RequestProgress::Complete(Err(
+                        recovery.unwrap_or(sdio_host2::Error::InvalidArgument)
                     )));
                 };
                 match self.progress_block_request(&mut data.request, data.id, &mut data.slot, cause)
@@ -279,16 +279,16 @@ impl sdmmc_host::SdMmcHost for Sdhci {
                     Ok(DataCommandProgress::Pending) => Ok(self.pending_transaction_progress()),
                     Ok(DataCommandProgress::Complete(resp)) if request.acknowledged_irq => {
                         self.complete_host2_transaction_request(request);
-                        Ok(sdmmc_host::RequestProgress::Complete(Ok(
+                        Ok(sdio_host2::RequestProgress::Complete(Ok(
                             resp.to_raw_response(response)
                         )))
                     }
                     Ok(DataCommandProgress::Complete(_)) => {
-                        Ok(sdmmc_host::RequestProgress::WaitingForIrq)
+                        Ok(sdio_host2::RequestProgress::WaitingForIrq)
                     }
                     Err(err) => {
                         let _ = self.abort_host2_transaction_request(request);
-                        Ok(sdmmc_host::RequestProgress::Complete(Err(
+                        Ok(sdio_host2::RequestProgress::Complete(Err(
                             map_protocol_error(err),
                         )))
                     }
@@ -300,7 +300,7 @@ impl sdmmc_host::SdMmcHost for Sdhci {
     fn abort_transaction<'a>(
         &mut self,
         request: &mut Self::TransactionRequest<'a>,
-    ) -> Result<(), sdmmc_host::Error>
+    ) -> Result<(), sdio_host2::Error>
     where
         Self: 'a,
     {
@@ -308,7 +308,7 @@ impl sdmmc_host::SdMmcHost for Sdhci {
             return Ok(());
         }
         if request.owner != self.host2_owner() {
-            return Err(sdmmc_host::Error::InvalidArgument);
+            return Err(sdio_host2::Error::InvalidArgument);
         }
         self.abort_host2_transaction_request(request)
     }
@@ -328,11 +328,11 @@ impl sdmmc_host::SdMmcHost for Sdhci {
 
     unsafe fn submit_bus_op(
         &mut self,
-        op: sdmmc_host::BusOp,
-    ) -> Result<Self::BusRequest, sdmmc_host::Error> {
+        op: sdio_host2::BusOp,
+    ) -> Result<Self::BusRequest, sdio_host2::Error> {
         self.check_not_poisoned().map_err(map_protocol_error)?;
         if !self.physical_bus_idle() {
-            return Err(sdmmc_host::Error::Busy);
+            return Err(sdio_host2::Error::Busy);
         }
         let state = self.prepare_host2_bus_op(op)?;
         let owner = self.host2_owner();
@@ -343,37 +343,37 @@ impl sdmmc_host::SdMmcHost for Sdhci {
     fn advance_bus_op(
         &mut self,
         request: &mut Self::BusRequest,
-        cause: sdmmc_host::ProgressCause,
-    ) -> Result<sdmmc_host::RequestProgress<()>, sdmmc_host::AdvanceRequestError> {
+        cause: sdio_host2::ProgressCause,
+    ) -> Result<sdio_host2::RequestProgress<()>, sdio_host2::AdvanceRequestError> {
         self.check_host2_bus_request(request)?;
         match self.advance_host2_bus_state(&mut request.state, cause) {
             Ok(
-                progress @ (sdmmc_host::RequestProgress::WaitingForIrq
-                | sdmmc_host::RequestProgress::RegisterPending { .. }),
+                progress @ (sdio_host2::RequestProgress::WaitingForIrq
+                | sdio_host2::RequestProgress::RegisterPending { .. }),
             ) => Ok(progress),
-            Ok(sdmmc_host::RequestProgress::Complete(Ok(()))) => {
+            Ok(sdio_host2::RequestProgress::Complete(Ok(()))) => {
                 self.complete_host2_bus_request(request);
-                Ok(sdmmc_host::RequestProgress::Complete(Ok(())))
+                Ok(sdio_host2::RequestProgress::Complete(Ok(())))
             }
-            Ok(sdmmc_host::RequestProgress::Complete(Err(err))) => {
+            Ok(sdio_host2::RequestProgress::Complete(Err(err))) => {
                 let _ = self.abort_host2_bus_state(&mut request.state);
                 self.complete_host2_bus_request(request);
-                Ok(sdmmc_host::RequestProgress::Complete(Err(err)))
+                Ok(sdio_host2::RequestProgress::Complete(Err(err)))
             }
             Err(err) => {
                 let _ = self.abort_host2_bus_state(&mut request.state);
                 self.complete_host2_bus_request(request);
-                Ok(sdmmc_host::RequestProgress::Complete(Err(err)))
+                Ok(sdio_host2::RequestProgress::Complete(Err(err)))
             }
         }
     }
 
-    fn abort_bus_op(&mut self, request: &mut Self::BusRequest) -> Result<(), sdmmc_host::Error> {
+    fn abort_bus_op(&mut self, request: &mut Self::BusRequest) -> Result<(), sdio_host2::Error> {
         if request.done {
             return Ok(());
         }
         if request.owner != self.host2_owner() {
-            return Err(sdmmc_host::Error::InvalidArgument);
+            return Err(sdio_host2::Error::InvalidArgument);
         }
         let result = self.abort_host2_bus_state(&mut request.state);
         request.done = true;

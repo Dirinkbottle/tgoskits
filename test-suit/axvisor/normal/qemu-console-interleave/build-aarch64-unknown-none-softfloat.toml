@@ -1,6 +1,0 @@
-features = [
-    "test-console-interleave",
-]
-log = "Info"
-target = "aarch64-unknown-none-softfloat"
-vm_configs = []

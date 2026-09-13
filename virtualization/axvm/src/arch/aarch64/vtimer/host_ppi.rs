@@ -4,12 +4,10 @@ use std::{format, sync::OnceLock, vec::Vec};
 
 use ax_std::os::arceos::modules::ax_hal::irq;
 
+use super::percpu::{PerCpuIrqControl, claim_enabled_percpu_irq};
 use crate::{
     AxVmError, AxVmResult,
-    host::{
-        HostCpu, default_host,
-        percpu_irq::{PerCpuIrqControl, claim_enabled_percpu_irq},
-    },
+    host::{HostCpu, default_host},
 };
 
 /// The architectural CNTV PPI is a host capability, not a per-VM resource.

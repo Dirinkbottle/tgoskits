@@ -38,7 +38,7 @@ pub enum OnProbeError {
     #[error("kerror: {0}")]
     KError(#[from] rdif_base::KError),
     #[error("other error: {0}")]
-    Other(#[from] Box<dyn Error + Send + Sync>),
+    Other(#[from] Box<dyn Error>),
     #[error("fdt parse error: {0}")]
     Fdt(String),
     #[error("unsupported probe backend: {0}")]

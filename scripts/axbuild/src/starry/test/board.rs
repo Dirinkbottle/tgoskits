@@ -34,7 +34,6 @@ pub(crate) fn collect_board_test_groups(
             target,
             build_config_path: info.build_config_path,
             board_test_config_path: info.board_test_config_path,
-            required_env: info.required_env,
         });
     }
 
@@ -69,11 +68,6 @@ impl Starry {
                 );
                 continue;
             }
-            let missing_env = board_test::missing_required_env(&group.required_env);
-            if !missing_env.is_empty() {
-                run_state.skip_group(group_label, &missing_env);
-                continue;
-            }
 
             let result = async {
                 let request = self.prepare_request(
@@ -83,11 +77,9 @@ impl Starry {
                     SnapshotPersistence::Discard,
                 )?;
                 let cargo = build::load_cargo_config(&request)?;
-                let (mut board_config, board_config_path) = self
+                let (board_config, board_config_path) = self
                     .load_board_config(&cargo, Some(board_test_config.as_path()))
                     .await?;
-                let _boot_entropy =
-                    crate::starry::boot_entropy::prepare_for_secure_wifi(&mut board_config)?;
                 let options = RunBoardOptions {
                     board_type: args.board_type.clone(),
                     server: args.server.clone(),

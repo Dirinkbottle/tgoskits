@@ -10,9 +10,17 @@ use crate::{AxVMRef, AxVmResult, GuestPhysAddr, VMMemoryRegion, ax_err, ax_err_t
 
 mod linux;
 
+pub use crate::arch::ImageLoader;
+
+/// Return whether an x86 configuration selects direct Linux bzImage boot.
+///
+/// This returns `false` on non-x86 targets.
+pub fn is_x86_linux_image_config(config: &GuestConfig, provider: &dyn BootImageProvider) -> bool {
+    crate::arch::is_x86_linux_image_config(config, provider)
+}
+
 /// Return the q35 PCI INTx route reserved for the passthrough block device.
-#[cfg(all(target_arch = "x86_64", any(test, feature = "host-fs")))]
-pub(crate) const fn x86_qemu_passthrough_block_intx() -> (u8, u8, u8, usize) {
+pub const fn x86_qemu_passthrough_block_intx() -> (u8, u8, u8, usize) {
     (3, 0, 1, 19)
 }
 
@@ -76,10 +84,10 @@ impl<'a> ImageLoaderCore<'a> {
         match self.config.kernel.image_location.as_deref() {
             Some("memory") => {
                 let images = memory_images_for_vm(&self.config, self.provider)?;
-                crate::arch::current::load_images_from_memory(self, images)
+                crate::arch::load_images_from_memory(self, images)
             }
             #[cfg(any(feature = "fs", feature = "host-fs"))]
-            Some("fs") => crate::arch::current::load_images_from_filesystem(self),
+            Some("fs") => crate::arch::load_images_from_filesystem(self),
             _ => ax_err!(
                 InvalidInput,
                 "Unsupported image_location; use \"memory\" or enable fs feature for \"fs\""
@@ -249,10 +257,7 @@ pub fn load_vm_image_from_memory(
                 bytes_to_write,
             );
         }
-        crate::arch::current::make_guest_memory_visible(
-            (region.as_ptr() as usize).into(),
-            bytes_to_write,
-        );
+        crate::clean_dcache_range((region.as_ptr() as usize).into(), bytes_to_write);
         buffer_pos += bytes_to_write;
         if buffer_pos == image_size {
             break;
@@ -304,10 +309,7 @@ pub mod fs {
             })?;
             buffer.copy_from_slice(data);
             offset = end;
-            crate::arch::current::make_guest_memory_visible(
-                (buffer.as_ptr() as usize).into(),
-                buffer.len(),
-            );
+            crate::clean_dcache_range((buffer.as_ptr() as usize).into(), buffer.len());
         }
         Ok(())
     }

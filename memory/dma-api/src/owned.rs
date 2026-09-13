@@ -1,8 +1,6 @@
 use core::{mem::ManuallyDrop, num::NonZeroUsize, ptr::NonNull};
 
-use crate::{
-    ContiguousArray, DeviceDma, DmaAddr, DmaCoherency, DmaDirection, DmaDomainId, DmaError,
-};
+use crate::{ContiguousArray, DeviceDma, DmaAddr, DmaDirection, DmaDomainId, DmaError};
 
 /// One device-visible DMA segment owned by a prepared request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,10 +65,6 @@ impl CpuDmaBuffer {
         self.domain
     }
 
-    pub fn coherency(&self) -> DmaCoherency {
-        self.backing.coherency()
-    }
-
     pub fn cpu_ptr(&self) -> NonNull<u8> {
         self.backing.as_ptr()
     }
@@ -95,12 +89,24 @@ impl CpuDmaBuffer {
         unsafe { self.backing.as_mut_slice_cpu() }
     }
 
-    pub fn copy_from_slice_cpu(&mut self, src: &[u8]) {
-        self.backing.copy_from_slice_cpu(src);
+    pub fn copy_to_device_from_slice(&mut self, src: &[u8]) {
+        self.backing.copy_to_device_from_slice(src);
+    }
+
+    pub fn copy_from_device_to_slice(&self, dst: &mut [u8]) {
+        self.backing.copy_from_device_to_slice(dst);
+    }
+
+    pub fn prepare_for_device_all(&self) {
+        self.backing.prepare_for_device_all();
+    }
+
+    pub fn complete_for_cpu_all(&self) {
+        self.backing.complete_for_cpu_all();
     }
 
     pub fn prepare_for_device(self) -> PreparedDma {
-        self.backing.prepare_for_device(0..self.backing.bytes_len());
+        self.prepare_for_device_all();
         PreparedDma { buffer: self }
     }
 }
@@ -121,10 +127,6 @@ impl PreparedDma {
 
     pub const fn domain_id(&self) -> DmaDomainId {
         self.buffer.domain_id()
-    }
-
-    pub fn coherency(&self) -> DmaCoherency {
-        self.buffer.coherency()
     }
 
     pub fn cpu_ptr(&self) -> NonNull<u8> {
@@ -156,9 +158,7 @@ impl PreparedDma {
             self.buffer.direction(),
             DmaDirection::FromDevice | DmaDirection::Bidirectional
         ) {
-            self.buffer
-                .backing
-                .complete_for_cpu(0..self.buffer.backing.bytes_len());
+            self.buffer.complete_for_cpu_all();
         }
         CompletedDma {
             buffer: self.buffer,
@@ -198,10 +198,6 @@ impl InFlightDma {
         self.prepared.domain_id()
     }
 
-    pub fn coherency(&self) -> DmaCoherency {
-        self.prepared.coherency()
-    }
-
     pub fn cpu_ptr(&self) -> NonNull<u8> {
         self.prepared.cpu_ptr()
     }
@@ -224,10 +220,7 @@ impl InFlightDma {
             prepared.buffer.direction(),
             DmaDirection::FromDevice | DmaDirection::Bidirectional
         ) {
-            prepared
-                .buffer
-                .backing
-                .complete_for_cpu(0..prepared.buffer.backing.bytes_len());
+            prepared.buffer.complete_for_cpu_all();
         }
         CompletedDma {
             buffer: prepared.buffer,
@@ -256,10 +249,8 @@ impl CompletedDma {
         self.buffer.direction()
     }
 
-    pub fn copy_to_slice_cpu(&self, dst: &mut [u8]) {
-        self.buffer
-            .backing
-            .read_with_cpu(dst.len(), |src| dst.copy_from_slice(src));
+    pub fn copy_from_device_to_slice(&self, dst: &mut [u8]) {
+        self.buffer.copy_from_device_to_slice(dst);
     }
 
     pub fn into_cpu_buffer(self) -> CpuDmaBuffer {

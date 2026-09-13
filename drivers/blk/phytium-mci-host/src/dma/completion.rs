@@ -10,9 +10,9 @@ impl PhytiumMci {
         request: &mut Option<BlockRequest>,
         id: RequestId,
         slot: &mut BlockRequestSlot,
-        cause: sdmmc_host::ProgressCause,
+        cause: sdio_host2::ProgressCause,
     ) -> Result<DataCommandProgress, Error> {
-        let acknowledged_irq = cause == sdmmc_host::ProgressCause::AcknowledgedIrq;
+        let acknowledged_irq = cause == sdio_host2::ProgressCause::AcknowledgedIrq;
         loop {
             let Some(active) = request.as_ref() else {
                 return Err(Error::InvalidArgument);
