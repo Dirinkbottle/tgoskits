@@ -222,8 +222,8 @@ mod k3_cpu_mask_tests {
 
     #[test]
     fn task_creator_cpu_selects_its_k3_cluster() {
-        assert_eq!(k3_cluster_cpu_range(0, 16), Some(0..8));
-        assert_eq!(k3_cluster_cpu_range(7, 16), Some(0..8));
+        assert_eq!(k3_cluster_cpu_range(0, 7), Some(0..7));
+        assert_eq!(k3_cluster_cpu_range(7, 16), Some(0..16));
         assert_eq!(k3_cluster_cpu_range(8, 16), Some(8..16));
         assert_eq!(k3_cluster_cpu_range(15, 16), Some(8..16));
     }

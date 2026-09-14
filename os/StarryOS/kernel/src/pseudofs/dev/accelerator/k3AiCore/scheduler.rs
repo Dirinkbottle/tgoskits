@@ -58,14 +58,14 @@ impl K3SchedulerOps for K3AiRunner {
             move || {
                 // worker 必须固定在提交该 per-core scheduler 的 CPU 上；否则会跨 core
                 // 读写另一个 core 的无锁队列，真板子上没有额外 cache 同步保证。
-                let affinity_set =
+                let _affinity_set =
                     ax_task::set_current_affinity(AxCpuMask::one_shot(core_id as usize));
-                warn!(
-                    "k3_airunner: scheduler worker affinity target_cpu={}, current_cpu={}, set={}",
-                    core_id,
-                    this_cpu_id(),
-                    affinity_set,
-                );
+                // warn!(
+                //     "k3_airunner: scheduler worker affinity target_cpu={}, current_cpu={}, set={}",
+                //     core_id,
+                //     this_cpu_id(),
+                //     affinity_set,
+                // );
                 f(arg);
             },
             String::from("k3-ai-worker"),
@@ -77,13 +77,13 @@ impl K3SchedulerOps for K3AiRunner {
         let kernel_root = ax_mm::kernel_page_table_root();
         worker_task.ctx_mut().set_page_table_root(kernel_root);
         worker_task.set_cpumask(AxCpuMask::one_shot(core_id as usize));
-        warn!(
-            "k3_airunner: scheduler worker spawn kernel task target_cpu={}, kernel_root={:#x}, \
-             stack_size={:#x}",
-            core_id,
-            kernel_root.as_usize(),
-            worker_stack_size,
-        );
+        // warn!(
+        //     "k3_airunner: scheduler worker spawn kernel task target_cpu={}, kernel_root={:#x}, \
+        //      stack_size={:#x}",
+        //     core_id,
+        //     kernel_root.as_usize(),
+        //     worker_stack_size,
+        // );
         spawn_task(worker_task);
     }
 
@@ -156,21 +156,21 @@ impl K3SchedulerOps for K3AiRunner {
             Backend::Shared(shared) => (shared.pages().clone(), page_offset),
             Backend::Cow(_) => match pin_cow_pages(&mut aspace, range_start, range_len) {
                 Ok(shared_pages) => (shared_pages, 0),
-                Err(err) => {
-                    error!(
-                        "k3_airunner: map_user_to_kernel failed to pin COW pages pid={}, \
-                         user_va={:#x}, len={:#x}, err={:?}",
-                        pid, user_va, len, err
-                    );
+                Err(_err) => {
+                    // error!(
+                    //     "k3_airunner: map_user_to_kernel failed to pin COW pages pid={}, \
+                    //      user_va={:#x}, len={:#x}, err={:?}",
+                    //     pid, user_va, len, err
+                    // );
                     return Err(());
                 }
             },
             _ => {
-                error!(
-                    "k3_airunner: map_user_to_kernel rejected non-shared/non-cow user memory \
-                     pid={}, user_va={:#x}, len={:#x}",
-                    pid, user_va, len
-                );
+                // error!(
+                //     "k3_airunner: map_user_to_kernel rejected non-shared/non-cow user memory \
+                //      pid={}, user_va={:#x}, len={:#x}",
+                //     pid, user_va, len
+                // );
                 return Err(());
             }
         };
@@ -178,14 +178,14 @@ impl K3SchedulerOps for K3AiRunner {
 
         let required_end = page_offset.checked_add(required_pages).ok_or(())?;
         if shared_pages.len() < required_end {
-            info!(
-                "k3_airunner: map_user_to_kernel rejected short SharedPages pid={}, pages={}, \
-                 offset={}, required={}",
-                pid,
-                shared_pages.len(),
-                page_offset,
-                required_pages
-            );
+            // info!(
+            //     "k3_airunner: map_user_to_kernel rejected short SharedPages pid={}, pages={}, \
+            //      offset={}, required={}",
+            //     pid,
+            //     shared_pages.len(),
+            //     page_offset,
+            //     required_pages
+            // );
             return Err(());
         }
 
@@ -253,11 +253,11 @@ impl K3SchedulerOps for K3AiRunner {
             );
         }
 
-        info!(
-            "k3_airunner: map_user_to_kernel pid={}, user_va={:#x}, len={:#x}, kernel_va={:#x}, \
-             map_size={:#x}",
-            pid, user_va, len, kernel_va, kernel_map_size
-        );
+        // info!(
+        //     "k3_airunner: map_user_to_kernel pid={}, user_va={:#x}, len={:#x}, kernel_va={:#x}, \
+        //      map_size={:#x}",
+        //     pid, user_va, len, kernel_va, kernel_map_size
+        // );
         Ok(kernel_va as u64)
     }
 
@@ -271,20 +271,20 @@ impl K3SchedulerOps for K3AiRunner {
         let table = table.as_mut().ok_or(())?;
         let registered = table.get(&kernel_va).ok_or(())?;
         if registered.requested_len != len {
-            info!(
-                "k3_airunner: unmap_user length mismatch kernel_va={:#x}, expected={:#x}, \
-                 got={:#x}",
-                kernel_va, registered.requested_len, len
-            );
+            // info!(
+            //     "k3_airunner: unmap_user length mismatch kernel_va={:#x}, expected={:#x}, \
+            //      got={:#x}",
+            //     kernel_va, registered.requested_len, len
+            // );
             return Err(());
         }
 
         // remove 后 RegisteredUserKernelMapping::drop 会撤销 kernel alias。
         let _mapping = table.remove(&kernel_va).ok_or(())?;
-        info!(
-            "k3_airunner: unmap_user kernel_va={:#x}, len={:#x}",
-            kernel_va, len
-        );
+        // info!(
+        //     "k3_airunner: unmap_user kernel_va={:#x}, len={:#x}",
+        //     kernel_va, len
+        // );
         Ok(())
     }
 }

@@ -3,7 +3,7 @@
 use alloc::{boxed::Box, collections::btree_map::BTreeMap};
 use core::any::Any;
 
-use ax_memory_addr::{MemoryAddr, PAGE_SIZE_4K, PhysAddr, VirtAddr, VirtAddrRange, align_up_4k};
+use ax_memory_addr::{MemoryAddr, PAGE_SIZE_4K, PhysAddr, VirtAddr, VirtAddrRange};
 use ax_runtime::hal::paging::MappingFlags;
 use ax_task::current;
 use axfs_ng_vfs::{NodeFlags, VfsError, VfsResult};
@@ -11,7 +11,7 @@ use k3_ai_scheduler::{K3SchedulerOps, kd_kring::resolve_parsed_graph, scheduler:
 use k3_ai_uabi::{
     AI_ABI_VERSION, AiGraphParser, AiGraphSubmitEntry, AiTensorDesc, GraphSubmitKind,
     K3_AI_IOC_BUILD_CHANNEL, K3_AI_IOC_SUBMIT_GRAPH, K3_CHANNEL_COUNT, K3_CHANNEL_RECIVERID,
-    K3_CHANNEL_SNEDERID, K3AiChannelBuildParam, KernelVa, MAX_DIM,
+    K3_CHANNEL_SNEDERID, K3AiChannelBuildParam, KernelOp, KernelVa, MAX_DIM,
 };
 use ov_channels::{ChannelId, SharedMemory};
 
@@ -27,10 +27,44 @@ use crate::{
     task::AsThread,
 };
 
+fn kernel_op_name(op: KernelOp) -> &'static str {
+    match op.0 {
+        1 => "MAT_MUL",
+        2 => "RMS_NORM",
+        3 => "ROPE",
+        4 => "SOFTMAX",
+        5 => "ADD",
+        6 => "MUL",
+        7 => "SILU",
+        8 => "SCALE",
+        9 => "CONV2D",
+        10 => "SIGMOID",
+        11 => "CONCAT",
+        12 => "TRANSPOSE",
+        13 => "GATHER",
+        14 => "MAX_POOL",
+        15 => "CAST",
+        16 => "RESIZE",
+        17 => "DIV",
+        18 => "TOP_K",
+        19 => "EXPAND",
+        20 => "TILE",
+        21 => "GATHER_ELEMENTS",
+        22 => "SUB",
+        23 => "REDUCE_MAX",
+        24 => "MOD",
+        25 => "GET_ROWS",
+        26 => "SET_ROWS",
+        27 => "GLU",
+        28 => "COPY",
+        _ => "UNKNOWN",
+    }
+}
+
 impl K3AiRunner {
     /// `BUILD_CHANNEL` ioctl: 注册用户态 ovchannel 共享区并建立连续 kernel VA alias。
     fn build_channel(&self, arg: usize) -> VfsResult<usize> {
-        info!("k3_airunner: BUILD_CHANNEL ioctl reached, arg={arg:#x}");
+        // info!("k3_airunner: BUILD_CHANNEL ioctl reached, arg={arg:#x}");
 
         // 先从用户态读 build 参数。
         let build_param = UserPtr::<K3AiChannelBuildParam>::from(arg).get_as_mut()?;
@@ -40,10 +74,10 @@ impl K3AiRunner {
         let pid = curr.as_thread().proc_data.proc.pid();
 
         if build_param.abi_version != AI_ABI_VERSION {
-            error!(
-                "k3_airunner: BUILD_CHANNEL rejected abi mismatch pid={}, user={}, kernel={}",
-                pid, build_param.abi_version, AI_ABI_VERSION
-            );
+            // error!(
+            //     "k3_airunner: BUILD_CHANNEL rejected abi mismatch pid={}, user={}, kernel={}",
+            //     pid, build_param.abi_version, AI_ABI_VERSION
+            // );
             return Err(VfsError::InvalidInput);
         }
 
@@ -80,11 +114,11 @@ impl K3AiRunner {
         let shared_pages = match area.backend() {
             Backend::Shared(shared) => shared.pages().clone(),
             _ => {
-                info!(
-                    "k3_airunner: BUILD_CHANNEL rejected non-shared backend, pid={}, va={:#x}, \
-                     size={:#x}",
-                    pid, user_va, size_bytes
-                );
+                // info!(
+                //     "k3_airunner: BUILD_CHANNEL rejected non-shared backend, pid={}, va={:#x}, \
+                //      size={:#x}",
+                //     pid, user_va, size_bytes
+                // );
                 return Err(VfsError::InvalidInput);
             }
         };
@@ -93,24 +127,24 @@ impl K3AiRunner {
         let shared_memory_size = core::mem::size_of::<SharedMemory<K3_CHANNEL_COUNT>>();
         // 现在内核和用户态都约定 ovchannel 为 SharedMemory<2>。
         if build_param.channel_count != K3_CHANNEL_COUNT as u32 || size_bytes < shared_memory_size {
-            info!(
-                "k3_airunner: BUILD_CHANNEL rejected channel layout pid={}, channels={}, \
-                 size={:#x}",
-                pid, build_param.channel_count, size_bytes
-            );
+            // info!(
+            //     "k3_airunner: BUILD_CHANNEL rejected channel layout pid={}, channels={}, \
+            //      size={:#x}",
+            //     pid, build_param.channel_count, size_bytes
+            // );
             return Err(VfsError::InvalidInput);
         }
 
         // range_len 已经页对齐，alias 需要映射同样数量的 4K 页。
         let required_pages = range_len / PAGE_SIZE_4K;
         if shared_pages.len() < required_pages {
-            info!(
-                "k3_airunner: BUILD_CHANNEL rejected short SharedPages pid={}, pages={}, \
-                 required={}",
-                pid,
-                shared_pages.len(),
-                required_pages
-            );
+            // info!(
+            //     "k3_airunner: BUILD_CHANNEL rejected short SharedPages pid={}, pages={}, \
+            //      required={}",
+            //     pid,
+            //     shared_pages.len(),
+            //     required_pages
+            // );
             return Err(VfsError::InvalidInput);
         }
 
@@ -127,35 +161,35 @@ impl K3AiRunner {
                     && existing.channel_count == build_param.channel_count
                 {
                     // 参数完全一致，幂等返回。
-                    info!(
-                        "k3_airunner: BUILD_CHANNEL pid={} already registered, idempotent return, \
-                         user_va={:#x}, size={:#x}, channels={}",
-                        pid, user_va, size_bytes, build_param.channel_count
-                    );
+                    // info!(
+                    //     "k3_airunner: BUILD_CHANNEL pid={} already registered, idempotent return, \
+                    //      user_va={:#x}, size={:#x}, channels={}",
+                    //     pid, user_va, size_bytes, build_param.channel_count
+                    // );
                     build_param.owner_pid = pid;
                     return Ok(0);
                 }
                 // 参数不一致，打印差异后拒绝。
                 if existing.user_va != user_va {
-                    error!(
-                        "k3_airunner: BUILD_CHANNEL pid={} user_va mismatch: existing={:#x}, \
-                         new={:#x}",
-                        pid, existing.user_va, user_va
-                    );
+                    // error!(
+                    //     "k3_airunner: BUILD_CHANNEL pid={} user_va mismatch: existing={:#x}, \
+                    //      new={:#x}",
+                    //     pid, existing.user_va, user_va
+                    // );
                 }
                 if existing.size_bytes != size_bytes {
-                    error!(
-                        "k3_airunner: BUILD_CHANNEL pid={} size_bytes mismatch: existing={:#x}, \
-                         new={:#x}",
-                        pid, existing.size_bytes, size_bytes
-                    );
+                    // error!(
+                    //     "k3_airunner: BUILD_CHANNEL pid={} size_bytes mismatch: existing={:#x}, \
+                    //      new={:#x}",
+                    //     pid, existing.size_bytes, size_bytes
+                    // );
                 }
                 if existing.channel_count != build_param.channel_count {
-                    error!(
-                        "k3_airunner: BUILD_CHANNEL pid={} channel_count mismatch: existing={}, \
-                         new={}",
-                        pid, existing.channel_count, build_param.channel_count
-                    );
+                    // error!(
+                    //     "k3_airunner: BUILD_CHANNEL pid={} channel_count mismatch: existing={}, \
+                    //      new={}",
+                    //     pid, existing.channel_count, build_param.channel_count
+                    // );
                 }
                 return Err(VfsError::AlreadyExists);
             }
@@ -221,16 +255,16 @@ impl K3AiRunner {
                 },
             );
             if let Some(registered) = table.get(&pid) {
-                info!(
-                    "k3_airunner: BUILD_CHANNEL keepalive pid={}, user_va={:#x}, size={:#x}, \
-                     channels={}, kernel_va={:#x}, kernel_map_size={:#x}",
-                    pid,
-                    registered.user_va,
-                    registered.size_bytes,
-                    registered.channel_count,
-                    registered.kernel_va,
-                    registered.kernel_map_size
-                );
+                // info!(
+                //     "k3_airrunner: BUILD_CHANNEL keepalive pid={}, user_va={:#x}, size={:#x}, \
+                //      channels={}, kernel_va={:#x}, kernel_map_size={:#x}",
+                //     pid,
+                //     registered.user_va,
+                //     registered.size_bytes,
+                //     registered.channel_count,
+                //     registered.kernel_va,
+                //     registered.kernel_map_size
+                // );
                 let _ = registered.shared_pages.len();
             }
         }
@@ -239,19 +273,19 @@ impl K3AiRunner {
         build_param.owner_pid = pid;
 
         // 这里先不真正创建 ov-channel sender/receiver，也不唤醒 guard。
-        info!(
-            "k3_airunner: BUILD_CHANNEL registered pid={}, va={:#x}, size={:#x}, pages={}",
-            pid,
-            user_va,
-            range_len,
-            align_up_4k(size_bytes) >> 12
-        );
+        // info!(
+        //     "k3_airunner: BUILD_CHANNEL registered pid={}, va={:#x}, size={:#x}, pages={}",
+        //     pid,
+        //     user_va,
+        //     range_len,
+        //     align_up_4k(size_bytes) >> 12
+        // );
         Ok(0)
     }
 
     /// `SUBMIT_GRAPH` ioctl: 从 channel 读取 graph 提交项，反序列化并交给调度器执行。
-    fn submit_graph(&self, arg: usize) -> VfsResult<usize> {
-        info!("k3_airunner: SUBMIT_GRAPH ioctl reached, arg={arg:#x}");
+    fn submit_graph(&self, _arg: usize) -> VfsResult<usize> {
+        // info!("k3_airunner: SUBMIT_GRAPH ioctl reached, arg={arg:#x}");
 
         let curr = current();
         let pid = curr.as_thread().proc_data.proc.pid();
@@ -262,23 +296,23 @@ impl K3AiRunner {
                 .as_ref()
                 .and_then(|table| table.get(&pid))
                 .ok_or_else(|| {
-                    info!(
-                        "k3_airunner: SUBMIT_GRAPH no registered channel memory pid={}",
-                        pid
-                    );
+                    // info!(
+                    //     "k3_airunner: SUBMIT_GRAPH no registered channel memory pid={}",
+                    //     pid
+                    // );
                     VfsError::InvalidInput
                 })?;
-            info!(
-                "k3_airunner: SUBMIT_GRAPH registered channel pid={}, user_va={:#x}, \
-                 kernel_va={:#x}, size={:#x}, kernel_map_size={:#x}, channels={}, pages={}",
-                pid,
-                registered.user_va,
-                registered.kernel_va,
-                registered.size_bytes,
-                registered.kernel_map_size,
-                registered.channel_count,
-                registered.shared_pages.len()
-            );
+            // info!(
+            //     "k3_airunner: SUBMIT_GRAPH registered channel pid={}, user_va={:#x}, \
+            //      kernel_va={:#x}, size={:#x}, kernel_map_size={:#x}, channels={}, pages={}",
+            //     pid,
+            //     registered.user_va,
+            //     registered.kernel_va,
+            //     registered.size_bytes,
+            //     registered.kernel_map_size,
+            //     registered.channel_count,
+            //     registered.shared_pages.len()
+            // );
 
             (
                 registered.kernel_va,
@@ -292,10 +326,10 @@ impl K3AiRunner {
         if channel_count != K3_CHANNEL_COUNT as u32
             || size_bytes < core::mem::size_of::<SharedMemory<K3_CHANNEL_COUNT>>()
         {
-            info!(
-                "k3_airunner: SUBMIT_GRAPH rejected channel layout pid={}, channels={}, size={:#x}",
-                pid, channel_count, size_bytes
-            );
+            // info!(
+            //     "k3_airunner: SUBMIT_GRAPH rejected channel layout pid={}, channels={}, size={:#x}",
+            //     pid, channel_count, size_bytes
+            // );
             return Err(VfsError::InvalidInput);
         }
 
@@ -305,80 +339,80 @@ impl K3AiRunner {
 
         // magic/version 不对说明共享区没有初始化或已经被破坏。
         for channel_index in 0..K3_CHANNEL_COUNT {
-            info!(
-                "k3_airunner: SUBMIT_GRAPH channel {} is_valid begin pid={}",
-                channel_index, pid
-            );
+            // info!(
+            //     "k3_airunner: SUBMIT_GRAPH channel {} is_valid begin pid={}",
+            //     channel_index, pid
+            // );
             let channel = unsafe { shm.channel_unchecked(ChannelId::new(channel_index as u8)) };
-            info!(
-                "k3_airunner: SUBMIT_GRAPH channel {} ref acquired pid={}, ptr={:#x}",
-                channel_index, pid, channel as *const _ as usize
-            );
+            // info!(
+            //     "k3_airunner: SUBMIT_GRAPH channel {} ref acquired pid={}, ptr={:#x}",
+            //     channel_index, pid, channel as *const _ as usize
+            // );
             let channel_valid = channel.is_valid();
-            info!(
-                "k3_airunner: SUBMIT_GRAPH channel {} is_valid done pid={}, valid={}",
-                channel_index, pid, channel_valid
-            );
+            // info!(
+            //     "k3_airunner: SUBMIT_GRAPH channel {} is_valid done pid={}, valid={}",
+            //     channel_index, pid, channel_valid
+            // );
             if !channel_valid {
-                info!(
-                    "k3_airunner: SUBMIT_GRAPH rejected invalid shared memory pid={}, \
-                     kernel_va={:#x}, channel={}",
-                    pid, kernel_va, channel_index
-                );
+                // info!(
+                //     "k3_airunner: SUBMIT_GRAPH rejected invalid shared memory pid={}, \
+                //      kernel_va={:#x}, channel={}",
+                //     pid, kernel_va, channel_index
+                // );
                 return Err(VfsError::InvalidInput);
             }
         }
-        info!("k3_airunner: SUBMIT_GRAPH shared memory valid pid={pid}");
+        // info!("k3_airunner: SUBMIT_GRAPH shared memory valid pid={pid}");
 
         // 最小闭环先固定读 channel 0。
-        info!("k3_airunner: SUBMIT_GRAPH receiver channel 0 init begin pid={pid}");
+        // info!("k3_airunner: SUBMIT_GRAPH receiver channel 0 init begin pid={pid}");
         let receiver = shm
             .receiver(ChannelId::new(K3_CHANNEL_SNEDERID))
-            .map_err(|err| {
-                info!(
-                    "k3_airunner: SUBMIT_GRAPH receiver channel 0 init failed pid={}, err={:?}",
-                    pid, err
-                );
+            .map_err(|_err| {
+                // info!(
+                //     "k3_airunner: SUBMIT_GRAPH receiver channel 0 init failed pid={}, err={:?}",
+                //     pid, err
+                // );
                 VfsError::InvalidInput
             })?;
-        info!("k3_airunner: SUBMIT_GRAPH receiver channel 0 init done pid={pid}");
+        // info!("k3_airunner: SUBMIT_GRAPH receiver channel 0 init done pid={pid}");
 
         // complete环
-        info!("k3_airunner: SUBMIT_GRAPH sender channel 1 init begin pid={pid}");
+        // info!("k3_airunner: SUBMIT_GRAPH sender channel 1 init begin pid={pid}");
         let complete_sender = shm
             .sender(ChannelId::new(K3_CHANNEL_RECIVERID))
-            .map_err(|err| {
-                info!(
-                    "k3_airunner: SUBMIT_GRAPH sender channel 1 init failed pid={}, err={:?}",
-                    pid, err
-                );
+            .map_err(|_err| {
+                // info!(
+                //     "k3_airunner: SUBMIT_GRAPH sender channel 1 init failed pid={}, err={:?}",
+                //     pid, err
+                // );
                 VfsError::InvalidInput
             })?;
-        info!("k3_airunner: SUBMIT_GRAPH sender channel 1 init done pid={pid}");
-        info!("k3_airunner: SUBMIT_GRAPH receiver channel 1 init begin pid={pid}");
+        // info!("k3_airunner: SUBMIT_GRAPH sender channel 1 init done pid={pid}");
+        // info!("k3_airunner: SUBMIT_GRAPH receiver channel 1 init begin pid={pid}");
         let _complete_reciver =
             shm.receiver(ChannelId::new(K3_CHANNEL_RECIVERID))
-                .map_err(|err| {
-                    info!(
-                        "k3_airunner: SUBMIT_GRAPH receiver channel 1 init failed pid={}, err={:?}",
-                        pid, err
-                    );
+                .map_err(|_err| {
+                    // info!(
+                    //     "k3_airunner: SUBMIT_GRAPH receiver channel 1 init failed pid={}, err={:?}",
+                    //     pid, err
+                    // );
                     VfsError::InvalidInput
                 })?;
-        info!("k3_airunner: SUBMIT_GRAPH receiver channel 1 init done pid={pid}");
+        // info!("k3_airunner: SUBMIT_GRAPH receiver channel 1 init done pid={pid}");
 
         // try_recv 非阻塞；空队列先返回 WouldBlock，后面再接 poll/async。
         let message = receiver.try_recv().ok_or_else(|| {
-            info!("k3_airunner: SUBMIT_GRAPH channel empty pid={}", pid);
+            // info!("k3_airunner: SUBMIT_GRAPH channel empty pid={}", pid);
             VfsError::WouldBlock
         })?;
 
         // 用户发送 AiGraphSubmitEntry 的序列化数据。
         let Some(payload) = message.as_data() else {
-            info!(
-                "k3_airunner: SUBMIT_GRAPH recv non-notification pid={}, msg={:?}",
-                pid, message
-            );
+            // info!(
+            //     "k3_airrunner: SUBMIT_GRAPH recv non-notification pid={}, msg={:?}",
+            //     pid, message
+            // );
             return Err(VfsError::InvalidInput);
         };
 
@@ -394,42 +428,42 @@ impl K3AiRunner {
 
         // 验证内核 abi_version 与用户 abi_version 是否匹配。
         if graph_entry.abi_version != AI_ABI_VERSION {
-            error!(
-                "k3_airunner: SUBMIT_GRAPH rejected abi mismatch pid={}, user={}, kernel={}",
-                pid, graph_entry.abi_version, AI_ABI_VERSION
-            );
+            // error!(
+            //     "k3_airunner: SUBMIT_GRAPH rejected abi mismatch pid={}, user={}, kernel={}",
+            //     pid, graph_entry.abi_version, AI_ABI_VERSION
+            // );
             return Err(VfsError::InvalidInput);
         }
 
         // 当前只接收真正的 graph submit，cancel/query 后面单独走分支。
         if graph_entry.submit_kind != GraphSubmitKind::GRAPH_SUBMIT {
-            info!(
-                "k3_airunner: SUBMIT_GRAPH rejected submit kind pid={}, kind={}",
-                pid, graph_entry.submit_kind.0
-            );
+            // info!(
+            //     "k3_airunner: SUBMIT_GRAPH rejected submit kind pid={}, kind={}",
+            //     pid, graph_entry.submit_kind.0
+            // );
             return Err(VfsError::OperationNotSupported);
         }
 
         // scheduler 需要 graph blob 的用户 VA 和大小。
         if graph_entry.graph_user_va == 0 || graph_entry.graph_size == 0 {
-            info!(
-                "k3_airunner: SUBMIT_GRAPH rejected empty graph blob pid={}, graph_va={:#x}, \
-                 size={:#x}",
-                pid,
-                graph_entry.graph_user_va.get(),
-                graph_entry.graph_size.get()
-            );
+            // info!(
+            //     "k3_airunner: SUBMIT_GRAPH rejected empty graph blob pid={}, graph_va={:#x}, \
+            //      size={:#x}",
+            //     pid,
+            //     graph_entry.graph_user_va.get(),
+            //     graph_entry.graph_size.get()
+            // );
             return Err(VfsError::InvalidInput);
         }
 
         // The graph blob is borrowed only while parsing. User space must keep
         // its address and contents valid; `AiGraphParser` then owns its nodes
         // and edges in the returned `AiParsedGraph`.
-        info!(
-            "k3_airunner: SUBMIT_GRAPH graph_size usize conversion begin pid={}, graph_size={:#x}",
-            pid,
-            graph_entry.graph_size.get()
-        );
+        // info!(
+        //     "k3_airunner: SUBMIT_GRAPH graph_size usize conversion begin pid={}, graph_size={:#x}",
+        //     pid,
+        //     graph_entry.graph_size.get()
+        // );
         let graph_size = graph_entry
             .graph_size
             .try_as_usize()
@@ -441,12 +475,12 @@ impl K3AiRunner {
             .map_err(|_| VfsError::BadAddress)?;
 
         let parsed_graph =
-            access_user_memory(|| AiGraphParser::parse(graph_blob)).map_err(|err| {
-                error!("k3_airunner: SUBMIT_GRAPH graph parse failed pid={pid}, err={err:?}");
+            access_user_memory(|| AiGraphParser::parse(graph_blob)).map_err(|_err| {
+                // error!("k3_airunner: SUBMIT_GRAPH graph parse failed pid={pid}, err={err:?}");
                 VfsError::InvalidInput
             })?;
-        let task_link = resolve_parsed_graph(0, &parsed_graph).map_err(|err| {
-            error!("k3_airunner: SUBMIT_GRAPH graph resolve failed pid={pid}, err={err:?}");
+        let task_link = resolve_parsed_graph(0, &parsed_graph).map_err(|_err| {
+            // error!("k3_airunner: SUBMIT_GRAPH graph resolve failed pid={pid}, err={err:?}");
             VfsError::InvalidInput
         })?;
 
@@ -473,45 +507,49 @@ impl K3AiRunner {
                 return Err(VfsError::InvalidInput);
             }
 
-            info!("I received the node:");
-            info!("  node_id: {}", node.node_id);
-            info!("  op: {:?}", node.desc.op);
-            info!("  target_hint: {:?}", node.desc.target_hint);
             info!(
-                "  input_count: {}, output_count: {}",
-                node.desc.input_count, node.desc.output_count
+                "k3_airunner: SUBMIT_GRAPH node pid={}, token={}, node_id={}, op={:?} ({}), \
+                 target_hint={:?}, input_count={}, output_count={}",
+                pid,
+                graph_entry.user_token,
+                node.node_id,
+                node.desc.op,
+                kernel_op_name(node.desc.op),
+                node.desc.target_hint,
+                node.desc.input_count,
+                node.desc.output_count
             );
 
             // 打印输入 tensors 信息
             for i in 0..input_count {
                 let tensor = &node.desc.tensors[i];
-                let ndim = tensor
+                let _ndim = tensor
                     .ndim
                     .try_under_max(MAX_DIM)
                     .map_err(|_| VfsError::InvalidInput)?;
-                info!(
-                    "  input[{}]: dtype={:?}, ndim={}, shape={:?}",
-                    i,
-                    tensor.dtype,
-                    tensor.ndim,
-                    &tensor.shape[..ndim]
-                );
+                // info!(
+                //     "  input[{}]: dtype={:?}, ndim={}, shape={:?}",
+                //     i,
+                //     tensor.dtype,
+                //     tensor.ndim,
+                //     &tensor.shape[..ndim]
+                // );
             }
 
             // 打印输出 tensors 信息
             for i in 0..output_count {
                 let tensor = &node.desc.tensors[input_count + i];
-                let ndim = tensor
+                let _ndim = tensor
                     .ndim
                     .try_under_max(MAX_DIM)
                     .map_err(|_| VfsError::InvalidInput)?;
-                info!(
-                    "  output[{}]: dtype={:?}, ndim={}, shape={:?}",
-                    i,
-                    tensor.dtype,
-                    tensor.ndim,
-                    &tensor.shape[..ndim]
-                );
+                // info!(
+                //     "  output[{}]: dtype={:?}, ndim={}, shape={:?}",
+                //     i,
+                //     tensor.dtype,
+                //     tensor.ndim,
+                //     &tensor.shape[..ndim]
+                // );
             }
 
             // 映射输入 tensors 到内核地址
@@ -529,7 +567,7 @@ impl K3AiRunner {
                 // guard
                 if tensor.kernel_va != 0 {
                     // 非法参数,阻止
-                    error!("kernel_va should writen by kernel!");
+                    // error!("kernel_va should writen by kernel!");
                     return Err(ax_errno::AxError::BadAddress);
                 }
 
@@ -550,26 +588,26 @@ impl K3AiRunner {
                             // 回填kernel_va
                             tensor.kernel_va = KernelVa::new(kernel_va);
 
-                            info!(
-                                "  input[{}] mapped: user_va={:#x}, size={:#x} -> kernel_va={:#x}",
-                                i,
-                                user_va,
-                                tensor.size_bytes.get(),
-                                kernel_va
-                            );
+                            // info!(
+                            //     "  input[{}] mapped: user_va={:#x}, size={:#x} -> kernel_va={:#x}",
+                            //     i,
+                            //     user_va,
+                            //     tensor.size_bytes.get(),
+                            //     kernel_va
+                            // );
                         }
                         Err(_) => {
-                            error!(
-                                "  input[{}] map failed: user_va={:#x}, size={:#x}",
-                                i,
-                                user_va,
-                                tensor.size_bytes.get()
-                            );
+                            // error!(
+                            //     "  input[{}] map failed: user_va={:#x}, size={:#x}",
+                            //     i,
+                            //     user_va,
+                            //     tensor.size_bytes.get()
+                            // );
                             return Err(ax_errno::AxError::BadAddress);
                         }
                     }
                 } else {
-                    error!("Tensor va or tensor size can't be null ptr!");
+                    // error!("Tensor va or tensor size can't be null ptr!");
                     return Err(ax_errno::AxError::BadAddress);
                 }
             }
@@ -596,34 +634,34 @@ impl K3AiRunner {
                             // 回填kernel_va
                             tensor.kernel_va = KernelVa::new(kernel_va);
 
-                            info!(
-                                "  output[{}] mapped: user_va={:#x}, size={:#x} -> kernel_va={:#x}",
-                                i,
-                                user_va,
-                                tensor.size_bytes.get(),
-                                kernel_va
-                            );
+                            // info!(
+                            //     "  output[{}] mapped: user_va={:#x}, size={:#x} -> kernel_va={:#x}",
+                            //     i,
+                            //     user_va,
+                            //     tensor.size_bytes.get(),
+                            //     kernel_va
+                            // );
                         }
                         Err(_) => {
-                            info!(
-                                "  output[{}] map failed: user_va={:#x}, size={:#x}",
-                                i,
-                                user_va,
-                                tensor.size_bytes.get()
-                            );
+                            // info!(
+                            //     "  output[{}] map failed: user_va={:#x}, size={:#x}",
+                            //     i,
+                            //     user_va,
+                            //     tensor.size_bytes.get()
+                            // );
                         }
                     }
                 }
             }
 
-            info!("  attr_size: {} bytes", node.desc.attr_size);
+            // info!("  attr_size: {} bytes", node.desc.attr_size);
         }
 
         // 这只是入队，真正的调度器 worker 线程会在后台执行。
-        info!(
-            "k3_airunner: scheduler run_graph begin pid={}, token={}",
-            pid, graph_entry.user_token
-        );
+        // info!(
+        //     "k3_airunner: scheduler run_graph begin pid={}, token={}",
+        //     pid, graph_entry.user_token
+        // );
 
         // release 屏障
         core::sync::atomic::fence(core::sync::atomic::Ordering::Release);
@@ -636,25 +674,25 @@ impl K3AiRunner {
         )
         .is_err()
         {
-            error!("k3_airunner: scheduler run_graph failed");
+            // error!("k3_airunner: scheduler run_graph failed");
             return Err(VfsError::InvalidInput);
         }
 
         // 到这里任务已经提交成功,等待worker进行消费
 
-        info!(
-            "k3_airunner: scheduler enqueue graph done pid={}, token={}",
-            pid, graph_entry.user_token
-        );
+        // info!(
+        //     "k3_airunner: scheduler enqueue graph done pid={}, token={}",
+        //     pid, graph_entry.user_token
+        // );
 
-        info!(
-            "k3_airunner: SUBMIT_GRAPH recv AiGraphSubmitEntry pid={}, token={}, graph_va={:#x}, \
-             graph_size={:#x}",
-            pid,
-            graph_entry.user_token,
-            graph_entry.graph_user_va.get(),
-            graph_entry.graph_size.get()
-        );
+        // info!(
+        //     "k3_airunner: SUBMIT_GRAPH recv AiGraphSubmitEntry pid={}, token={}, graph_va={:#x}, \
+        //      graph_size={:#x}",
+        //     pid,
+        //     graph_entry.user_token,
+        //     graph_entry.graph_user_va.get(),
+        //     graph_entry.graph_size.get()
+        // );
 
         Ok(0)
     }

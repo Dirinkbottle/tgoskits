@@ -6,7 +6,7 @@
 use alloc::{collections::btree_map::BTreeMap, sync::Arc};
 
 use ax_kspin::SpinNoIrq;
-use ax_log::warn;
+// use ax_log::warn;
 use ax_memory_addr::VirtAddr;
 use ax_task::current;
 
@@ -85,23 +85,23 @@ pub(super) static USER_KERNEL_MAPPING_TABLE: SpinNoIrq<
 
 /// 把 kernel alias 映射同步到当前线程的进程地址空间，保证后续调度器能直接访问。
 pub(super) fn sync_kernel_alias_to_current_aspace(
-    pid: u32,
+    _pid: u32,
     kernel_va: usize,
     kernel_map_size: usize,
 ) -> bool {
     if kernel_va == 0 || kernel_map_size == 0 {
-        info!(
-            "k3_airunner: sync kernel alias rejected pid={}, kernel_va={:#x}, map_size={:#x}",
-            pid, kernel_va, kernel_map_size
-        );
+        // info!(
+        //     "k3_airunner: sync kernel alias rejected pid={}, kernel_va={:#x}, map_size={:#x}",
+        //     pid, kernel_va, kernel_map_size
+        // );
         return false;
     }
 
     let start = VirtAddr::from_usize(kernel_va);
-    info!(
-        "k3_airunner: sync kernel alias begin pid={}, kernel_va={:#x}, map_size={:#x}",
-        pid, kernel_va, kernel_map_size
-    );
+    // info!(
+    //     "k3_airunner: sync kernel alias begin pid={}, kernel_va={:#x}, map_size={:#x}",
+    //     pid, kernel_va, kernel_map_size
+    // );
     {
         let curr = current();
         let aspace_arc = curr.as_thread().proc_data.aspace();
@@ -113,14 +113,14 @@ pub(super) fn sync_kernel_alias_to_current_aspace(
             .clone_missing_root_entries_from(kspace.page_table(), start, kernel_map_size)
             .is_err()
         {
-            warn!("k3_airunner: sync kernel alias failed pid={pid}");
+            // warn!("k3_airunner: sync kernel alias failed pid={pid}");
             return false;
         }
     }
     let _ = crate::mm::flush_tlb_range_sync(start, kernel_map_size);
-    info!(
-        "k3_airunner: sync kernel alias done pid={}, kernel_va={:#x}, map_size={:#x}",
-        pid, kernel_va, kernel_map_size
-    );
+    // info!(
+    //     "k3_airunner: sync kernel alias done pid={}, kernel_va={:#x}, map_size={:#x}",
+    //     pid, kernel_va, kernel_map_size
+    // );
     true
 }
