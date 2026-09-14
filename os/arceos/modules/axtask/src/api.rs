@@ -180,11 +180,11 @@ const K3_CPU_COUNT: usize = K3_CLUSTER_CPU_COUNT * 2;
 #[cfg(feature = "k3_com260kit")]
 fn k3_cluster_cpu_range(cpu_id: usize, cpu_num: usize) -> Option<core::ops::Range<usize>> {
     let range = match cpu_id {
-        // note: Threads of the current task running on 
-        //cores 0–7—and any new threads spawned by them—are 
-        //permitted to run on cores 0–15; however, threads on 
-        //AI cores 8–15 are restricted to running only on cores 
-        //8–15.
+        // note: Threads of the current task running on
+        // cores 0–7—and any new threads spawned by them—are
+        // permitted to run on cores 0–15; however, threads on
+        // AI cores 8–15 are restricted to running only on cores
+        // 8–15.
         0..K3_CLUSTER_CPU_COUNT => 0..cpu_num,
         K3_CLUSTER_CPU_COUNT..K3_CPU_COUNT => K3_CLUSTER_CPU_COUNT..cpu_num.min(K3_CPU_COUNT),
         _ => return None,

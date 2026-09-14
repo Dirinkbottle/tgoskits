@@ -11,7 +11,8 @@ use riscv::{
     interrupt::{
         Trap,
         supervisor::{Exception as E, Interrupt as I},
-    }, register::{scause, sepc, sstatus::Sstatus, stval},
+    },
+    register::{scause, sstatus::Sstatus, stval},
 };
 
 pub use crate::uspace_common::{ExceptionKind, ExceptionSyndrome, ReturnReason};
@@ -55,6 +56,8 @@ impl UserContext {
             },
             sepc: entry,
             sstatus,
+            stval: 0,
+            scause: 0,
         })
     }
 
@@ -117,20 +120,43 @@ impl UserContext {
                     va!(stval),
                     PageFaultFlags::WRITE | PageFaultFlags::USER,
                 ),
-                Trap::Exception(E::InstructionPageFault) =>{
-                    {
-                        // note: on spacemit k3 occur stval!=sepc
-                        let fault_addr = {
-                            const VA_BITS: usize = 39;
-                            (((stval << (usize::BITS as usize - VA_BITS)) as isize)
-                                >> (usize::BITS as usize - VA_BITS)) as usize
-                        };
-
-                        ReturnReason::PageFault(
-                            va!(fault_addr),
-                            PageFaultFlags::EXECUTE | PageFaultFlags::USER,
-                        )
+                Trap::Exception(E::InstructionPageFault) => {
+                    let stval_hd: usize;
+                    let sepc_hd: usize;
+                    unsafe {
+                        core::arch::asm!(
+                            "csrr {stval}, stval",
+                            "csrr {sepc}, sepc",
+                            stval = out(reg) stval_hd,
+                            sepc = out(reg) sepc_hd,
+                        );
                     }
+                    if stval_hd != self.stval || sepc_hd != self.sepc {
+                        error!(
+                            concat!(
+                                "Instruction page fault CSR changed: stval_hd={:#x}, ",
+                                "trap_stval={:#x}, sepc_hd={:#x}, trap_sepc={:#x}, ",
+                                "trap_scause={:#x}",
+                            ),
+                            stval_hd, self.stval, sepc_hd, self.sepc, self.scause,
+                        );
+                    } else if stval_hd != sepc_hd {
+                        error!(
+                            "Instruction page fault: stval={:#x}, sepc={:#x}",
+                            stval_hd, sepc_hd,
+                        );
+                    }
+
+                    let fault_addr = {
+                        const VA_BITS: usize = 39;
+                        (((stval << (usize::BITS as usize - VA_BITS)) as isize)
+                            >> (usize::BITS as usize - VA_BITS)) as usize
+                    };
+
+                    ReturnReason::PageFault(
+                        va!(fault_addr),
+                        PageFaultFlags::EXECUTE | PageFaultFlags::USER,
+                    )
                     // #[cfg(not(feature = "k3_com260kit"))]
                     // {
                     //     ReturnReason::PageFault(
@@ -138,7 +164,7 @@ impl UserContext {
                     //         PageFaultFlags::EXECUTE | PageFaultFlags::USER,
                     //     )
                     // }
-                } ,
+                }
                 Trap::Exception(e) => ReturnReason::Exception(ExceptionInfo { e, stval }),
             }
         } else {

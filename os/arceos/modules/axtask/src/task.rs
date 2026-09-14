@@ -393,7 +393,7 @@ impl TaskInner {
                     crate::api::cpu_mask_onk3()
                 }
                 #[cfg(not(feature = "k3_com260kit"))]
-                    crate::api::cpu_mask_full()
+                crate::api::cpu_mask_full()
             }),
             sched_policy: AtomicI32::new(0),
             sched_priority: AtomicI32::new(0),

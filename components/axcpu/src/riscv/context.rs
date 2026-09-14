@@ -334,6 +334,10 @@ pub struct TrapFrame {
     pub sepc: usize,
     /// Supervisor Status Register.
     pub sstatus: sstatus::Sstatus,
+    /// Supervisor Trap Value captured at trap entry.
+    pub stval: usize,
+    /// Supervisor Cause captured at trap entry.
+    pub scause: usize,
 }
 
 impl Default for TrapFrame {
@@ -342,6 +346,8 @@ impl Default for TrapFrame {
             regs: GeneralRegisters::default(),
             sepc: 0,
             sstatus: sstatus::Sstatus::from_bits(0),
+            stval: 0,
+            scause: 0,
         }
     }
 }

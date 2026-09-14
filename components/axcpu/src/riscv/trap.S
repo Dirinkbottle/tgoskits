@@ -48,10 +48,14 @@ trap_vector_base:
     STR     t1, sp, 6           // tf.regs.t1
 
 .Ltrap_saved:
-    csrr    t1, sepc
+    csrr    t3, stval
+    csrr    t4, scause
+    csrr    t5, sepc
     csrr    t2, sstatus
-    STR     t1, sp, 32          // tf.sepc
+    STR     t5, sp, 32          // tf.sepc
     STR     t2, sp, 33          // tf.sstatus
+    STR     t3, sp, 34          // tf.stval
+    STR     t4, sp, 35          // tf.scause
 
     // Kernel Rust always sees the psABI global pointer, trusted kernel tp, and
     // canonical sscratch=0.

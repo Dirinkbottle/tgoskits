@@ -37,10 +37,14 @@ trap_vector_base:
     STR     t1, sp, 6
 
 .Ltrap_saved:
-    csrr    t1, sepc
+    csrr    t3, stval
+    csrr    t4, scause
+    csrr    t5, sepc
     csrr    t2, sstatus
-    STR     t1, sp, 32
+    STR     t5, sp, 32
     STR     t2, sp, 33
+    STR     t3, sp, 34
+    STR     t4, sp, 35
     csrw    sscratch, t0
     .option push
     .option norelax
