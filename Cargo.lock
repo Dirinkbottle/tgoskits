@@ -4704,7 +4704,7 @@ dependencies = [
 [[package]]
 name = "k3_aiScheduler"
 version = "0.1.0"
-source = "git+https://github.com/Dirinkbottle/k3x-HERA-RT.git#8b035138afb2d40cacfdc775e904580d30b15e10"
+source = "git+https://github.com/Dirinkbottle/k3x-HERA-RT.git#8f77001e159522b642caf49b981dfe0f109d0183"
 dependencies = [
  "dma-api 0.8.2",
  "k3_aiUabi",
@@ -4716,7 +4716,7 @@ dependencies = [
 [[package]]
 name = "k3_aiUabi"
 version = "0.1.0"
-source = "git+https://github.com/Dirinkbottle/k3x-HERA-RT.git#8b035138afb2d40cacfdc775e904580d30b15e10"
+source = "git+https://github.com/Dirinkbottle/k3x-HERA-RT.git#8f77001e159522b642caf49b981dfe0f109d0183"
 dependencies = [
  "bitflags 2.13.1",
 ]
@@ -4724,7 +4724,7 @@ dependencies = [
 [[package]]
 name = "k3_kernel_backend"
 version = "0.1.0"
-source = "git+https://github.com/Dirinkbottle/k3x-HERA-RT.git#8b035138afb2d40cacfdc775e904580d30b15e10"
+source = "git+https://github.com/Dirinkbottle/k3x-HERA-RT.git#8f77001e159522b642caf49b981dfe0f109d0183"
 dependencies = [
  "half",
  "k3_aiUabi",
